@@ -64,7 +64,9 @@ deploy('blockfield-web', os.environ['WEB_WEBHOOK'])
 # Выкат сервера — это его рестарт: идущий матч он оборвал бы. Образ уже в GHCR,
 # так что пропуск здесь ничего не теряет — деплой доедет со следующим выпуском или руками.
 online = players_online(os.environ.get('SERVER_HOST', 'minecraft.play.nether.pp.ua'))
-if online:
+if os.environ.get('DEPLOY_SERVER', 'true') != 'true':
+    print('blockfield-server: пак не менялся, сервер не трогаем')
+elif online:
     print(f'blockfield-server: на сервере {online} игрок(ов) — деплой пропущен, образ ждёт в GHCR')
 else:
     if online is None:
