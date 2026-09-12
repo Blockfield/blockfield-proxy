@@ -1,5 +1,6 @@
 import json
 import os
+import sys
 import urllib.request
 
 
@@ -17,11 +18,8 @@ def deploy(service, url):
     print(f'{service}: deployment accepted')
 
 
-deploy('blockfield-web', os.environ['WEB_WEBHOOK'])
-
-# Выкат сервера — это его рестарт. Если серверное дерево не изменилось (см. SERVER_CHANGED в
-# release.yml), образ не пересобирался и трогать сервер незачем.
-if os.environ.get('SERVER_CHANGED') == '1':
-    deploy('blockfield-server', os.environ['SERVER_WEBHOOK'])
-else:
-    print('blockfield-server: содержимое не изменилось, деплой пропущен')
+if __name__ == '__main__':
+    service = sys.argv[1]
+    if service not in ('web', 'server'):
+        raise SystemExit('Expected web or server')
+    deploy(f'blockfield-{service}', os.environ[f'{service.upper()}_WEBHOOK'])
