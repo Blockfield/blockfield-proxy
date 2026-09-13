@@ -1,0 +1,45 @@
+config-version = "2.7"
+bind = "0.0.0.0:25565"
+motd = "<gold>BLOCKFIELD"
+show-max-players = 40
+# Личность подтверждает плагин blockfield-proxy через Drasl; Mojang не участвует.
+online-mode = false
+force-key-authentication = false
+prevent-client-proxy-connections = false
+player-info-forwarding-mode = "modern"
+# Секрет берётся из окружения VELOCITY_FORWARDING_SECRET (файл тогда не читается); тот же у FabricProxy-Lite и лобби.
+forwarding-secret-file = "forwarding.secret"
+announce-forge = false
+kick-existing-players = false
+ping-passthrough = "disabled"
+enable-player-address-logging = true
+
+[servers]
+game = "blockfield-server-lfcxy0:25565"
+lobby = "127.0.0.1:30000"
+try = ["lobby"]
+
+[forced-hosts]
+
+[advanced]
+compression-threshold = 256
+compression-level = -1
+login-ratelimit = 3000
+connection-timeout = 5000
+read-timeout = 30000
+haproxy-protocol = false
+tcp-fast-open = false
+bungee-plugin-message-channel = true
+show-ping-requests = false
+failover-on-unexpected-server-disconnect = true
+announce-proxy-commands = true
+# /login и /register несут пароли.
+log-command-executions = false
+log-player-connections = true
+accepts-transfers = false
+
+[query]
+enabled = false
+port = 25565
+map = "Velocity"
+show-plugins = false

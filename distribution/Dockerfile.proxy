@@ -1,0 +1,14 @@
+FROM itzg/mc-proxy:java21
+LABEL org.opencontainers.image.source="https://github.com/netherg-io/blockfield-modpack"
+ENV TYPE=VELOCITY VELOCITY_VERSION=3.5.1 VELOCITY_BUILD_ID=615 MEMORY=256m
+ADD --checksum=sha256:dc528599c08df1766c29a15da646df5d586b791d5c52255170746fc51563c120 \
+    https://cdn.modrinth.com/data/gIDqs3gn/versions/nMTNj48K/Limbo-0.7.10-ALPHA-1.21.1.jar /opt/lobby/limbo.jar
+ADD --checksum=sha256:b03cebc45c1583edf8c7456fa67f0a6248eb95a856249378173cc1ea8b8d0d68 \
+    https://cdn.modrinth.com/data/9eGKb6K1/versions/ES87t4lm/voicechat-velocity-2.6.18.jar /plugins/voicechat-velocity-2.6.18.jar
+COPY proxy/plugin/build/libs/blockfield-proxy-1.0.0.jar /plugins/blockfield-proxy.jar
+COPY proxy/velocity.toml /config/velocity.toml
+COPY proxy/lobby/ /opt/lobby/
+RUN chown -R 1000:1000 /opt/lobby
+COPY --chmod=755 proxy/start-proxy.sh /start-blockfield-proxy
+EXPOSE 25565/tcp 25565/udp
+CMD ["/start-blockfield-proxy"]

@@ -20,6 +20,6 @@ def deploy(service, url):
 
 if __name__ == '__main__':
     service = sys.argv[1]
-    if service not in ('web', 'server'):
-        raise SystemExit('Expected web or server')
+    if service not in ('web', 'server', 'proxy'):
+        raise SystemExit('Expected web, server or proxy')
     deploy(f'blockfield-{service}', os.environ[f'{service.upper()}_WEBHOOK'])
