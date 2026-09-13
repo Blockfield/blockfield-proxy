@@ -54,6 +54,8 @@ import java.util.regex.Pattern;
 public final class BlockfieldProxy {
     static final MinecraftChannelIdentifier AUTH = MinecraftChannelIdentifier.create("blockfield", "auth");
     static final MinecraftChannelIdentifier PACK = MinecraftChannelIdentifier.create("blockfield", "pack_version");
+    /** play-пакет клиенту: writeUtf(jwt) + writeUtf(ключ); пустые строки — забыть вход. */
+    static final MinecraftChannelIdentifier SESSION = MinecraftChannelIdentifier.create("blockfield", "session");
     // TaCZ Tweaks шлёт конфиг сервера login-запросом и кикает за «не понят»; после входа клиента
     // login-фаза уже прошла, поэтому отвечаем за него и досылаем тот же конфиг play-пакетом.
     static final MinecraftChannelIdentifier TACZ_TWEAKS = MinecraftChannelIdentifier.create("tacztweaks", "server_sync_config");
@@ -68,6 +70,9 @@ public final class BlockfieldProxy {
     private final String drasl = System.getenv().getOrDefault("BLOCKFIELD_DRASL_URL", "https://skins.nether.pp.ua");
     private final HttpClient http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(5)).build();
     private final SecureRandom random = new SecureRandom();
+    // Секрет сессий выводится из секрета форвардинга: его смена разлогинивает всех, отдельной переменной не нужно.
+    private final byte[] sessionSecret = Optional.ofNullable(System.getenv("VELOCITY_FORWARDING_SECRET"))
+            .filter(s -> !s.isBlank()).map(Sessions::secret).orElse(null);
 
     private record Pending(long createdAt, CompletableFuture<Boolean> auth, CompletableFuture<byte[]> pack) {}
 
@@ -89,7 +94,8 @@ public final class BlockfieldProxy {
         var commands = proxy.getCommandManager();
         commands.register(commands.metaBuilder("login").aliases("l").plugin(this).build(), new AuthCommand(false));
         commands.register(commands.metaBuilder("register").aliases("reg").plugin(this).build(), new AuthCommand(true));
-        proxy.getChannelRegistrar().register(TACZ_TWEAKS);
+        commands.register(commands.metaBuilder("logout").plugin(this).build(), new LogoutCommand());
+        proxy.getChannelRegistrar().register(TACZ_TWEAKS, SESSION);
         proxy.getScheduler().buildTask(this, this::tick).repeat(3, TimeUnit.SECONDS).schedule();
     }
 
@@ -108,11 +114,13 @@ public final class BlockfieldProxy {
         connection.sendLoginPluginMessage(PACK, new byte[0], pack::complete);
         String serverId = HexFormat.of().formatHex(bytes(20));
         connection.sendLoginPluginMessage(AUTH, utf(serverId), response -> {
-            if (response == null || response.length != 1 || response[0] != 1) {
+            if (response != null && response.length == 1 && response[0] == 1) {
+                hasJoined(event.getUsername(), serverId).whenComplete((ok, error) -> auth.complete(error == null && ok));
+            } else if (response != null && response.length > 1 && sessionSecret != null) {
+                auth.complete(Sessions.verify(sessionSecret, event.getUsername(), serverId, response, System.currentTimeMillis() / 1000));
+            } else {
                 auth.complete(false);
-                return;
             }
-            hasJoined(event.getUsername(), serverId).whenComplete((ok, error) -> auth.complete(error == null && ok));
         });
     }
 
@@ -281,6 +289,22 @@ public final class BlockfieldProxy {
         }
     }
 
+    private final class LogoutCommand implements SimpleCommand {
+        @Override
+        public boolean hasPermission(Invocation invocation) {
+            return invocation.source() instanceof Player player && authed.contains(player.getUniqueId());
+        }
+
+        @Override
+        public void execute(Invocation invocation) {
+            if (!(invocation.source() instanceof Player player)) return;
+            player.sendPluginMessage(SESSION, concat(utf(""), utf("")));
+            // Пауза, чтобы сброс сессии дошёл до клиента раньше разрыва соединения.
+            proxy.getScheduler().buildTask(BlockfieldProxy.this, () -> player.disconnect(
+                    Component.text("Вы вышли. В следующий раз понадобится /login."))).delay(Duration.ofMillis(500)).schedule();
+        }
+    }
+
     private void fail(Player player, InetAddress ip, String message) {
         ipFailures.compute(ip, (k, w) -> w == null ? new long[]{1, System.currentTimeMillis()} : new long[]{w[0] + 1, w[1]});
         int count = failures.merge(player.getUniqueId(), 1, Integer::sum);
@@ -294,7 +318,11 @@ public final class BlockfieldProxy {
     private void admit(Player player) {
         authed.add(player.getUniqueId());
         failures.remove(player.getUniqueId());
-        player.sendMessage(Component.text("Вход выполнен.", NamedTextColor.GREEN));
+        if (sessionSecret != null) {
+            String[] session = Sessions.issue(sessionSecret, player.getUsername(), System.currentTimeMillis() / 1000);
+            player.sendPluginMessage(SESSION, concat(utf(session[0]), utf(session[1])));
+        }
+        player.sendMessage(Component.text("Вход выполнен. На этом компьютере игра запомнит его на 30 дней, выйти — /logout.", NamedTextColor.GREEN));
         server("game").ifPresent(game -> game.ping().thenRun(() -> player.createConnectionRequest(game).fireAndForget()));
     }
 
@@ -369,10 +397,20 @@ public final class BlockfieldProxy {
     /** Строка в формате FriendlyByteBuf#writeUtf: VarInt длины + UTF-8. */
     static byte[] utf(String value) {
         byte[] data = value.getBytes(StandardCharsets.UTF_8);
-        if (data.length > 127) throw new IllegalArgumentException("too long");
-        byte[] out = new byte[data.length + 1];
-        out[0] = (byte) data.length;
-        System.arraycopy(data, 0, out, 1, data.length);
+        java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream(data.length + 3);
+        int length = data.length;
+        while ((length & ~0x7f) != 0) {
+            out.write((length & 0x7f) | 0x80);
+            length >>>= 7;
+        }
+        out.write(length);
+        out.writeBytes(data);
+        return out.toByteArray();
+    }
+
+    static byte[] concat(byte[] a, byte[] b) {
+        byte[] out = java.util.Arrays.copyOf(a, a.length + b.length);
+        System.arraycopy(b, 0, out, a.length, b.length);
         return out;
     }
 }
