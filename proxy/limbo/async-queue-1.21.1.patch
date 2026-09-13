@@ -1,0 +1,133 @@
+diff --git a/pom.xml b/pom.xml
+index 552dd59..288a2e1 100644
+--- a/pom.xml
++++ b/pom.xml
+@@ -258,38 +258,44 @@
+ 		<dependency>
+ 			<groupId>net.md-5</groupId>
+ 			<artifactId>bungeecord-chat</artifactId>
+-			<version>1.18-R0.1-SNAPSHOT</version>
++			<version>1.21-R0.3</version>
+ 			<type>jar</type>
+ 			<scope>compile</scope>
+ 		</dependency>
++		<dependency>
++			<groupId>net.md-5</groupId>
++			<artifactId>bungeecord-serializer</artifactId>
++			<version>1.21-R0.3</version>
++			<scope>compile</scope>
++		</dependency>
+ 		<dependency>
+ 			<groupId>net.kyori</groupId>
+ 			<artifactId>adventure-text-serializer-gson</artifactId>
+-			<version>4.17.0-SNAPSHOT</version>
++			<version>4.17.0</version>
+ 			<scope>compile</scope>
+ 		</dependency>
+ 		<dependency>
+ 			<groupId>net.kyori</groupId>
+ 			<artifactId>adventure-text-serializer-legacy</artifactId>
+-			<version>4.17.0-SNAPSHOT</version>
++			<version>4.17.0</version>
+ 			<scope>compile</scope>
+ 		</dependency>
+ 		<dependency>
+ 			<groupId>net.kyori</groupId>
+ 			<artifactId>adventure-text-serializer-plain</artifactId>
+-			<version>4.17.0-SNAPSHOT</version>
++			<version>4.17.0</version>
+ 			<scope>compile</scope>
+ 		</dependency>
+ 		<dependency>
+ 			<groupId>net.kyori</groupId>
+ 			<artifactId>adventure-api</artifactId>
+-			<version>4.17.0-SNAPSHOT</version>
++			<version>4.17.0</version>
+ 			<scope>compile</scope>
+ 		</dependency>
+ 		<dependency>
+ 			<groupId>net.kyori</groupId>
+ 			<artifactId>adventure-nbt</artifactId>
+-			<version>4.17.0-SNAPSHOT</version>
++			<version>4.17.0</version>
+ 			<scope>compile</scope>
+ 		</dependency>
+ 		<dependency>
+diff --git a/src/main/java/com/loohp/limbo/scheduler/Tick.java b/src/main/java/com/loohp/limbo/scheduler/Tick.java
+index 80a12e3..faa63d1 100644
+--- a/src/main/java/com/loohp/limbo/scheduler/Tick.java
++++ b/src/main/java/com/loohp/limbo/scheduler/Tick.java
+@@ -26,8 +26,8 @@ import com.loohp.limbo.scheduler.LimboScheduler.LimboSchedulerTask;
+ import java.io.IOException;
+ import java.util.ArrayList;
+ import java.util.List;
+-import java.util.Queue;
+-import java.util.concurrent.ConcurrentLinkedQueue;
++import java.util.concurrent.BlockingQueue;
++import java.util.concurrent.LinkedBlockingQueue;
+ import java.util.concurrent.TimeUnit;
+ import java.util.concurrent.atomic.AtomicLong;
+ 
+@@ -37,7 +37,7 @@ public class Tick {
+ 	private AtomicLong tick = new AtomicLong(0);
+ 	
+ 	private List<Thread> threads = new ArrayList<>();
+-	private Queue<LimboSchedulerTask> asyncTasksQueue = new ConcurrentLinkedQueue<>();
++	private BlockingQueue<LimboSchedulerTask> asyncTasksQueue = new LinkedBlockingQueue<>();
+ 	
+ 	public Tick(Limbo instance) {
+ 		new Thread(() -> {
+@@ -46,22 +46,19 @@ public class Tick {
+ 			for (int i = 0; i < 4; i++) {
+ 				Thread thread = new Thread(() -> {
+ 					while (instance.isRunning()) {
+-						LimboSchedulerTask task = asyncTasksQueue.poll();
+-						if (task == null) {
+-							try {
+-								TimeUnit.NANOSECONDS.sleep(10000);
+-							} catch (InterruptedException e) {
+-								e.printStackTrace();
+-							}
+-						} else {
+-							LimboTask limboTask = task.getTask();
+-							try {
+-								limboTask.run();
+-							} catch (Throwable e) {
+-								System.err.println("Task " + task.getTaskId() + " threw an exception: " + e.getLocalizedMessage());
+-								e.printStackTrace();
+-							}
+-						}
++                        try {
++                            LimboSchedulerTask task = asyncTasksQueue.take();
++                            LimboTask limboTask = task.getTask();
++                            try {
++                                limboTask.run();
++                            } catch (Throwable e) {
++                                System.err.println("Task " + task.getTaskId() + " threw an exception: " + e.getLocalizedMessage());
++                                e.printStackTrace();
++                            }
++                        } catch (InterruptedException e) {
++                            Thread.currentThread().interrupt();
++                            e.printStackTrace();
++                        }
+ 					}
+ 				});
+ 				thread.start();
+@@ -124,7 +121,6 @@ public class Tick {
+ 		return tick.get();
+ 	}
+ 	
+-	@SuppressWarnings("deprecation")
+ 	public void waitAndKillThreads(long waitTime) {
+ 		long end = System.currentTimeMillis() + waitTime;
+ 		for (Thread thread : threads) {
+@@ -133,9 +129,6 @@ public class Tick {
+ 			} catch (InterruptedException e) {
+ 				e.printStackTrace();
+ 			}
+-			if (thread.isAlive()) {
+-				thread.stop();
+-			}
+ 		}
+ 	}
+ 	
