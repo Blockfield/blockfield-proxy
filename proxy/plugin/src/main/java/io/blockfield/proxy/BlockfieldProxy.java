@@ -75,7 +75,7 @@ public final class BlockfieldProxy {
 
     private final ProxyServer proxy;
     private final Logger logger;
-    private final String drasl = System.getenv().getOrDefault("BLOCKFIELD_DRASL_URL", "https://skins.nether.pp.ua");
+    private final String drasl = System.getenv().getOrDefault("BLOCKFIELD_DRASL_URL", "https://skins.blockfield.pro");
     private final HttpClient http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(5)).build();
     private final SecureRandom random = new SecureRandom();
     // Секрет сессий выводится из секрета форвардинга: его смена разлогинивает всех, отдельной переменной не нужно.
