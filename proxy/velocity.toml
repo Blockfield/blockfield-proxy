@@ -16,6 +16,9 @@ enable-player-address-logging = true
 
 [servers]
 game = "blockfield-server-lfcxy0:25565"
+# Строительный профиль того же образа (Dokploy-приложение blockfield-workshop, 0 реплик вне мастерской).
+# Имя-заглушка: заменить на фактическое имя сервиса из `docker service ls` до деплоя прокси.
+workshop = "blockfield-workshop-CHANGEME:25565"
 lobby = "127.0.0.1:30000"
 try = ["lobby"]
 

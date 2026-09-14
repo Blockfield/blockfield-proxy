@@ -15,6 +15,7 @@ import com.velocitypowered.api.event.player.ServerLoginPluginMessageEvent;
 import com.velocitypowered.api.event.player.ServerPostConnectEvent;
 import com.velocitypowered.api.event.player.ServerPreConnectEvent;
 import com.velocitypowered.api.event.proxy.ProxyInitializeEvent;
+import com.velocitypowered.api.event.proxy.ProxyPingEvent;
 import com.velocitypowered.api.plugin.Plugin;
 import com.velocitypowered.api.proxy.LoginPhaseConnection;
 import com.velocitypowered.api.proxy.Player;
@@ -33,6 +34,9 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.attribute.FileTime;
 import java.security.SecureRandom;
 import java.time.Duration;
 import java.util.HexFormat;
@@ -43,6 +47,7 @@ import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.regex.Pattern;
 
 /**
@@ -64,6 +69,9 @@ public final class BlockfieldProxy {
     private static final int MAX_FAILURES = 5;
     private static final long IP_WINDOW_MS = TimeUnit.MINUTES.toMillis(10);
     private static final int IP_MAX_FAILURES = 15;
+    // ponytail: участник доигрываемой Кампании = был на игровом сервере за 10 минут; точный резерв проверяет мод. Передавать резервы в gate.json, если окна не хватит.
+    private static final long GAME_MEMBER_MS = TimeUnit.MINUTES.toMillis(10);
+    private static final String RESTARTING = "Игровой сервер перезапускается. Вернём вас автоматически, как только он поднимется.";
 
     private final ProxyServer proxy;
     private final Logger logger;
@@ -74,10 +82,18 @@ public final class BlockfieldProxy {
     private final byte[] sessionSecret = Optional.ofNullable(System.getenv("VELOCITY_FORWARDING_SECRET"))
             .filter(s -> !s.isBlank()).map(Sessions::secret).orElse(null);
 
-    private record Pending(long createdAt, CompletableFuture<Boolean> auth, CompletableFuture<byte[]> pack) {}
+    private final Path gateFile = Optional.ofNullable(System.getenv("BLOCKFIELD_GATE_FILE"))
+            .filter(s -> !s.isBlank()).map(Path::of).orElse(null);
+    private volatile Gate gate = Gate.load(gateFile);
+    private volatile FileTime gateStamp;
+
+    private record Pending(long createdAt, CompletableFuture<Boolean> auth, CompletableFuture<byte[]> pack, AtomicReference<String> drasl) {}
 
     private final Map<String, Pending> pending = new ConcurrentHashMap<>();
     private final Set<UUID> authed = ConcurrentHashMap.newKeySet();
+    /** Drasl profile id подтверждённого аккаунта: ACL мастерской сверяет id и ник вместе. */
+    private final Map<UUID, String> draslIds = new ConcurrentHashMap<>();
+    private final Map<UUID, Long> lastOnGame = new ConcurrentHashMap<>();
     private final Map<UUID, byte[]> packReplies = new ConcurrentHashMap<>();
     private final Map<UUID, byte[]> taczConfig = new ConcurrentHashMap<>();
     private final Map<UUID, Integer> failures = new ConcurrentHashMap<>();
@@ -109,13 +125,17 @@ public final class BlockfieldProxy {
         if (!(event.getConnection() instanceof LoginPhaseConnection connection)) return;
         var auth = new CompletableFuture<Boolean>();
         var pack = new CompletableFuture<byte[]>();
+        var drasl = new AtomicReference<String>();
         pending.put(key(event.getConnection().getRemoteAddress(), event.getUsername()),
-                new Pending(System.currentTimeMillis(), auth, pack));
+                new Pending(System.currentTimeMillis(), auth, pack, drasl));
         connection.sendLoginPluginMessage(PACK, new byte[0], pack::complete);
         String serverId = HexFormat.of().formatHex(bytes(20));
         connection.sendLoginPluginMessage(AUTH, utf(serverId), response -> {
             if (response != null && response.length == 1 && response[0] == 1) {
-                hasJoined(event.getUsername(), serverId).whenComplete((ok, error) -> auth.complete(error == null && ok));
+                hasJoined(event.getUsername(), serverId).whenComplete((id, error) -> {
+                    if (error == null && id != null) drasl.set(id);
+                    auth.complete(error == null && id != null);
+                });
             } else if (response != null && response.length > 1 && sessionSecret != null) {
                 auth.complete(Sessions.verify(sessionSecret, event.getUsername(), serverId, response, System.currentTimeMillis() / 1000));
             } else {
@@ -134,15 +154,68 @@ public final class BlockfieldProxy {
                 entry.pack().completeOnTimeout(null, 10, TimeUnit.SECONDS).thenAccept(reply -> {
                     if (reply != null) packReplies.put(id, reply);
                 }),
-                entry.auth().completeOnTimeout(false, 15, TimeUnit.SECONDS).thenAccept(ok -> {
-                    if (ok) authed.add(id);
+                entry.auth().completeOnTimeout(false, 15, TimeUnit.SECONDS).thenCompose(ok -> {
+                    if (!ok) return CompletableFuture.completedFuture(null);
+                    authed.add(id);
+                    return resolveDrasl(id, player.getUsername(), entry.drasl().get());
                 })));
+    }
+
+    /** Запомненный вход (JWT) несёт только ник: id берём у Drasl по уже подтверждённому нику; сбой — без доступа в мастерскую. */
+    private CompletableFuture<Void> resolveDrasl(UUID player, String name, String known) {
+        CompletableFuture<String> id = known != null ? CompletableFuture.completedFuture(known)
+                : profileId(name).exceptionally(error -> null).completeOnTimeout(null, 5, TimeUnit.SECONDS);
+        return id.thenAccept(value -> {
+            if (value != null) draslIds.put(player, value);
+        });
+    }
+
+    private void reloadGate() {
+        if (gateFile == null) return;
+        FileTime stamp;
+        try {
+            stamp = Files.getLastModifiedTime(gateFile);
+        } catch (java.io.IOException e) {
+            stamp = null;
+        }
+        if (stamp != null && stamp.equals(gateStamp)) return;
+        gateStamp = stamp;
+        Gate next = Gate.load(gateFile);
+        if (!next.equals(gate)) logger.info("Gate {}:{} -> {}:{} ({} allowed)", gate.state(), gate.backend(), next.state(), next.backend(), next.allowed().size());
+        gate = next;
+    }
+
+    private boolean allowed(Player player, RegisteredServer server) {
+        UUID id = player.getUniqueId();
+        Long seen = lastOnGame.get(id);
+        boolean member = player.getCurrentServer().map(c -> c.getServerInfo().getName().equals("game")).orElse(false)
+                || seen != null && System.currentTimeMillis() - seen <= GAME_MEMBER_MS;
+        return authed.contains(id) && gate.allows(server.getServerInfo().getName(), draslIds.get(id), player.getUsername(), member);
+    }
+
+    /** Цель по gate, если игроку туда можно; иначе он ждёт в лобби. */
+    private Optional<RegisteredServer> target(Player player) {
+        return server(gate.backend()).filter(server -> allowed(player, server));
+    }
+
+    private String waitingText(Player player) {
+        return target(player).isPresent() ? RESTARTING : gate.message();
+    }
+
+    @Subscribe
+    public void onPing(ProxyPingEvent event) {
+        reloadGate();
+        if (!gate.open()) {
+            event.setPing(event.getPing().asBuilder().description(Component.text(gate.message(), NamedTextColor.GOLD)).build());
+        }
     }
 
     @Subscribe
     public void onChooseServer(PlayerChooseInitialServerEvent event) {
+        reloadGate();
         boolean ok = authed.contains(event.getPlayer().getUniqueId());
-        server(ok ? "game" : "lobby").ifPresent(event::setInitialServer);
+        Optional<RegisteredServer> target = ok ? target(event.getPlayer()) : Optional.empty();
+        (target.isPresent() ? target : server("lobby")).ifPresent(event::setInitialServer);
         if (!ok) {
             proxy.getScheduler().buildTask(this, () -> {
                 Player player = event.getPlayer();
@@ -155,11 +228,17 @@ public final class BlockfieldProxy {
 
     @Subscribe
     public void onPreConnect(ServerPreConnectEvent event) {
-        if (!authed.contains(event.getPlayer().getUniqueId()) && !isLobby(event.getOriginalServer())) {
+        if (isLobby(event.getOriginalServer())) return;
+        reloadGate();
+        Player player = event.getPlayer();
+        if (!authed.contains(player.getUniqueId())) {
             event.setResult(ServerPreConnectEvent.ServerResult.denied());
             if (event.getPreviousServer() != null) {
-                event.getPlayer().sendMessage(Component.text("Сначала войдите: /login или /register.", NamedTextColor.RED));
+                player.sendMessage(Component.text("Сначала войдите: /login или /register.", NamedTextColor.RED));
             }
+        } else if (!allowed(player, event.getOriginalServer())) {
+            event.setResult(ServerPreConnectEvent.ServerResult.denied());
+            if (event.getPreviousServer() != null) player.sendMessage(Component.text(gate.message(), NamedTextColor.GOLD));
         }
     }
 
@@ -190,8 +269,7 @@ public final class BlockfieldProxy {
         if (authed.contains(player.getUniqueId())) {
             // После кика с игрового сервера этот текст уже пришёл в RedirectPlayer.
             if (event.getPreviousServer() != null) return;
-            player.sendMessage(Component.text("Игровой сервер перезапускается. Вернём вас автоматически, как только он поднимется.",
-                    NamedTextColor.GOLD));
+            player.sendMessage(Component.text(waitingText(player), NamedTextColor.GOLD));
         } else {
             player.sendMessage(Component.text("Войдите в аккаунт Blockfield:\n", NamedTextColor.GOLD)
                     .append(Component.text("/login <пароль>", NamedTextColor.YELLOW))
@@ -210,11 +288,13 @@ public final class BlockfieldProxy {
             event.setResult(KickedFromServerEvent.DisconnectPlayer.create(
                     reason.orElse(Component.text("Игровой сервер недоступен."))));
         } else if (event.getPlayer().getCurrentServer().map(c -> isLobby(c.getServer())).orElse(false)) {
-            event.setResult(KickedFromServerEvent.Notify.create(Component.text("Игровой сервер ещё запускается…", NamedTextColor.GRAY)));
+            event.setResult(KickedFromServerEvent.Notify.create(target(event.getPlayer()).isPresent()
+                    ? Component.text("Игровой сервер ещё запускается…", NamedTextColor.GRAY)
+                    : Component.text(gate.message(), NamedTextColor.GOLD)));
         } else {
             // Без своего текста Velocity показывает английское «You were kicked from game».
-            event.setResult(KickedFromServerEvent.RedirectPlayer.create(lobby.get(), Component.text(
-                    "Игровой сервер перезапускается. Вернём вас автоматически, как только он поднимется.", NamedTextColor.GOLD)));
+            event.setResult(KickedFromServerEvent.RedirectPlayer.create(lobby.get(),
+                    Component.text(waitingText(event.getPlayer()), NamedTextColor.GOLD)));
         }
     }
 
@@ -222,6 +302,7 @@ public final class BlockfieldProxy {
     public void onDisconnect(DisconnectEvent event) {
         UUID id = event.getPlayer().getUniqueId();
         authed.remove(id);
+        draslIds.remove(id);
         packReplies.remove(id);
         taczConfig.remove(id);
         failures.remove(id);
@@ -237,12 +318,26 @@ public final class BlockfieldProxy {
         long now = System.currentTimeMillis();
         pending.values().removeIf(p -> now - p.createdAt() > 60_000);
         ipFailures.values().removeIf(w -> now - w[1] > IP_WINDOW_MS);
-        Optional<RegisteredServer> game = server("game");
+        server("game").ifPresent(game -> game.getPlayersConnected().forEach(p -> lastOnGame.put(p.getUniqueId(), now)));
+        lastOnGame.values().removeIf(seen -> now - seen > GAME_MEMBER_MS);
+        Gate previous = gate;
+        reloadGate();
         Optional<RegisteredServer> lobby = server("lobby");
-        if (game.isEmpty() || lobby.isEmpty()) return;
-        var waiting = lobby.get().getPlayersConnected().stream().filter(p -> authed.contains(p.getUniqueId())).toList();
+        if (lobby.isEmpty()) return;
+        if (!gate.equals(previous)) {
+            // Отзыв доступа действует сразу: всех, кому новый gate не разрешает текущий backend, — в лобби.
+            for (Player player : proxy.getAllPlayers()) {
+                player.getCurrentServer().filter(c -> !isLobby(c.getServer()) && !allowed(player, c.getServer())).ifPresent(c -> {
+                    player.sendMessage(Component.text(gate.open() ? "Мастерская закрыта." : gate.message(), NamedTextColor.GOLD));
+                    player.createConnectionRequest(lobby.get()).fireAndForget();
+                });
+            }
+        }
+        Optional<RegisteredServer> backend = server(gate.backend());
+        if (backend.isEmpty()) return;
+        var waiting = lobby.get().getPlayersConnected().stream().filter(p -> allowed(p, backend.get())).toList();
         if (waiting.isEmpty()) return;
-        game.get().ping().thenRun(() -> waiting.forEach(p -> p.createConnectionRequest(game.get()).fireAndForget()));
+        backend.get().ping().thenRun(() -> waiting.forEach(p -> p.createConnectionRequest(backend.get()).fireAndForget()));
     }
 
     private final class AuthCommand implements SimpleCommand {
@@ -323,7 +418,9 @@ public final class BlockfieldProxy {
             player.sendPluginMessage(SESSION, concat(utf(session[0]), utf(session[1])));
         }
         player.sendMessage(Component.text("Вход выполнен. На этом компьютере игра запомнит его на 30 дней, выйти — /logout.", NamedTextColor.GREEN));
-        server("game").ifPresent(game -> game.ping().thenRun(() -> player.createConnectionRequest(game).fireAndForget()));
+        resolveDrasl(player.getUniqueId(), player.getUsername(), null).thenRun(() -> target(player).ifPresentOrElse(
+                backend -> backend.ping().thenRun(() -> player.createConnectionRequest(backend).fireAndForget()),
+                () -> player.sendMessage(Component.text(gate.message(), NamedTextColor.GOLD))));
     }
 
     /** null — пароль верный и ник совпадает с аккаунтом; иначе текст ошибки для игрока. */
@@ -362,12 +459,23 @@ public final class BlockfieldProxy {
         });
     }
 
-    CompletableFuture<Boolean> hasJoined(String name, String serverId) {
-        URI uri = URI.create(drasl + "/session/minecraft/hasJoined?username=" + URLEncoder.encode(name, StandardCharsets.UTF_8)
-                + "&serverId=" + serverId);
+    /** Drasl profile id, если клиент действительно вошёл под этим ником; иначе null. */
+    CompletableFuture<String> hasJoined(String name, String serverId) {
+        return profile(URI.create(drasl + "/session/minecraft/hasJoined?username=" + URLEncoder.encode(name, StandardCharsets.UTF_8)
+                + "&serverId=" + serverId), name);
+    }
+
+    CompletableFuture<String> profileId(String name) {
+        return profile(URI.create(drasl + "/account/users/profiles/minecraft/" + URLEncoder.encode(name, StandardCharsets.UTF_8)), name);
+    }
+
+    private CompletableFuture<String> profile(URI uri, String name) {
         return http.sendAsync(HttpRequest.newBuilder(uri).timeout(Duration.ofSeconds(10)).GET().build(),
-                HttpResponse.BodyHandlers.ofString()).thenApply(response -> response.statusCode() == 200
-                && JsonParser.parseString(response.body()).getAsJsonObject().get("name").getAsString().equals(name));
+                HttpResponse.BodyHandlers.ofString()).thenApply(response -> {
+                    if (response.statusCode() != 200) return null;
+                    JsonObject json = JsonParser.parseString(response.body()).getAsJsonObject();
+                    return json.get("name").getAsString().equals(name) ? json.get("id").getAsString() : null;
+                });
     }
 
     private CompletableFuture<HttpResponse<String>> post(String path, JsonObject body) {
