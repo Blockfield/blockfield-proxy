@@ -2,8 +2,8 @@
 # есть только в master под новые версии игры — собираем 1.21.1 сами с бэкпортом (proxy/limbo/*.patch).
 FROM maven:3.9-eclipse-temurin-21 AS limbo
 RUN git clone -q https://github.com/LOOHP/Limbo /src && cd /src && git checkout -q 29571119
-COPY proxy/limbo/async-queue-1.21.1.patch /tmp/
-RUN cd /src && git apply /tmp/async-queue-1.21.1.patch && mvn -q -B -DskipTests package
+COPY proxy/limbo/*.patch /tmp/limbo-patches/
+RUN cd /src && git apply /tmp/limbo-patches/*.patch && mvn -q -B -DskipTests package
 
 FROM itzg/mc-proxy:java21
 LABEL org.opencontainers.image.source="https://github.com/netherg-io/blockfield-modpack"
