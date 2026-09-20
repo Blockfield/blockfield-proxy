@@ -137,7 +137,7 @@ index 0000000..af84077
 +    }
 +}
 diff --git a/src/main/java/com/loohp/limbo/player/PlayerInteractManager.java b/src/main/java/com/loohp/limbo/player/PlayerInteractManager.java
-index 9c57313..241e9aa 100644
+index 9c57313..83d8069 100644
 --- a/src/main/java/com/loohp/limbo/player/PlayerInteractManager.java
 +++ b/src/main/java/com/loohp/limbo/player/PlayerInteractManager.java
 @@ -27,6 +27,9 @@ import com.loohp.limbo.network.protocol.packets.ClientboundChunkBatchFinishedPac
@@ -150,7 +150,19 @@ index 9c57313..241e9aa 100644
  import com.loohp.limbo.network.protocol.packets.PacketPlayOutEntityMetadata;
  import com.loohp.limbo.network.protocol.packets.PacketPlayOutSpawnEntity;
  import com.loohp.limbo.network.protocol.packets.PacketPlayOutUnloadChunk;
-@@ -50,6 +53,7 @@ public class PlayerInteractManager {
+@@ -47,9 +50,19 @@ import java.util.stream.Collectors;
+ 
+ public class PlayerInteractManager {
+ 	
++	private static final java.lang.reflect.Field SKIN_LAYERS;
++	static {
++		try {
++			SKIN_LAYERS = Player.class.getDeclaredField("skinLayers");
++		} catch (NoSuchFieldException e) {
++			throw new ExceptionInInitializerError(e);
++		}
++	}
++
  	private Player player;
  	
  	private Set<Entity> entities;
@@ -158,7 +170,7 @@ index 9c57313..241e9aa 100644
  	private Map<ChunkPosition, Chunk> currentViewing;
  	
  	public PlayerInteractManager() {
-@@ -79,19 +83,43 @@ public class PlayerInteractManager {
+@@ -79,19 +92,44 @@ public class PlayerInteractManager {
  		int viewDistanceBlocks = viewDistanceChunks << 4;
  		Location location = player.getLocation();
  		Set<Entity> entitiesInRange = player.getWorld().getEntities().stream().filter(each -> each.getLocation().distanceSquared(location) < viewDistanceBlocks * viewDistanceBlocks).collect(Collectors.toSet());
@@ -179,7 +191,9 @@ index 9c57313..241e9aa 100644
 +				PacketPlayOutSpawnEntity packet = new PacketPlayOutSpawnEntity(entity.getEntityId(), entity.getUniqueId(), entity.getType(), entity.getX(), entity.getY(), entity.getZ(), entity.getPitch(), entity.getYaw(), entity.getYaw(), 0, (short) 0, (short) 0, (short) 0);
  				player.clientConnection.sendPacket(packet);
  
- 				PacketPlayOutEntityMetadata meta = new PacketPlayOutEntityMetadata(entity);
+-				PacketPlayOutEntityMetadata meta = new PacketPlayOutEntityMetadata(entity);
++				// Limbo's metadata type ids predate 1.19.3: a full living-entity dump fails to decode on 1.21.1. BYTE (id 0) is still valid.
++				PacketPlayOutEntityMetadata meta = entity instanceof Player ? new PacketPlayOutEntityMetadata(entity, false, SKIN_LAYERS) : new PacketPlayOutEntityMetadata(entity);
  				player.clientConnection.sendPacket(meta);
  			}
 +            if (entity instanceof Player) {

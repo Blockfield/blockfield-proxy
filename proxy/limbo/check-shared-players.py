@@ -106,6 +106,14 @@ class Client:
         spawn_index = next(i for i, (key, data) in enumerate(self.seen) if spawned(key, data))
         assert any(key == 'player_info_update' and other.uuid.bytes in data
                    for key, data in self.seen[:spawn_index]), 'Profile must precede spawn'
+        # 1.21.1 client decodes only this shape from Limbo: index 17 (skin layers), serializer 0 (byte), value, 0xff.
+        prefix = varint(other.entity)
+        metadata = [data for key, data in self.seen[spawn_index:] if key == 'set_entity_data' and data.startswith(prefix)]
+        if not metadata:
+            metadata = [self.until(lambda key, data: key == 'set_entity_data' and data.startswith(prefix))]
+        for data in metadata:
+            rest = data[len(prefix):]
+            assert len(rest) == 4 and rest[:2] == bytes([17, 0]) and rest[3] == 0xff, ('Undecodable player metadata', rest)
         for key, data in self.seen:
             if key == 'add_entity':
                 body = io.BytesIO(data)
