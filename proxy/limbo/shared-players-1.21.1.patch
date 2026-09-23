@@ -1,3 +1,17 @@
+diff --git a/src/main/java/com/loohp/limbo/entity/EntityType.java b/src/main/java/com/loohp/limbo/entity/EntityType.java
+index a9ea5e7..e51fffb 100644
+--- a/src/main/java/com/loohp/limbo/entity/EntityType.java
++++ b/src/main/java/com/loohp/limbo/entity/EntityType.java
+@@ -283,7 +283,8 @@ public enum EntityType {
+      * Spawn with {@link World#strikeLightning(Location)}.
+      */
+     //LIGHTNING("lightning_bolt", LightningStrike.class, -1, false),
+-    PLAYER("player", Player.class, 106, false),
++    // Shared lobby players: 106 is minecraft:tnt on 1.21.1 (reports/registries.json has player = 128).
++    PLAYER("player", Player.class, 128, false),
+     /**
+      * An unknown entity without an Entity Class
+      */
 diff --git a/src/main/java/com/loohp/limbo/network/ClientConnection.java b/src/main/java/com/loohp/limbo/network/ClientConnection.java
 index 65244d6..c60047c 100644
 --- a/src/main/java/com/loohp/limbo/network/ClientConnection.java

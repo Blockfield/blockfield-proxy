@@ -40,8 +40,9 @@ def string(value):
 
 
 class Client:
-    def __init__(self, name, port, packets):
+    def __init__(self, name, port, packets, player_type):
         self.packets = packets
+        self.player_type = player_type
         self.uuid = uuid.uuid3(uuid.NAMESPACE_DNS, name)
         self.socket = socket.create_connection(('127.0.0.1', port), timeout=20)
         self.stream = self.socket.makefile('rb')
@@ -104,6 +105,12 @@ class Client:
         if not any(spawned(key, data) for key, data in self.seen):
             self.until(spawned)
         spawn_index = next(i for i, (key, data) in enumerate(self.seen) if spawned(key, data))
+        # A wrong type id spawns another entity (106 = tnt) and the client drops on the skin-layer metadata below.
+        body = io.BytesIO(self.seen[spawn_index][1])
+        read_varint(body)
+        body.read(16)
+        spawned_type = read_varint(body)
+        assert spawned_type == self.player_type, ('Player spawned as entity type', spawned_type)
         assert any(key == 'player_info_update' and other.uuid.bytes in data
                    for key, data in self.seen[:spawn_index]), 'Profile must precede spawn'
         # 1.21.1 client decodes only this shape from Limbo: index 17 (skin layers), serializer 0 (byte), value, 0xff.
@@ -128,11 +135,12 @@ class Client:
 def main():
     with zipfile.ZipFile(sys.argv[1]) as jar:
         packets = json.loads(jar.read('reports/packets.json'))
+        player_type = json.loads(jar.read('reports/registries.json'))['minecraft:entity_type']['entries']['minecraft:player']['protocol_id']
     port = int(sys.argv[2])
-    first = Client('LobbyCheckA', port, packets)
+    first = Client('LobbyCheckA', port, packets, player_type)
     second = None
     try:
-        second = Client('LobbyCheckB', port, packets)
+        second = Client('LobbyCheckB', port, packets, player_type)
         first.sees(second)
         second.sees(first)
         second.send_named('move_player_pos_rot', struct.pack('>dddff?', 60.5, 18, 52.5, 90, 15, True))
@@ -150,10 +158,10 @@ def main():
         body = io.BytesIO(data)
         assert read_varint(body) == 1 and read_varint(body) == second.entity
         first.seen.clear()
-        second = Client('LobbyCheckB', port, packets)
+        second = Client('LobbyCheckB', port, packets, player_type)
         first.sees(second)
         second.sees(first)
-        print('PASS: mutual visibility, profile ordering, no self-spawn, movement, head rotation, quit, reconnect')
+        print('PASS: player entity type, mutual visibility, profile ordering, no self-spawn, movement, head rotation, quit, reconnect')
     finally:
         first.close()
         if second:
