@@ -86,6 +86,8 @@ public final class BlockfieldProxy {
             .filter(s -> !s.isBlank()).map(Path::of).orElse(null);
     private volatile Gate gate = Gate.load(gateFile);
     private volatile FileTime gateStamp;
+    /** Gate whose evictions tick() last applied. A ping or connect may reload the file first; tick must still evict once. */
+    private Gate enforced = gate;
 
     private record Pending(long createdAt, CompletableFuture<Boolean> auth, CompletableFuture<byte[]> pack, AtomicReference<String> drasl) {}
 
@@ -320,11 +322,11 @@ public final class BlockfieldProxy {
         ipFailures.values().removeIf(w -> now - w[1] > IP_WINDOW_MS);
         server("game").ifPresent(game -> game.getPlayersConnected().forEach(p -> lastOnGame.put(p.getUniqueId(), now)));
         lastOnGame.values().removeIf(seen -> now - seen > GAME_MEMBER_MS);
-        Gate previous = gate;
         reloadGate();
         Optional<RegisteredServer> lobby = server("lobby");
         if (lobby.isEmpty()) return;
-        if (!gate.equals(previous)) {
+        if (!gate.equals(enforced)) {
+            enforced = gate;
             // Отзыв доступа действует сразу: всех, кому новый gate не разрешает текущий backend, — в лобби.
             for (Player player : proxy.getAllPlayers()) {
                 player.getCurrentServer().filter(c -> !isLobby(c.getServer()) && !allowed(player, c.getServer())).ifPresent(c -> {
