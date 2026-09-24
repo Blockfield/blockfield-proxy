@@ -28,7 +28,7 @@ class GateTest {
         assertEquals("closed", Gate.load(dir.resolve("missing.json")).state());
         Path file = dir.resolve("gate.json");
         for (String bad : new String[]{"{", "[]", "{\"schema\":2,\"gate\":\"public\",\"backend\":\"game\",\"message\":\"\",\"allowed\":[]}",
-                gate("testers", "game", ""), gate("public", "staging", ""), gate("builders", "workshop", "{\"draslId\":\"x\",\"name\":\"Nether\"}"),
+                gate("staging", "game", ""), gate("public", "staging", ""), gate("builders", "workshop", "{\"draslId\":\"x\",\"name\":\"Nether\"}"),
                 "{\"schema\":1,\"gate\":\"public\",\"backend\":\"game\"}"}) {
             Files.writeString(file, bad);
             Gate loaded = Gate.load(file);
@@ -50,6 +50,14 @@ class GateTest {
         assertFalse(draining.open());
         assertTrue(draining.allows("game", null, "Member", true));
         assertFalse(draining.allows("game", ID, "Nether", false));
+    }
+
+    @Test
+    void testersAreTheWorkshopMembersOnTheWorkshopBackend() {
+        Gate testers = Gate.parse(gate("testers", "workshop", "{\"draslId\":\"" + ID + "\",\"name\":\"Nether\"}"));
+        assertTrue(testers.allows("workshop", ID, "Nether", false));
+        assertFalse(testers.allows("workshop", ID, "Impostor", false));
+        assertFalse(testers.allows("game", ID, "Nether", true));
     }
 
     @Test
