@@ -47,7 +47,8 @@ record Gate(String state, String backend, String message, Set<Member> allowed) {
         return switch (state) {
             case "public" -> true;
             case "draining" -> gameMember;
-            case "builders" -> draslId != null && allowed.contains(new Member(normalizeId(draslId), name));
+            // testers: closed playtest of a workshop candidate on the same backend, same member list.
+            case "builders", "testers" -> draslId != null && allowed.contains(new Member(normalizeId(draslId), name));
             default -> false;
         };
     }
@@ -68,7 +69,7 @@ record Gate(String state, String backend, String message, Set<Member> allowed) {
             if (json.get("schema").getAsInt() != 1) return closed();
             String state = json.get("gate").getAsString();
             String backend = json.get("backend").getAsString();
-            if (!Set.of("public", "draining", "closed", "builders").contains(state) || !Set.of("game", "workshop").contains(backend)) {
+            if (!Set.of("public", "draining", "closed", "builders", "testers").contains(state) || !Set.of("game", "workshop").contains(backend)) {
                 return closed();
             }
             String message = json.get("message").getAsString().strip();
