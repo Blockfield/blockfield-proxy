@@ -93,7 +93,8 @@ def swarm_update(service):
 
 def monitor_window(service):
     try:
-        nanoseconds = docker('service', 'inspect', APPS[service][0], '--format', '{{with .Spec.UpdateConfig}}{{.Monitor}}{{end}}')
+        # json: a plain template prints the Duration as "1m0s"
+        nanoseconds = docker('service', 'inspect', APPS[service][0], '--format', '{{with .Spec.UpdateConfig}}{{json .Monitor}}{{end}}')
         return int(nanoseconds) // 10**9 or 600
     except (subprocess.CalledProcessError, ValueError):
         return 600
