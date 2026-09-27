@@ -41,7 +41,12 @@ POLL = 5
 
 
 def docker(*args):
-    return subprocess.run(['docker', *args], text=True, capture_output=True, check=True, timeout=300).stdout.strip()
+    try:
+        return subprocess.run(['docker', *args], text=True, capture_output=True, check=True, timeout=300).stdout.strip()
+    except subprocess.CalledProcessError as error:
+        # The registry's answer (denied, not found) is the useful part of the failure.
+        print(f'docker {" ".join(args[:4])}: {error.stderr.strip()[-400:]}', file=sys.stderr, flush=True)
+        raise
 
 
 def registry_digest(ref):
