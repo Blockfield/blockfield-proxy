@@ -33,11 +33,16 @@ RELEASE_URL_RE = re.compile(r'https://github\.com/([^/]+/[^/]+)/releases/downloa
 
 
 def version_key(tag):
-    """Порядок тегов компонента: vX.Y.Z, bfN, music-vN, launcher-vX.Y.Z; иначе None."""
-    nums = re.findall(r'\d+', tag or '')
-    if not nums or not re.fullmatch(r'[a-z-]*v?\d+(\.\d+)*', tag or ''):
-        return None
-    return tuple(int(n) for n in nums)
+    """(семейство, номера) для vX.Y.Z, bfN, music-vN, launcher-vX.Y.Z; иначе None.
+
+    Сравнивать можно только ключи одного семейства: import-2.53.0 → bf9 — не откат.
+    """
+    m = re.fullmatch(r'([a-z]+-)?(v|bf)(\d+(?:\.\d+)*)', tag or '')
+    return ((m.group(1) or '') + m.group(2), tuple(map(int, m.group(3).split('.')))) if m else None
+
+
+def comparable(a, b):
+    return a is not None and b is not None and a[0] == b[0]
 
 
 def pin_from(url, name, filename, sha):
@@ -94,7 +99,7 @@ def pin_diff(old_pins, new_pins):
                          f"{new['name']}: {new['tag']} пересобран (хеш изменился)."))
         else:
             ko, kn = version_key(old['tag']), version_key(new['tag'])
-            change = 'rollback' if ko and kn and kn < ko else 'update'
+            change = 'rollback' if comparable(ko, kn) and kn < ko else 'update'
             word = 'откат' if change == 'rollback' else 'обновление'
             rows.append((key, change, old, new, f"{new['name']}: {word} {old['tag']} → {new['tag']}."))
     return rows
@@ -116,11 +121,11 @@ def component_notes(old, new):
     """
     repo = new['repo'] if new['repo'] == old['repo'] else None
     ko, kn = version_key(old['tag']), version_key(new['tag'])
-    if not repo or not ko or not kn:
+    if not repo or not comparable(ko, kn):
         return [], [f"{new['name']}: промежуток {old['tag']} → {new['tag']} не сверен автоматически"]
     lo, hi = sorted((ko, kn))
     releases = [r for page in gh_json(f'repos/{repo}/releases?per_page=100') for r in page
-                if not r['draft'] and version_key(r['tag_name']) and lo < version_key(r['tag_name']) <= hi]
+                if not r['draft'] and comparable(version_key(r['tag_name']), lo) and lo < version_key(r['tag_name']) <= hi]
     releases.sort(key=lambda r: version_key(r['tag_name']))
     prefix = 'снято откатом: ' if kn < ko else ''
     lines, gaps = [], []
