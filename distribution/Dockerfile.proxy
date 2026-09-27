@@ -1,11 +1,15 @@
 # Limbo под 1.21.1 (0.7.10) в апстриме заморожен, а фикс холостого цикла asyncTasksQueue (~50% CPU без игроков)
 # есть только в master под новые версии игры — собираем 1.21.1 сами с бэкпортом (proxy/limbo/*.patch).
-FROM maven:3.9-eclipse-temurin-21 AS limbo
+# База limbo закреплена по digest (тот же, из которого собран v2.54.1): плавающий тег менял бы сборку без правки здесь.
+# Обновление — отдельным PR с новым digest тега 3.9-eclipse-temurin-21.
+FROM maven:3.9-eclipse-temurin-21@sha256:99e61abcff91a9b1333463bd8451fb18495d6eba9250ac66a338b518f8278320 AS limbo
 RUN git clone -q https://github.com/LOOHP/Limbo /src && cd /src && git checkout -q 29571119
 COPY proxy/limbo/*.patch /tmp/limbo-patches/
 RUN cd /src && git apply /tmp/limbo-patches/*.patch && mvn -q -B -DskipTests package
 
-FROM itzg/mc-proxy:java21
+# База прокси закреплена по digest (тот же, из которого собран v2.54.1): плавающий java21 менял бы рантайм без правки здесь.
+# Обновление — отдельным PR с новым digest тега java21.
+FROM itzg/mc-proxy:java21@sha256:e65f52bd44a223181a62c3516d5bbdff7ec185ec527bf43e98175d74290ec94f
 LABEL org.opencontainers.image.source="https://github.com/Blockfield/blockfield-proxy"
 ENV TYPE=VELOCITY VELOCITY_VERSION=3.5.1 VELOCITY_BUILD_ID=615 MEMORY=256m
 COPY --from=limbo /src/target/Limbo-0.7.10-ALPHA-1.21.1.jar /opt/lobby/limbo.jar
