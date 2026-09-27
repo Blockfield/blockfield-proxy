@@ -36,7 +36,7 @@ LOCK = '/tmp/blockfield-deploy.lock'
 # Held for a whole server or client deploy (validation to rollback), so the pair is never checked by one job and
 # switched by another. Deploy server holds it from its workflow with flock(1).
 PAIR_LOCK = '/tmp/blockfield-pair.lock'
-DEADLINE = 900  # the game server's health check allows a 600 s start
+DEADLINE = 1200  # game server: up to 600 s to start healthy, then swarm monitors the update for 600 s
 POLL = 5
 
 
@@ -75,6 +75,14 @@ def running(service):
 def runs(service, digest):
     tasks = running(service)
     return bool(tasks) and all(digest in own and health in ('healthy', 'none') for own, health in tasks)
+
+
+def swarm_update(service):
+    """completed/updating/paused/rollback_* of the last service update; '' when there is none or no swarm."""
+    try:
+        return docker('service', 'inspect', APPS[service][0], '--format', '{{if .UpdateStatus}}{{.UpdateStatus.State}}{{end}}')
+    except subprocess.CalledProcessError:
+        return ''
 
 
 def current(service):
@@ -168,8 +176,13 @@ def deploy(service, digest):
                 resent = True
                 call(service, note)
             elif log and runs(service, digest):
-                print(f'{service}: runs {digest}')
-                return
+                # Swarm may still pause or roll back the update inside its monitor window.
+                state = swarm_update(service)
+                if state.startswith('rollback') or state == 'paused':
+                    raise SystemExit(f'{service}: swarm update {state}; see docker service ps')
+                if state != 'updating':
+                    print(f'{service}: runs {digest}')
+                    return
             time.sleep(POLL)
         raise SystemExit(f'{service}: {digest} is not running healthy after {DEADLINE} s; see the Dokploy deployment log')
 
