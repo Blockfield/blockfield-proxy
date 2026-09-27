@@ -5,6 +5,10 @@ on:
       tag:
         description: 'Published proxy image tag (restarts player connections)'
         required: true
+      without_rollback:
+        description: 'Allow a deploy whose running proxy image is outside ghcr.io/blockfield (no automatic rollback)'
+        type: boolean
+        default: false
 permissions:
   contents: read
   packages: write
@@ -15,8 +19,9 @@ jobs:
   deploy:
     runs-on: blockfield-deploy
     env:
-      DOKPLOY_API_KEY: ${{ secrets.DOKPLOY_API_KEY }}
-    timeout-minutes: 10
+      # Redeploys only the proxy's :prod channel; no Dokploy API key in Actions.
+      DOKPLOY_PROXY_WEBHOOK: ${{ secrets.DOKPLOY_PROXY_WEBHOOK }}
+    timeout-minutes: 45
     steps:
       - run: echo "DOCKER_CONFIG=$RUNNER_TEMP/docker" >> "$GITHUB_ENV"
       - uses: actions/checkout@v4
@@ -27,9 +32,26 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ github.token }}
-      - env:
+      - name: Deploy the exact release, roll back to the running digest on failure
+        env:
           TAG: ${{ inputs.tag }}
+          WITHOUT_ROLLBACK: ${{ inputs.without_rollback }}
         run: |
-          scripts/retry.sh docker buildx imagetools create --tag ghcr.io/blockfield/blockfield-proxy:latest "ghcr.io/blockfield/blockfield-proxy:$TAG"
-          scripts/wait-latest.sh ghcr.io/blockfield/blockfield-proxy "$TAG"
-          python3 scripts/deploy-webhooks.py proxy
+          python3 - <<'PYCODE'
+          import os, sys
+          sys.path.insert(0, 'scripts')
+          hooks = __import__('deploy-webhooks')
+          digest = hooks.release_digest('blockfield-proxy', os.environ['TAG'])
+          try:
+              previous = hooks.current('blockfield-proxy')
+          except ValueError as error:
+              if os.environ['WITHOUT_ROLLBACK'] != 'true':
+                  raise SystemExit(f'{error}: rerun with without_rollback to deploy anyway')
+              previous = None
+          try:
+              hooks.deploy('blockfield-proxy', digest)
+          except BaseException:
+              if previous:
+                  hooks.deploy('blockfield-proxy', previous)
+              raise
+          PYCODE
