@@ -14,6 +14,8 @@ concurrency:
 jobs:
   deploy:
     runs-on: blockfield-deploy
+    env:
+      DOKPLOY_API_KEY: ${{ secrets.DOKPLOY_API_KEY }}
     timeout-minutes: 10
     steps:
       - run: echo "DOCKER_CONFIG=$RUNNER_TEMP/docker" >> "$GITHUB_ENV"
@@ -27,7 +29,6 @@ jobs:
           password: ${{ github.token }}
       - env:
           TAG: ${{ inputs.tag }}
-          PROXY_WEBHOOK: ${{ secrets.DOKPLOY_PROXY_WEBHOOK }}
         run: |
           scripts/retry.sh docker buildx imagetools create --tag ghcr.io/blockfield/blockfield-proxy:latest "ghcr.io/blockfield/blockfield-proxy:$TAG"
           scripts/wait-latest.sh ghcr.io/blockfield/blockfield-proxy "$TAG"
