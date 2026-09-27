@@ -21,7 +21,8 @@ jobs:
     env:
       # Redeploys only the proxy's :prod channel; no Dokploy API key in Actions.
       DOKPLOY_PROXY_WEBHOOK: ${{ secrets.DOKPLOY_PROXY_WEBHOOK }}
-    timeout-minutes: 45
+    # Rollout and its rollback at the deploy-webhooks.py limits.
+    timeout-minutes: 60
     steps:
       - run: echo "DOCKER_CONFIG=$RUNNER_TEMP/docker" >> "$GITHUB_ENV"
       - uses: actions/checkout@v4

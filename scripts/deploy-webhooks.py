@@ -2,12 +2,13 @@
 
 The Dokploy webhook redeploys only the image configured in the app and answers before pulling. So every app is
 configured once with its channel tag ghcr.io/blockfield/<app>:prod. deploy() points the channel at the validated
-digest, calls the webhook and returns only when the Dokploy log shows the pull of that digest and every running task
-of the swarm service runs it healthy.
+digest, calls the webhook and returns only when the Dokploy log shows the pull of that digest, every running task
+of the swarm service runs it healthy and swarm has closed the update's monitor window.
 
     deploy-webhooks.py digest <app> <vX.Y.Z>   registry digest of a release image
     deploy-webhooks.py current <app>           digest of the running image (the exact rollback target)
     deploy-webhooks.py deploy <app> <digest>   <app>: server, distribution or proxy
+    deploy-webhooks.py serves <app> <digest>   exit 0 when every running task was started from this digest
 """
 import contextlib
 import fcntl
@@ -36,7 +37,12 @@ LOCK = '/tmp/blockfield-deploy.lock'
 # Held for a whole server or client deploy (validation to rollback), so the pair is never checked by one job and
 # switched by another. Deploy server holds it from its workflow with flock(1).
 PAIR_LOCK = '/tmp/blockfield-pair.lock'
-DEADLINE = 1200  # game server: up to 600 s to start healthy, then swarm monitors the update for 600 s
+# Webhook to healthy task on the new digest: pull, stop-first stop (grace 120 s), then the game server's health check
+# (start period 600 s, 6 retries x 30 s). Measured on prod 2026-09-27: about 1.5 min.
+STARTUP = 1200
+# Healthy to swarm's "completed": the service's UpdateConfig.Monitor (server 600 s, distribution 120 s, proxy 60 s)
+# plus this margin; 600 s when the monitor cannot be read.
+MARGIN = 300
 POLL = 5
 
 
@@ -83,6 +89,20 @@ def swarm_update(service):
         return docker('service', 'inspect', APPS[service][0], '--format', '{{if .UpdateStatus}}{{.UpdateStatus.State}}{{end}}')
     except subprocess.CalledProcessError:
         return ''
+
+
+def monitor_window(service):
+    try:
+        nanoseconds = docker('service', 'inspect', APPS[service][0], '--format', '{{with .Spec.UpdateConfig}}{{.Monitor}}{{end}}')
+        return int(nanoseconds) // 10**9 or 600
+    except (subprocess.CalledProcessError, ValueError):
+        return 600
+
+
+def serves(service, digest):
+    """Every running task was started from digest, healthy or not: which release the app is actually on."""
+    tasks = running(service)
+    return bool(tasks) and all(digest in own for own, _ in tasks)
 
 
 def current(service):
@@ -164,7 +184,8 @@ def deploy(service, digest):
         note = f"{os.environ.get('GITHUB_REPOSITORY', 'local')} run {os.environ.get('GITHUB_RUN_ID', '-')} {digest}"
         sent, resent, seen = time.time() - 1, False, set()
         call(service, note)
-        deadline = time.monotonic() + DEADLINE
+        limit, monitoring = STARTUP, False
+        deadline = time.monotonic() + limit
         while time.monotonic() < deadline:
             path, log = dokploy_log(service, sent, seen)
             # A pull that failed or returned another digest (registry lag) left the service untouched: safe to resend once.
@@ -175,16 +196,26 @@ def deploy(service, digest):
                 seen.add(path)
                 resent = True
                 call(service, note)
-            elif log and runs(service, digest):
+            # The update state is only this update's once a task of the digest ran healthy; before that it can be
+            # the previous update's paused or rollback.
+            elif log and (monitoring or runs(service, digest)):
                 # Swarm may still pause or roll back the update inside its monitor window.
                 state = swarm_update(service)
                 if state.startswith('rollback') or state == 'paused':
                     raise SystemExit(f'{service}: swarm update {state}; see docker service ps')
-                if state != 'updating':
+                if state != 'updating' and runs(service, digest):
                     print(f'{service}: runs {digest}')
                     return
+                if not monitoring:
+                    # A slow start does not eat into the monitor window: the limit restarts here.
+                    monitoring, limit = True, monitor_window(service) + MARGIN
+                    deadline = time.monotonic() + limit
+                    print(f'{service}: healthy on {digest}, waiting up to {limit} s for swarm to complete the update', flush=True)
             time.sleep(POLL)
-        raise SystemExit(f'{service}: {digest} is not running healthy after {DEADLINE} s; see the Dokploy deployment log')
+        if monitoring:
+            raise SystemExit(f'{service}: swarm has not completed the update {limit} s after the task became healthy; '
+                             'see docker service inspect')
+        raise SystemExit(f'{service}: {digest} is not running healthy after {STARTUP} s; see the Dokploy deployment log')
 
 
 if __name__ == '__main__':
@@ -196,5 +227,7 @@ if __name__ == '__main__':
         print(current(service))
     elif command == 'deploy':
         deploy(service, *rest)
+    elif command == 'serves':
+        sys.exit(0 if serves(service, *rest) else 1)
     else:
         raise SystemExit(__doc__)
