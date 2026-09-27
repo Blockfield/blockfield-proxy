@@ -42,7 +42,7 @@ jobs:
           context: .
           file: distribution/Dockerfile.proxy
           push: ${{ github.ref_type == 'tag' }}
-          tags: ghcr.io/blockfield/blockfield-proxy:${{ github.ref_name }}
+          tags: ${{ github.event_name == 'pull_request' && format('ghcr.io/blockfield/blockfield-proxy:pr-{0}', github.event.pull_request.number) || format('ghcr.io/blockfield/blockfield-proxy:{0}', github.ref_name) }}
   # Описание версии: только GitHub Release с release-notes.md; деплой — отдельный ручной workflow.
   release:
     if: github.ref_type == 'tag'
