@@ -106,9 +106,10 @@ def call(service, note):
         raise SystemExit(f'{service}: Dokploy webhook unreachable ({type(error.reason).__name__})') from None
 
 
-def dokploy_log(service, since):
-    logs = [p for p in (LOGS / APPS[service][0]).glob('*.log') if p.stat().st_mtime >= since]
-    return max(logs, key=lambda p: p.stat().st_mtime).read_text(errors='replace') if logs else ''
+def dokploy_log(service, since, seen):
+    logs = [p for p in (LOGS / APPS[service][0]).glob('*.log') if p.stat().st_mtime >= since and p not in seen]
+    newest = max(logs, key=lambda p: p.stat().st_mtime, default=None)
+    return newest, newest.read_text(errors='replace') if newest else ''
 
 
 def wait(condition, seconds, message):
@@ -148,17 +149,18 @@ def deploy(service, digest):
             print(f'{service}: {digest} already runs, webhook not sent')
             return
         note = f"{os.environ.get('GITHUB_REPOSITORY', 'local')} run {os.environ.get('GITHUB_RUN_ID', '-')} {digest}"
-        sent, resent = time.time() - 1, False
+        sent, resent, seen = time.time() - 1, False, set()
         call(service, note)
         deadline = time.monotonic() + DEADLINE
         while time.monotonic() < deadline:
-            log = dokploy_log(service, sent)
+            path, log = dokploy_log(service, sent, seen)
             # A pull that failed or returned another digest (registry lag) left the service untouched: safe to resend once.
             if '❌' in log or ('✅' in log and 'Digest: ' + digest not in log):
                 if resent:
                     raise SystemExit(f'{service}: Dokploy deployment failed:\n' + '\n'.join(log.splitlines()[-8:]))
                 print(f'{service}: Dokploy pull failed, resending the webhook once', flush=True)
-                sent, resent = time.time() - 1, True
+                seen.add(path)
+                resent = True
                 call(service, note)
             elif log and runs(service, digest):
                 print(f'{service}: runs {digest}')
