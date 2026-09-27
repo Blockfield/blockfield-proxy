@@ -1,0 +1,34 @@
+name: Deploy proxy
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Published proxy image tag (restarts player connections)'
+        required: true
+permissions:
+  contents: read
+  packages: write
+concurrency:
+  group: blockfield-proxy-deploy
+  cancel-in-progress: false
+jobs:
+  deploy:
+    runs-on: blockfield-deploy
+    timeout-minutes: 10
+    steps:
+      - run: echo "DOCKER_CONFIG=$RUNNER_TEMP/docker" >> "$GITHUB_ENV"
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - env:
+          TAG: ${{ inputs.tag }}
+          PROXY_WEBHOOK: ${{ secrets.DOKPLOY_PROXY_WEBHOOK }}
+        run: |
+          scripts/retry.sh docker buildx imagetools create --tag ghcr.io/blockfield/blockfield-proxy:latest "ghcr.io/blockfield/blockfield-proxy:$TAG"
+          scripts/wait-latest.sh ghcr.io/blockfield/blockfield-proxy "$TAG"
+          python3 scripts/deploy-webhooks.py proxy

@@ -5,7 +5,7 @@ import urllib.request
 
 
 def deploy(service, url):
-    body = {'repository': {'repo_name': f'ghcr.io/netherg-io/{service}'},
+    body = {'repository': {'repo_name': f'ghcr.io/blockfield/{service}'},
             'push_data': {'tag': 'latest', 'pusher': 'GitHub Actions'}}
     request = urllib.request.Request(url, data=json.dumps(body).encode(),
                                      headers={'Content-Type': 'application/json', 'User-Agent': 'Go-http-client/1.1'})

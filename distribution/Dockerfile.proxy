@@ -6,7 +6,7 @@ COPY proxy/limbo/*.patch /tmp/limbo-patches/
 RUN cd /src && git apply /tmp/limbo-patches/*.patch && mvn -q -B -DskipTests package
 
 FROM itzg/mc-proxy:java21
-LABEL org.opencontainers.image.source="https://github.com/netherg-io/blockfield-modpack"
+LABEL org.opencontainers.image.source="https://github.com/Blockfield/blockfield-proxy"
 ENV TYPE=VELOCITY VELOCITY_VERSION=3.5.1 VELOCITY_BUILD_ID=615 MEMORY=256m
 COPY --from=limbo /src/target/Limbo-0.7.10-ALPHA-1.21.1.jar /opt/lobby/limbo.jar
 ADD --checksum=sha256:b03cebc45c1583edf8c7456fa67f0a6248eb95a856249378173cc1ea8b8d0d68 \
