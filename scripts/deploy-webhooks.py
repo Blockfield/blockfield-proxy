@@ -40,7 +40,7 @@ PAIR_LOCK = '/tmp/blockfield-pair.lock'
 # Webhook to healthy task on the new digest: pull, stop-first stop (grace 120 s), then the game server's health check
 # (start period 600 s, 6 retries x 30 s). Measured on prod 2026-09-27: about 1.5 min.
 STARTUP = 1200
-# Healthy to swarm's "completed": the service's UpdateConfig.Monitor (server 600 s, distribution 120 s, proxy 60 s)
+# Healthy to swarm's "completed": the service's UpdateConfig.Monitor (server and distribution 120 s, proxy 60 s)
 # plus this margin; 600 s when the monitor cannot be read.
 MARGIN = 300
 POLL = 5
