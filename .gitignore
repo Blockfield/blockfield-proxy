@@ -1,2 +1,5 @@
 proxy/plugin/build/
 proxy/plugin/.gradle/
+
+.cache/quality/
+__pycache__/

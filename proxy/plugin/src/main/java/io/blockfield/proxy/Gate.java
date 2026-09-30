@@ -17,10 +17,12 @@ import java.util.regex.Pattern;
 
 /**
  * Вход на backend по gate.json host-контроллера мастерской (tools/workshop, blockfield-releases#8).
- * Без BLOCKFIELD_GATE_FILE прокси работает как раньше; с ним отсутствующий, битый или незнакомый файл закрывает вход.
+ * Без BLOCKFIELD_GATE_FILE прокси работает как раньше; с ним отсутствующий, битый или незнакомый
+ * файл закрывает вход.
  */
 record Gate(String state, String backend, String message, Set<Member> allowed) {
-    static final String DEFAULT_MESSAGE = "На сервере проводятся технические работы. Обычный вход временно недоступен.";
+    static final String DEFAULT_MESSAGE =
+            "На сервере проводятся технические работы. Обычный вход временно недоступен.";
     static final Gate OPEN = new Gate("public", "game", "", Set.of());
     private static final Pattern DRASL_ID = Pattern.compile("[0-9a-f]{32}");
     private static final int MAX_BYTES = 256 * 1024;
@@ -47,8 +49,10 @@ record Gate(String state, String backend, String message, Set<Member> allowed) {
         return switch (state) {
             case "public" -> true;
             case "draining" -> gameMember;
-            // testers: closed playtest of a workshop candidate on the same backend, same member list.
-            case "builders", "testers" -> draslId != null && allowed.contains(new Member(normalizeId(draslId), name));
+            // testers: closed playtest of a workshop candidate on the same backend, same member
+            // list.
+            case "builders", "testers" ->
+                    draslId != null && allowed.contains(new Member(normalizeId(draslId), name));
             default -> false;
         };
     }
@@ -57,7 +61,9 @@ record Gate(String state, String backend, String message, Set<Member> allowed) {
         if (path == null) return OPEN;
         try (InputStream in = Files.newInputStream(path)) {
             byte[] data = in.readNBytes(MAX_BYTES + 1);
-            return data.length > MAX_BYTES ? closed() : parse(new String(data, StandardCharsets.UTF_8));
+            return data.length > MAX_BYTES
+                    ? closed()
+                    : parse(new String(data, StandardCharsets.UTF_8));
         } catch (IOException | RuntimeException e) {
             return closed();
         }
@@ -69,7 +75,8 @@ record Gate(String state, String backend, String message, Set<Member> allowed) {
             if (json.get("schema").getAsInt() != 1) return closed();
             String state = json.get("gate").getAsString();
             String backend = json.get("backend").getAsString();
-            if (!Set.of("public", "draining", "closed", "builders", "testers").contains(state) || !Set.of("game", "workshop").contains(backend)) {
+            if (!Set.of("public", "draining", "closed", "builders", "testers").contains(state)
+                    || !Set.of("game", "workshop").contains(backend)) {
                 return closed();
             }
             String message = json.get("message").getAsString().strip();
@@ -81,7 +88,8 @@ record Gate(String state, String backend, String message, Set<Member> allowed) {
                 JsonObject member = element.getAsJsonObject();
                 String id = normalizeId(member.get("draslId").getAsString());
                 String name = member.get("name").getAsString();
-                if (!DRASL_ID.matcher(id).matches() || !BlockfieldProxy.NAME.matcher(name).matches()) return closed();
+                if (!DRASL_ID.matcher(id).matches()
+                        || !BlockfieldProxy.NAME.matcher(name).matches()) return closed();
                 allowed.add(new Member(id, name));
             }
             return new Gate(state, backend, message, Set.copyOf(allowed));

@@ -3,8 +3,6 @@ package io.blockfield.proxy;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 
-import javax.crypto.Mac;
-import javax.crypto.spec.SecretKeySpec;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.security.GeneralSecurityException;
@@ -13,14 +11,19 @@ import java.security.SecureRandom;
 import java.util.Base64;
 import java.util.HexFormat;
 
+import javax.crypto.Mac;
+import javax.crypto.spec.SecretKeySpec;
+
 /**
- * Запомненный вход для игроков без токена Drasl (Prism offline). После /login клиент получает JWT (HS256)
- * и отдельный ключ; при следующем входе он шлёт JWT и HMAC(ключ, serverId). Ключ выводится из jti и секрета
- * прокси и в JWT не лежит, поэтому перехваченный ответ не годится для другого serverId.
+ * Запомненный вход для игроков без токена Drasl (Prism offline). После /login клиент получает JWT
+ * (HS256) и отдельный ключ; при следующем входе он шлёт JWT и HMAC(ключ, serverId). Ключ выводится
+ * из jti и секрета прокси и в JWT не лежит, поэтому перехваченный ответ не годится для другого
+ * serverId.
  */
 final class Sessions {
     static final long TTL_SECONDS = 30L * 24 * 3600;
-    private static final String HEADER = b64("{\"alg\":\"HS256\",\"typ\":\"JWT\"}".getBytes(StandardCharsets.UTF_8));
+    private static final String HEADER =
+            b64("{\"alg\":\"HS256\",\"typ\":\"JWT\"}".getBytes(StandardCharsets.UTF_8));
     private static final SecureRandom RANDOM = new SecureRandom();
 
     private Sessions() {}
@@ -40,10 +43,15 @@ final class Sessions {
         claims.addProperty("iat", now);
         claims.addProperty("exp", now + TTL_SECONDS);
         String unsigned = HEADER + "." + b64(claims.toString().getBytes(StandardCharsets.UTF_8));
-        return new String[]{unsigned + "." + b64(hmac(secret, unsigned)), HexFormat.of().formatHex(key(secret, jti))};
+        return new String[] {
+            unsigned + "." + b64(hmac(secret, unsigned)), HexFormat.of().formatHex(key(secret, jti))
+        };
     }
 
-    /** Ответ клиента на login-запрос: байт 2, затем writeUtf(jwt) и writeUtf(hex HMAC(ключ, serverId)). */
+    /**
+     * Ответ клиента на login-запрос: байт 2, затем writeUtf(jwt) и writeUtf(hex HMAC(ключ,
+     * serverId)).
+     */
     static boolean verify(byte[] secret, String name, String serverId, byte[] response, long now) {
         try {
             ByteBuffer in = ByteBuffer.wrap(response);
@@ -53,9 +61,17 @@ final class Sessions {
             if (in.hasRemaining()) return false;
             String[] parts = jwt.split("\\.");
             if (parts.length != 3 || !parts[0].equals(HEADER)) return false;
-            if (!MessageDigest.isEqual(Base64.getUrlDecoder().decode(parts[2]), hmac(secret, parts[0] + "." + parts[1]))) return false;
-            JsonObject claims = JsonParser.parseString(new String(Base64.getUrlDecoder().decode(parts[1]), StandardCharsets.UTF_8)).getAsJsonObject();
-            if (!claims.get("sub").getAsString().equals(name) || claims.get("exp").getAsLong() <= now) return false;
+            if (!MessageDigest.isEqual(
+                    Base64.getUrlDecoder().decode(parts[2]),
+                    hmac(secret, parts[0] + "." + parts[1]))) return false;
+            JsonObject claims =
+                    JsonParser.parseString(
+                                    new String(
+                                            Base64.getUrlDecoder().decode(parts[1]),
+                                            StandardCharsets.UTF_8))
+                            .getAsJsonObject();
+            if (!claims.get("sub").getAsString().equals(name)
+                    || claims.get("exp").getAsLong() <= now) return false;
             byte[] expected = hmac(key(secret, claims.get("jti").getAsString()), serverId);
             return MessageDigest.isEqual(HexFormat.of().parseHex(proof), expected);
         } catch (RuntimeException e) {
