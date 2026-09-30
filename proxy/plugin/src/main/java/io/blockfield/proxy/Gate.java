@@ -88,8 +88,8 @@ record Gate(String state, String backend, String message, Set<Member> allowed) {
                 JsonObject member = element.getAsJsonObject();
                 String id = normalizeId(member.get("draslId").getAsString());
                 String name = member.get("name").getAsString();
-                if (!DRASL_ID.matcher(id).matches()
-                        || !BlockfieldProxy.NAME.matcher(name).matches()) return closed();
+                if (!DRASL_ID.matcher(id).matches() || !Authentication.NAME.matcher(name).matches())
+                    return closed();
                 allowed.add(new Member(id, name));
             }
             return new Gate(state, backend, message, Set.copyOf(allowed));

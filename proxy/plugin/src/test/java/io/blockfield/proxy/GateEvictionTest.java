@@ -2,6 +2,8 @@ package io.blockfield.proxy;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
+import com.velocitypowered.api.event.connection.DisconnectEvent;
+import com.velocitypowered.api.event.player.ServerPreConnectEvent;
 import com.velocitypowered.api.proxy.ConnectionRequestBuilder;
 import com.velocitypowered.api.proxy.Player;
 import com.velocitypowered.api.proxy.ProxyServer;
@@ -79,10 +81,14 @@ class GateEvictionTest {
                                     case "getAllPlayers" -> List.of(builder);
                                     default -> null;
                                 });
-        BlockfieldProxy plugin = new BlockfieldProxy(proxy, LoggerFactory.getLogger("test"));
-        this.<Set<UUID>>field(plugin, "authed").add(id);
-        this.<Map<UUID, String>>field(plugin, "draslIds").put(id, DRASL);
-        Method tick = BlockfieldProxy.class.getDeclaredMethod("tick");
+        Authentication authentication =
+                new Authentication(
+                        this, proxy, LoggerFactory.getLogger("test"), new LoginForwarding());
+        BackendRouting plugin =
+                new BackendRouting(this, proxy, LoggerFactory.getLogger("test"), authentication);
+        this.<Set<UUID>>field(authentication, "authed").add(id);
+        this.<Map<UUID, String>>field(authentication, "draslIds").put(id, DRASL);
+        Method tick = BackendRouting.class.getDeclaredMethod("tick");
         tick.setAccessible(true);
 
         setGate(
@@ -101,6 +107,25 @@ class GateEvictionTest {
                 "the closed gate evicts once even though tick did not reload it");
         tick.invoke(plugin);
         assertEquals(1, evictions.get(), "no repeated eviction for the same gate");
+
+        setGate(plugin, Gate.OPEN);
+        var admitted = new ServerPreConnectEvent(builder, game, lobby);
+        plugin.onPreConnect(admitted);
+        assertEquals(
+                true, admitted.getResult().isAllowed(), "authenticated player enters public game");
+        authentication.onDisconnect(
+                new DisconnectEvent(builder, DisconnectEvent.LoginStatus.SUCCESSFUL_LOGIN));
+        assertEquals(false, authentication.authenticated(builder));
+        assertEquals(null, authentication.profileId(id));
+        var denied = new ServerPreConnectEvent(builder, game, lobby);
+        plugin.onPreConnect(denied);
+        assertEquals(false, denied.getResult().isAllowed(), "disconnect revokes backend admission");
+        var parked = new ServerPreConnectEvent(builder, lobby, game);
+        plugin.onPreConnect(parked);
+        assertEquals(
+                true,
+                parked.getResult().isAllowed(),
+                "unauthenticated player may still enter lobby");
     }
 
     private static RegisteredServer server(String name) {
@@ -116,21 +141,21 @@ class GateEvictionTest {
                         });
     }
 
-    private static void setGate(BlockfieldProxy plugin, Gate gate) throws Exception {
-        Field field = BlockfieldProxy.class.getDeclaredField("gate");
+    private static void setGate(BackendRouting plugin, Gate gate) throws Exception {
+        Field field = BackendRouting.class.getDeclaredField("gate");
         field.setAccessible(true);
         field.set(plugin, gate);
     }
 
     @SuppressWarnings("unchecked")
-    private <T> T field(BlockfieldProxy plugin, String name) throws Exception {
-        Field field = BlockfieldProxy.class.getDeclaredField(name);
+    private <T> T field(Authentication plugin, String name) throws Exception {
+        Field field = Authentication.class.getDeclaredField(name);
         field.setAccessible(true);
         return (T) field.get(plugin);
     }
 
     @SuppressWarnings("unchecked")
-    private static <T> T fake(Class<T> type, BiFunction<String, Object[], Object> answer) {
+    static <T> T fake(Class<T> type, BiFunction<String, Object[], Object> answer) {
         return (T)
                 java.lang.reflect.Proxy.newProxyInstance(
                         type.getClassLoader(),

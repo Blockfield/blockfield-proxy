@@ -14,9 +14,9 @@ class SessionsTest {
     private static byte[] answer(String jwt, String keyHex, String serverId) {
         ByteArrayOutputStream out = new ByteArrayOutputStream();
         out.write(2);
-        out.writeBytes(BlockfieldProxy.utf(jwt));
+        out.writeBytes(Authentication.utf(jwt));
         out.writeBytes(
-                BlockfieldProxy.utf(
+                Authentication.utf(
                         HexFormat.of()
                                 .formatHex(
                                         Sessions.hmac(HexFormat.of().parseHex(keyHex), serverId))));
