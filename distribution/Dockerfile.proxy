@@ -3,7 +3,7 @@
 # База limbo закреплена по digest (тот же, из которого собран v2.54.1): плавающий тег менял бы сборку без правки здесь.
 # Обновление — отдельным PR с новым digest тега 3.9-eclipse-temurin-21.
 FROM maven:3.9-eclipse-temurin-21@sha256:99e61abcff91a9b1333463bd8451fb18495d6eba9250ac66a338b518f8278320 AS limbo
-RUN git clone -q https://github.com/LOOHP/Limbo /src && cd /src && git checkout -q 29571119
+RUN git clone -q https://github.com/LOOHP/Limbo /src && cd /src && git checkout -q 29571119f9df6737b5025b9ff1207e49b90cac82
 COPY proxy/limbo/*.patch /tmp/limbo-patches/
 RUN cd /src && git apply /tmp/limbo-patches/*.patch && mvn -q -B -DskipTests package
 
