@@ -59,7 +59,9 @@ class Client:
             elif key == "finish_configuration":
                 self.send_named("finish_configuration")
                 self.phase = "play"
-        self.until(lambda key, data: key == "player_position")
+        position = self.until(lambda key, data: key == "player_position")
+        assert position[32] == 0, "Initial spawn must use absolute coordinates"
+        self.position = struct.unpack(">ddd", position[:24])
 
     def send(self, packet, data=b""):
         body = varint(packet) + data
@@ -173,13 +175,15 @@ def main():
         second = Client("LobbyCheckB", port, packets, player_type)
         first.sees(second)
         second.sees(first)
+        x, y, z = first.position
+        target = (x + 1, y, z + 1)
         second.send_named(
-            "move_player_pos_rot", struct.pack(">dddff?", 60.5, 18, 52.5, 90, 15, True)
+            "move_player_pos_rot", struct.pack(">dddff?", *target, 90, 15, True)
         )
         data = first.until(lambda key, data: key == "teleport_entity")
         body = io.BytesIO(data)
         assert read_varint(body) == second.entity
-        assert struct.unpack(">ddd", body.read(24)) == (60.5, 18, 52.5)
+        assert struct.unpack(">ddd", body.read(24)) == target
         assert body.read(2) == bytes([64, 10])
         data = first.until(lambda key, data: key == "rotate_head")
         body = io.BytesIO(data)
