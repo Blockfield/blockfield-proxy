@@ -12,7 +12,6 @@ of the swarm service runs it healthy and swarm has closed the update's monitor w
 """
 
 import contextlib
-import fcntl
 import json
 import os
 import re
@@ -22,6 +21,11 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
+
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
 
 REGISTRY = "ghcr.io/blockfield/"
 # Dokploy app name (= swarm service and log directory) and the repository secret holding its webhook URL.
@@ -219,6 +223,8 @@ def wait(condition, seconds, message):
 
 @contextlib.contextmanager
 def pair_lock(seconds=1800):
+    if fcntl is None:
+        raise RuntimeError("Production deployment locking requires a Linux runner")
     with open(PAIR_LOCK, "a") as lock:
         deadline = time.monotonic() + seconds
         while True:
@@ -238,6 +244,8 @@ def pair_lock(seconds=1800):
 def deploy(service, digest):
     if service not in APPS or not DIGEST.fullmatch(digest):
         raise ValueError("Unexpected deployment target")
+    if fcntl is None:
+        raise RuntimeError("Production deployment locking requires a Linux runner")
     image = REGISTRY + service
     with open(LOCK, "a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
