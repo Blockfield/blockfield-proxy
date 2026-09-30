@@ -19,7 +19,7 @@ jobs:
   deploy:
     runs-on: blockfield-deploy
     env:
-      # Redeploys only the proxy's :prod channel; no Dokploy API key in Actions.
+      # Redeploys only the proxy's :latest channel; no Dokploy API key in Actions.
       DOKPLOY_PROXY_WEBHOOK: ${{ secrets.DOKPLOY_PROXY_WEBHOOK }}
     # Rollout and its rollback at the deploy-webhooks.py limits.
     timeout-minutes: 60
