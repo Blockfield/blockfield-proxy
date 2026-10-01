@@ -28,10 +28,8 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
-        with:
-          python-version: "3.12.10"
-      - run: python -I -X utf8 scripts/toolchain.py --ci
+      - name: Bootstrap pinned project tools
+        run: python3 -I -X utf8 scripts/toolchain.py --ci
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
