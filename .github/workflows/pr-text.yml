@@ -14,7 +14,7 @@ jobs:
       contents: read
       pull-requests: write
     steps:
-      - uses: Blockfield/blockfield-workspace/.github/actions/release-text@967a62fafed15d5915a65edf1773d0b5b6f026ee
+      - uses: Blockfield/blockfield-workspace/.github/actions/release-text@4ab737a26625bcbeece19f86e9a3c9cad5419337
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           RELEASE_TEXT_MODEL: ${{ vars.RELEASE_TEXT_MODEL }}
