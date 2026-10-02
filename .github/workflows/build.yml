@@ -7,6 +7,9 @@ on:
   workflow_dispatch:
 permissions:
   contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
   build:
     runs-on: blacksmith-4vcpu-ubuntu-2404
@@ -29,6 +32,7 @@ jobs:
         with:
           node-version: "22.23.2"
       - run: python -I -X utf8 scripts/toolchain.py --ci
+      - uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a # v4
       - run: just build
         working-directory: proxy/plugin
       - uses: docker/setup-buildx-action@v3
@@ -41,6 +45,8 @@ jobs:
       - uses: docker/build-push-action@v6
         with:
           context: .
+          cache-from: type=gha,scope=blockfield-proxy
+          cache-to: type=gha,mode=max,scope=blockfield-proxy
           file: distribution/Dockerfile.proxy
           push: ${{ github.ref_type == 'tag' }}
           tags: ${{ github.event_name == 'pull_request' && format('ghcr.io/blockfield/blockfield-proxy:pr-{0}', github.event.pull_request.number) || format('ghcr.io/blockfield/blockfield-proxy:{0}', github.ref_name) }}
