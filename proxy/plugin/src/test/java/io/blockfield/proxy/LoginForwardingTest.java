@@ -57,6 +57,18 @@ class LoginForwardingTest {
                 new ServerLoginPluginMessageEvent(connection, LoginForwarding.PACK, new byte[0], 1);
         forwarding.onBackendLoginMessage(pack);
         assertArrayEquals(version, pack.getResult().getResponse());
+        var missingContract =
+                new ServerLoginPluginMessageEvent(
+                        connection, LoginForwarding.CONTRACT, new byte[0], 3);
+        forwarding.onBackendLoginMessage(missingContract);
+        assertFalse(missingContract.getResult().isAllowed());
+        byte[] contract = {7, 8};
+        forwarding.rememberContract(id, contract);
+        var contractQuery =
+                new ServerLoginPluginMessageEvent(
+                        connection, LoginForwarding.CONTRACT, new byte[0], 4);
+        forwarding.onBackendLoginMessage(contractQuery);
+        assertArrayEquals(contract, contractQuery.getResult().getResponse());
         byte[] config = {4, 5, 6};
         var tacz =
                 new ServerLoginPluginMessageEvent(
@@ -79,6 +91,10 @@ class LoginForwardingTest {
         assertEquals(1, deliveries.get(), "disconnect clears retained config");
         forwarding.onBackendLoginMessage(pack);
         assertFalse(pack.getResult().isAllowed(), "disconnect clears cached pack response");
+        forwarding.onBackendLoginMessage(contractQuery);
+        assertFalse(
+                contractQuery.getResult().isAllowed(),
+                "disconnect clears cached contract response");
     }
 
     private static ServerConnection on(String name) {

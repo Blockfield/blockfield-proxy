@@ -68,6 +68,7 @@ final class Authentication {
             long createdAt,
             CompletableFuture<Boolean> auth,
             CompletableFuture<byte[]> pack,
+            CompletableFuture<byte[]> contract,
             AtomicReference<String> drasl) {}
 
     private final Map<String, Pending> pending = new ConcurrentHashMap<>();
@@ -153,11 +154,14 @@ final class Authentication {
         if (!(event.getConnection() instanceof LoginPhaseConnection connection)) return;
         var auth = new CompletableFuture<Boolean>();
         var pack = new CompletableFuture<byte[]>();
+        var contract = new CompletableFuture<byte[]>();
         var drasl = new AtomicReference<String>();
         pending.put(
                 key(event.getConnection().getRemoteAddress(), event.getUsername()),
-                new Pending(System.currentTimeMillis(), auth, pack, drasl));
+                new Pending(System.currentTimeMillis(), auth, pack, contract, drasl));
         connection.sendLoginPluginMessage(LoginForwarding.PACK, new byte[0], pack::complete);
+        connection.sendLoginPluginMessage(
+                LoginForwarding.CONTRACT, new byte[0], contract::complete);
         String serverId = HexFormat.of().formatHex(bytes(20));
         connection.sendLoginPluginMessage(
                 AUTH,
@@ -197,6 +201,13 @@ final class Authentication {
                                 .thenAccept(
                                         reply -> {
                                             if (reply != null) forwarding.rememberPack(id, reply);
+                                        }),
+                        entry.contract()
+                                .completeOnTimeout(null, 10, TimeUnit.SECONDS)
+                                .thenAccept(
+                                        reply -> {
+                                            if (reply != null)
+                                                forwarding.rememberContract(id, reply);
                                         }),
                         entry.auth()
                                 .completeOnTimeout(false, 15, TimeUnit.SECONDS)
