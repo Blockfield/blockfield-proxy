@@ -52,6 +52,7 @@ jobs:
     timeout-minutes: 15
     permissions:
       contents: write
+      pull-requests: read # release-text reads the merged pull requests of the range
     steps:
       - uses: actions/checkout@v4
         with:
