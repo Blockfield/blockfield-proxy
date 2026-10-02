@@ -7,7 +7,7 @@ of the swarm service runs it healthy and swarm has closed the update's monitor w
 
     deploy-webhooks.py digest <app> <vX.Y.Z>   registry digest of a release image
     deploy-webhooks.py current <app>           digest of the running image (the exact rollback target)
-    deploy-webhooks.py deploy <app> <digest>   <app>: server, distribution or proxy
+    deploy-webhooks.py deploy <app> <digest>   <app>: server or proxy
     deploy-webhooks.py serves <app> <digest>   exit 0 when every running task was started from this digest
 """
 
@@ -31,10 +31,6 @@ REGISTRY = "ghcr.io/blockfield/"
 # Dokploy app name (= swarm service and log directory) and the repository secret holding its webhook URL.
 APPS = {
     "blockfield-server": ("blockfield-server-lfcxy0", "DOKPLOY_SERVER_WEBHOOK"),
-    "blockfield-distribution": (
-        "blockfield-web-pojcp4",
-        "DOKPLOY_DISTRIBUTION_WEBHOOK",
-    ),
     "blockfield-proxy": ("blockfield-proxy-niocmj", "DOKPLOY_PROXY_WEBHOOK"),
 }
 TAG = re.compile(r"v[0-9]+\.[0-9]+\.[0-9]+")
@@ -48,7 +44,7 @@ PAIR_LOCK = "/tmp/blockfield-pair.lock"
 # Webhook to healthy task on the new digest: pull, stop-first stop (grace 120 s), then the game server's health check
 # (start period 600 s, 6 retries x 30 s). Measured on prod 2026-09-27: about 1.5 min.
 STARTUP = 1200
-# Healthy to swarm's "completed": the service's UpdateConfig.Monitor (server and distribution 120 s, proxy 60 s)
+# Healthy to swarm's "completed": the service's UpdateConfig.Monitor (server 120 s, proxy 60 s)
 # plus this margin; 600 s when the monitor cannot be read.
 MARGIN = 300
 POLL = 5
