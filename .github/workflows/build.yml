@@ -31,12 +31,6 @@ jobs:
       - run: python -I -X utf8 scripts/toolchain.py --ci
       - run: just build
         working-directory: proxy/plugin
-      - name: Validate release notes
-        if: github.ref_type == 'tag'
-        run: |
-          test -f "release-notes/$GITHUB_REF_NAME.md" || { echo "missing release-notes/$GITHUB_REF_NAME.md: prepare it in the release PR"; exit 1; }
-          just python scripts/release-notes-tool.py check "release-notes/$GITHUB_REF_NAME.md" \
-            --repository Blockfield/blockfield-proxy --version "$GITHUB_REF_NAME" --kind server
       - uses: docker/setup-buildx-action@v3
       - if: github.ref_type == 'tag'
         uses: docker/login-action@v3
@@ -50,32 +44,43 @@ jobs:
           file: distribution/Dockerfile.proxy
           push: ${{ github.ref_type == 'tag' }}
           tags: ${{ github.event_name == 'pull_request' && format('ghcr.io/blockfield/blockfield-proxy:pr-{0}', github.event.pull_request.number) || format('ghcr.io/blockfield/blockfield-proxy:{0}', github.ref_name) }}
-  # Описание версии: только GitHub Release с release-notes.md; деплой — отдельный ручной workflow.
+  # Описание версии: только GitHub Release с release-notes.md и announcement.json; деплой — отдельный ручной workflow.
   release:
     if: github.ref_type == 'tag'
     needs: build
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 15
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+      - name: Release text
+        uses: Blockfield/blockfield-workspace/.github/actions/release-text@7679d345f6d2efd1342c053d5147301c336292b4
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          RELEASE_TEXT_MODEL: ${{ vars.RELEASE_TEXT_MODEL }}
+        with:
+          mode: release
+          version: ${{ github.ref_name }}
+          kind: proxy
+          out-dir: rn
       - name: Publish version GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          mkdir -p rn && cp "release-notes/$GITHUB_REF_NAME.md" rn/release-notes.md
+          files=(rn/release-notes.md)
+          [ -f rn/announcement.json ] && files+=(rn/announcement.json)
           if ! gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
             gh release create "$GITHUB_REF_NAME" --title "Blockfield proxy $GITHUB_REF_NAME" \
-              --notes-file rn/release-notes.md rn/release-notes.md
+              --notes-file rn/release-notes.md "${files[@]}"
           elif gh release download "$GITHUB_REF_NAME" --pattern release-notes.md --output rn/published.md 2>/dev/null \
               && cmp -s rn/published.md rn/release-notes.md; then
             echo "release-notes.md already published"
           else
-            gh release upload "$GITHUB_REF_NAME" rn/release-notes.md --clobber
+            gh release upload "$GITHUB_REF_NAME" "${files[@]}" --clobber
             gh release edit "$GITHUB_REF_NAME" --notes-file rn/release-notes.md
           fi

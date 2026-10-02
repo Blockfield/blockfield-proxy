@@ -1,0 +1,22 @@
+# Пустое описание нового PR заполняется по diff и коммитам; любой сбой ничего не меняет.
+name: PR text
+on:
+  pull_request:
+    types: [opened]
+permissions:
+  contents: read
+jobs:
+  text:
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: Blockfield/blockfield-workspace/.github/actions/release-text@7679d345f6d2efd1342c053d5147301c336292b4
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          RELEASE_TEXT_MODEL: ${{ vars.RELEASE_TEXT_MODEL }}
+        with:
+          mode: pr
