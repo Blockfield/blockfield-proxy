@@ -23,7 +23,7 @@ Blacksmith проверяет main и PR. Тег `v*` публикует `ghcr.i
 
 - [`Authentication`](proxy/plugin/src/main/java/io/blockfield/proxy/Authentication.java): Drasl, `/login`, `/register`, `/logout`, сохранённые сессии и лимиты попыток.
 - [`BackendRouting`](proxy/plugin/src/main/java/io/blockfield/proxy/BackendRouting.java): `gate.json`, ACL мастерской, лобби и возврат после рестарта.
-- [`LoginForwarding`](proxy/plugin/src/main/java/io/blockfield/proxy/LoginForwarding.java): ответы о версии пака и перенос конфигурации TaCZ Tweaks из login в play.
+- [`LoginForwarding`](proxy/plugin/src/main/java/io/blockfield/proxy/LoginForwarding.java): ответы о версии пака и контракте совместимости, а также перенос конфигурации TaCZ Tweaks из login в play.
 
 `Authentication` и `LoginForwarding` очищают данные при отключении игрока; маршрутизация сохраняет недавнее участие в игре на десять минут для доигрывания Кампании. `Gate` хранит правила доступа, `Sessions` — проверку HMAC. Модули собираются в один плагин; образ, переменные окружения и протоколы не меняются. Limbo остаётся внутри контейнера прокси.
 
