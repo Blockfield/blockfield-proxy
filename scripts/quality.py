@@ -101,6 +101,7 @@ def kotlin(files, format=False):
 
 
 def lint(files):
+    compile_check(files, "lintJava")
     run("actionlint")
     each(["ruff", "check"], [f for f in files if f.endswith(".py")])
     each(["shellcheck", "--severity=error"], [f for f in files if f.endswith(".sh")])
@@ -174,13 +175,13 @@ def gradle_command(wrapper, windows=None):
     return wrapper.with_name("gradlew.bat") if windows else wrapper
 
 
-def compile_check(files):
+def compile_check(files, task="check"):
     wrappers = [ROOT / f for f in files if Path(f).name == "gradlew"]
     if wrappers:
         for wrapper in wrappers:
             run(
                 gradle_command(wrapper),
-                "check",
+                task,
                 "--no-daemon",
                 "--max-workers=2",
                 "-Dorg.gradle.jvmargs=-Xmx2G",
@@ -214,6 +215,7 @@ def compile_check(files):
 
 
 def tests():
+    compile_check(sources(), "test")
     if (ROOT / "package.json").is_file():
         import json
 
