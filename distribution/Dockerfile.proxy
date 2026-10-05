@@ -9,10 +9,9 @@ RUN cd /src && git apply /tmp/limbo-patches/*.patch && mvn -q -B -DskipTests pac
 
 # База прокси закреплена по digest (тот же, из которого собран v2.54.1): плавающий java21 менял бы рантайм без правки здесь.
 # Обновление — отдельным PR с новым digest тега java21.
-FROM itzg/mc-proxy:java21@sha256:e65f52bd44a223181a62c3516d5bbdff7ec185ec527bf43e98175d74290ec94f
+FROM itzg/mc-proxy:java21@sha256:e65f52bd44a223181a62c3516d5bbdff7ec185ec527bf43e98175d74290ec94f AS runtime-base
 LABEL org.opencontainers.image.source="https://github.com/Blockfield/blockfield-proxy"
 ENV TYPE=VELOCITY VELOCITY_VERSION=3.5.1 VELOCITY_BUILD_ID=615 MEMORY=256m
-COPY --from=limbo /src/target/Limbo-0.7.10-ALPHA-1.21.1.jar /opt/lobby/limbo.jar
 ADD --checksum=sha256:b03cebc45c1583edf8c7456fa67f0a6248eb95a856249378173cc1ea8b8d0d68 \
     https://cdn.modrinth.com/data/9eGKb6K1/versions/ES87t4lm/voicechat-velocity-2.6.18.jar /plugins/voicechat-velocity-2.6.18.jar
 COPY proxy/plugin/build/libs/blockfield-proxy-1.0.0.jar /plugins/blockfield-proxy.jar
@@ -22,3 +21,10 @@ RUN chown -R 1000:1000 /opt/lobby
 COPY --chmod=755 proxy/start-proxy.sh /start-blockfield-proxy
 EXPOSE 25565/tcp 25565/udp
 CMD ["/start-blockfield-proxy"]
+
+# CI transfers both Java outputs from the self-hosted build job.
+FROM runtime-base AS ci
+COPY --chown=1000:1000 proxy/limbo-build/Limbo-0.7.10-ALPHA-1.21.1.jar /opt/lobby/limbo.jar
+
+FROM runtime-base AS runtime
+COPY --from=limbo --chown=1000:1000 /src/target/Limbo-0.7.10-ALPHA-1.21.1.jar /opt/lobby/limbo.jar
