@@ -77,7 +77,7 @@ jobs:
   release:
     if: github.ref_type == 'tag'
     needs: build
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, blockfield]
     timeout-minutes: 15
     permissions:
       contents: write
