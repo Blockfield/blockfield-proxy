@@ -3,4 +3,5 @@ self-hosted-runner:
     - blacksmith-2vcpu-ubuntu-2404
     - blockfield-deploy
     - tenki-standard-autoscale
-    - blockfield
+    - tiny
+    - big

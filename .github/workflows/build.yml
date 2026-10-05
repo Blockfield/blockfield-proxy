@@ -14,7 +14,7 @@ jobs:
   build:
     outputs:
       image: ${{ steps.image-scope.outputs.image }}
-    runs-on: [self-hosted, blockfield]
+    runs-on: [self-hosted, big]
     timeout-minutes: 30
     permissions:
       contents: read
@@ -89,7 +89,8 @@ jobs:
         run: |
           mkdir -p .cache/quality proxy/limbo-build
           archive=.cache/quality/apache-maven-3.9.11-bin.tar.gz
-          test -f "$archive" || curl --fail --location --silent --show-error --max-time 120 \
+          test -f "$archive" || curl --fail --location --silent --show-error \
+            --retry 4 --retry-all-errors --retry-max-time 1200 --connect-timeout 30 --max-time 300 \
             https://archive.apache.org/dist/maven/maven-3/3.9.11/binaries/apache-maven-3.9.11-bin.tar.gz --output "$archive"
           echo "bcfe4fe305c962ace56ac7b5fc7a08b87d5abd8b7e89027ab251069faebee516b0ded8961445d6d91ec1985dfe30f8153268843c89aa392733d1a3ec956c9978  $archive" | sha512sum --check
           tar -xzf "$archive" -C .cache/quality
@@ -146,7 +147,7 @@ jobs:
   release:
     if: github.ref_type == 'tag'
     needs: image
-    runs-on: [self-hosted, blockfield]
+    runs-on: [self-hosted, tiny]
     timeout-minutes: 15
     permissions:
       contents: write

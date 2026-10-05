@@ -8,7 +8,7 @@ permissions:
 jobs:
   text:
     if: github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: [self-hosted, blockfield]
+    runs-on: [self-hosted, tiny]
     timeout-minutes: 10
     permissions:
       contents: read
