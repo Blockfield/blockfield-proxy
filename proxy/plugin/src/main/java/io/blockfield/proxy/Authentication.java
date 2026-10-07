@@ -400,7 +400,7 @@ final class Authentication {
                                     player.sendMessage(
                                             Component.text(
                                                     "Сохранённый вход недоступен. Войдите через"
-                                                        + " лаунчер Blockfield.",
+                                                            + " лаунчер Blockfield.",
                                                     NamedTextColor.RED));
                                     return;
                                 }
@@ -430,8 +430,8 @@ final class Authentication {
                                 player.sendMessage(
                                         Component.text(
                                                 "Вход сохранён на 30 дней. Переподключитесь к этому"
-                                                    + " же адресу сервера, чтобы войти с UUID"
-                                                    + " аккаунта. Выйти — /logout.",
+                                                        + " же адресу сервера, чтобы войти с UUID"
+                                                        + " аккаунта. Выйти — /logout.",
                                                 NamedTextColor.GREEN));
                             }
                         });
