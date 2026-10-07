@@ -16,10 +16,15 @@ import net.kyori.adventure.text.format.NamedTextColor;
 
 import org.slf4j.Logger;
 
+import java.net.InetAddress;
+import java.net.URI;
+import java.net.URISyntaxException;
+import java.net.UnknownHostException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.attribute.FileTime;
 import java.time.Duration;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
@@ -32,6 +37,7 @@ final class BackendRouting {
     private final ProxyServer proxy;
     private final Logger logger;
     private final Authentication authentication;
+    private final String workshopHost;
     private static final Duration LOGIN_TIMEOUT = Duration.ofMinutes(5);
     // ponytail: участник доигрываемой Кампании = был на игровом сервере за 10 минут; точный резерв
     // проверяет мод. Передавать резервы в gate.json, если окна не хватит.
@@ -56,10 +62,55 @@ final class BackendRouting {
     private final Map<UUID, Long> lastOnGame = new ConcurrentHashMap<>();
 
     BackendRouting(Object plugin, ProxyServer proxy, Logger logger, Authentication authentication) {
+        this(plugin, proxy, logger, authentication, System.getenv("BLOCKFIELD_WORKSHOP_HOST"));
+    }
+
+    BackendRouting(
+            Object plugin,
+            ProxyServer proxy,
+            Logger logger,
+            Authentication authentication,
+            String workshopHost) {
         this.plugin = plugin;
         this.proxy = proxy;
         this.logger = logger;
         this.authentication = authentication;
+        String host = workshopHost == null ? "" : workshopHost.strip();
+        if (!host.isEmpty()) {
+            try {
+                if (new URI("minecraft", null, host, -1, null, null, null).getHost() == null)
+                    throw new URISyntaxException(host, "Not a host");
+            } catch (URISyntaxException e) {
+                throw new IllegalArgumentException(
+                        "BLOCKFIELD_WORKSHOP_HOST must be a plain hostname or IP, without a port");
+            }
+        }
+        this.workshopHost = normalizeHost(host);
+    }
+
+    static String normalizeHost(String value) {
+        String host = value.strip().toLowerCase(Locale.ROOT);
+        if (host.startsWith("[") && host.endsWith("]")) host = host.substring(1, host.length() - 1);
+        if (host.endsWith(".")) host = host.substring(0, host.length() - 1);
+        // Only numeric IPv6 literals reach InetAddress: routing never performs a DNS lookup.
+        if (host.contains(":") && host.matches("[0-9a-f:.]+")) {
+            try {
+                return InetAddress.getByName(host).getHostAddress();
+            } catch (UnknownHostException ignored) {
+                // A malformed handshake host cannot match the validated workshop host.
+            }
+        }
+        return host;
+    }
+
+    private String requestedBackend(Player player) {
+        return !workshopHost.isEmpty()
+                        && player.getVirtualHost()
+                                .map(address -> normalizeHost(address.getHostString()))
+                                .filter(workshopHost::equals)
+                                .isPresent()
+                ? "workshop"
+                : "game";
     }
 
     void admit(Player player) {
@@ -73,7 +124,7 @@ final class BackendRouting {
                                                                 .fireAndForget()),
                         () ->
                                 player.sendMessage(
-                                        Component.text(gate.message(), NamedTextColor.GOLD)));
+                                        Component.text(waitingText(player), NamedTextColor.GOLD)));
     }
 
     private void reloadGate() {
@@ -107,6 +158,7 @@ final class BackendRouting {
                                 .orElse(false)
                         || seen != null && System.currentTimeMillis() - seen <= GAME_MEMBER_MS;
         return authentication.authenticated(player)
+                && server.getServerInfo().getName().equals(requestedBackend(player))
                 && gate.allows(
                         server.getServerInfo().getName(),
                         authentication.profileId(id),
@@ -114,13 +166,23 @@ final class BackendRouting {
                         member);
     }
 
-    /** Цель по gate, если игроку туда можно; иначе он ждёт в лобби. */
+    /** The address selects a profile; gate and account roles still control admission. */
     private Optional<RegisteredServer> target(Player player) {
-        return server(gate.backend()).filter(server -> allowed(player, server));
+        return server(requestedBackend(player)).filter(server -> allowed(player, server));
     }
 
     private String waitingText(Player player) {
-        return target(player).isPresent() ? RESTARTING : gate.message();
+        String backend = requestedBackend(player);
+        if (!backend.equals(gate.backend()))
+            return backend.equals("workshop")
+                    ? "Мастерская сейчас недоступна. Вернём вас автоматически, когда она откроется."
+                    : "Игровой сервер сейчас недоступен. Вернём вас автоматически, когда он"
+                            + " откроется.";
+        if (target(player).isPresent())
+            return backend.equals("workshop")
+                    ? "Мастерская запускается. Вернём вас автоматически, когда она поднимется."
+                    : RESTARTING;
+        return gate.message().isBlank() ? "Игровой сервер недоступен." : gate.message();
     }
 
     @Subscribe
@@ -170,8 +232,18 @@ final class BackendRouting {
             }
         } else if (!allowed(player, event.getOriginalServer())) {
             event.setResult(ServerPreConnectEvent.ServerResult.denied());
-            if (event.getPreviousServer() != null)
-                player.sendMessage(Component.text(gate.message(), NamedTextColor.GOLD));
+            if (event.getPreviousServer() != null) {
+                String text =
+                        event.getOriginalServer()
+                                        .getServerInfo()
+                                        .getName()
+                                        .equals(requestedBackend(player))
+                                ? waitingText(player)
+                                : requestedBackend(player).equals("workshop")
+                                        ? "Профиль мастерской подключается только к мастерской."
+                                        : "Игровой профиль подключается только к игровому серверу.";
+                player.sendMessage(Component.text(text, NamedTextColor.GOLD));
+            }
         }
     }
 
@@ -217,10 +289,7 @@ final class BackendRouting {
                 .orElse(false)) {
             event.setResult(
                     KickedFromServerEvent.Notify.create(
-                            target(event.getPlayer()).isPresent()
-                                    ? Component.text(
-                                            "Игровой сервер ещё запускается…", NamedTextColor.GRAY)
-                                    : Component.text(gate.message(), NamedTextColor.GOLD)));
+                            Component.text(waitingText(event.getPlayer()), NamedTextColor.GOLD)));
         } else {
             // Без своего текста Velocity показывает английское «You were kicked from game».
             event.setResult(
@@ -264,10 +333,7 @@ final class BackendRouting {
                                 c -> {
                                     player.sendMessage(
                                             Component.text(
-                                                    gate.open()
-                                                            ? "Мастерская закрыта."
-                                                            : gate.message(),
-                                                    NamedTextColor.GOLD));
+                                                    waitingText(player), NamedTextColor.GOLD));
                                     player.createConnectionRequest(lobby.get()).fireAndForget();
                                 });
             }

@@ -24,6 +24,7 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BiFunction;
 
 /**
@@ -41,6 +42,7 @@ class GateEvictionTest {
                 workshop = server("workshop"),
                 game = server("game");
         UUID id = UUID.randomUUID();
+        AtomicReference<String> host = new AtomicReference<>("workshop.invalid");
         ServerConnection onWorkshop =
                 fake(
                         ServerConnection.class,
@@ -64,6 +66,10 @@ class GateEvictionTest {
                                 switch (method) {
                                     case "getUniqueId" -> id;
                                     case "getUsername" -> "RigPeer";
+                                    case "getVirtualHost" ->
+                                            Optional.of(
+                                                    InetSocketAddress.createUnresolved(
+                                                            host.get(), 25565));
                                     case "getCurrentServer" -> Optional.of(onWorkshop);
                                     case "createConnectionRequest" ->
                                             args[0] == lobby ? request : null;
@@ -85,7 +91,12 @@ class GateEvictionTest {
                 new Authentication(
                         this, proxy, LoggerFactory.getLogger("test"), new LoginForwarding());
         BackendRouting plugin =
-                new BackendRouting(this, proxy, LoggerFactory.getLogger("test"), authentication);
+                new BackendRouting(
+                        this,
+                        proxy,
+                        LoggerFactory.getLogger("test"),
+                        authentication,
+                        "workshop.invalid");
         this.<Set<UUID>>field(authentication, "authed").add(id);
         this.<Map<UUID, String>>field(authentication, "draslIds").put(id, DRASL);
         Method tick = BackendRouting.class.getDeclaredMethod("tick");
@@ -109,6 +120,7 @@ class GateEvictionTest {
         assertEquals(1, evictions.get(), "no repeated eviction for the same gate");
 
         setGate(plugin, Gate.OPEN);
+        host.set("game.invalid");
         var admitted = new ServerPreConnectEvent(builder, game, lobby);
         plugin.onPreConnect(admitted);
         assertEquals(
