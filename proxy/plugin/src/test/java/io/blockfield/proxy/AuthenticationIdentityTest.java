@@ -279,6 +279,77 @@ class AuthenticationIdentityTest {
         }
     }
 
+    @Test
+    void logoutSerializesWithCredentialSendAndLeavesNoAuthentication() throws Exception {
+        try (Fixture fixture = new Fixture()) {
+            var packets = new java.util.concurrent.CopyOnWriteArrayList<byte[]>();
+            var sending = new java.util.concurrent.CountDownLatch(1);
+            var release = new java.util.concurrent.CountDownLatch(1);
+            UUID id = UUID.fromString("74b2f4ae-ceb1-4b2d-abbf-c5f41d0a8846");
+            Player player =
+                    fake(
+                            Player.class,
+                            (method, args) ->
+                                    switch (method) {
+                                        case "getUniqueId" -> id;
+                                        case "getUsername" -> NAME;
+                                        case "getRemoteAddress" -> fixture.remote;
+                                        case "isActive" -> true;
+                                        case "sendPluginMessage" -> {
+                                            byte[] packet = (byte[]) args[1];
+                                            if (packet.length > 2) {
+                                                sending.countDown();
+                                                try {
+                                                    if (!release.await(5, TimeUnit.SECONDS))
+                                                        throw new AssertionError(
+                                                                "credential send deadline");
+                                                } catch (InterruptedException error) {
+                                                    Thread.currentThread().interrupt();
+                                                    throw new AssertionError(error);
+                                                }
+                                            }
+                                            packets.add(packet);
+                                            yield true;
+                                        }
+                                        default -> null;
+                                    });
+            fixture.commands.get("login").execute(invocation(player, "fixture-password"));
+            assertTrue(sending.await(5, TimeUnit.SECONDS));
+            var logoutDone = new CompletableFuture<Void>();
+            Thread logout =
+                    new Thread(
+                            () -> {
+                                try {
+                                    fixture.commands.get("logout").execute(invocation(player));
+                                    logoutDone.complete(null);
+                                } catch (Throwable error) {
+                                    logoutDone.completeExceptionally(error);
+                                }
+                            });
+            logout.start();
+            try {
+                long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+                while (logout.getState() != Thread.State.BLOCKED
+                        && !logoutDone.isDone()
+                        && System.nanoTime() < deadline) Thread.onSpinWait();
+                assertEquals(
+                        Thread.State.BLOCKED,
+                        logout.getState(),
+                        "logout must serialize with the final credential/auth commit");
+            } finally {
+                release.countDown();
+                logout.join(5000);
+            }
+            assertFalse(logout.isAlive());
+            logoutDone.get(5, TimeUnit.SECONDS);
+            assertEquals(2, packets.size());
+            assertArrayEquals(
+                    new byte[] {0, 0}, packets.get(1), "clear must follow the credential send");
+            assertFalse(fixture.authentication.authenticated(player));
+            assertNull(fixture.authentication.profileId(id));
+        }
+    }
+
     private static SimpleCommand.Invocation invocation(Player player, String... arguments) {
         return fake(
                 SimpleCommand.Invocation.class,

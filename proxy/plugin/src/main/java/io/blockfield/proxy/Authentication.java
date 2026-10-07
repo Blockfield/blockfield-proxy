@@ -137,11 +137,14 @@ final class Authentication {
 
     @Subscribe
     public void onDisconnect(DisconnectEvent event) {
-        UUID id = event.getPlayer().getUniqueId();
-        authed.remove(id);
-        loggingOut.remove(id);
-        draslIds.remove(id);
-        failures.remove(id);
+        Player player = event.getPlayer();
+        synchronized (player) {
+            UUID id = player.getUniqueId();
+            authed.remove(id);
+            loggingOut.remove(id);
+            draslIds.remove(id);
+            failures.remove(id);
+        }
     }
 
     @Subscribe
@@ -222,9 +225,13 @@ final class Authentication {
         if (entry == null) return null;
         UUID id = player.getUniqueId();
         String account = entry.auth().getNow(null);
-        if (account != null && id.toString().replace("-", "").equals(account)) {
-            draslIds.put(id, account);
-            authed.add(id);
+        synchronized (player) {
+            if (!loggingOut.contains(id)
+                    && account != null
+                    && id.toString().replace("-", "").equals(account)) {
+                draslIds.put(id, account);
+                authed.add(id);
+            }
         }
         return EventTask.resumeWhenComplete(
                 CompletableFuture.allOf(
@@ -331,10 +338,12 @@ final class Authentication {
         @Override
         public void execute(Invocation invocation) {
             if (!(invocation.source() instanceof Player player)) return;
-            loggingOut.add(player.getUniqueId());
-            authed.remove(player.getUniqueId());
-            draslIds.remove(player.getUniqueId());
-            player.sendPluginMessage(SESSION, concat(utf(""), utf("")));
+            synchronized (player) {
+                loggingOut.add(player.getUniqueId());
+                authed.remove(player.getUniqueId());
+                draslIds.remove(player.getUniqueId());
+                player.sendPluginMessage(SESSION, concat(utf(""), utf("")));
+            }
             // Пауза, чтобы сброс сессии дошёл до клиента раньше разрыва соединения.
             proxy.getScheduler()
                     .buildTask(
@@ -368,58 +377,63 @@ final class Authentication {
         resolveDrasl(player.getUsername())
                 .thenAccept(
                         account -> {
-                            if (!player.isActive() || loggingOut.contains(player.getUniqueId()))
-                                return;
-                            if (expected == null || !expected.equals(account)) {
+                            // Logout must be the last credential/auth write even when HTTP finishes
+                            // concurrently.
+                            synchronized (player) {
+                                if (!player.isActive() || loggingOut.contains(player.getUniqueId()))
+                                    return;
+                                if (expected == null || !expected.equals(account)) {
+                                    player.sendMessage(
+                                            Component.text(
+                                                    "Не удалось подтвердить профиль аккаунта."
+                                                            + " Попробуйте ещё раз.",
+                                                    NamedTextColor.RED));
+                                    return;
+                                }
+                                failures.remove(player.getUniqueId());
+                                boolean sameIdentity =
+                                        player.getUniqueId()
+                                                .toString()
+                                                .replace("-", "")
+                                                .equals(account);
+                                if (sessionSecret == null && !sameIdentity) {
+                                    player.sendMessage(
+                                            Component.text(
+                                                    "Сохранённый вход недоступен. Войдите через"
+                                                        + " лаунчер Blockfield.",
+                                                    NamedTextColor.RED));
+                                    return;
+                                }
+                                if (sessionSecret != null) {
+                                    String[] session =
+                                            Sessions.issue(
+                                                    sessionSecret,
+                                                    player.getUsername(),
+                                                    account,
+                                                    System.currentTimeMillis() / 1000);
+                                    player.sendPluginMessage(
+                                            SESSION, concat(utf(session[0]), utf(session[1])));
+                                }
+                                if (sameIdentity) {
+                                    draslIds.put(player.getUniqueId(), account);
+                                    authed.add(player.getUniqueId());
+                                    player.sendMessage(
+                                            Component.text(
+                                                    "Вход выполнен. Выйти — /logout.",
+                                                    NamedTextColor.GREEN));
+                                    admitted.accept(player);
+                                    return;
+                                }
+                                // A play-phase player still has its offline UUID: never forward it
+                                // to a
+                                // backend.
                                 player.sendMessage(
                                         Component.text(
-                                                "Не удалось подтвердить профиль аккаунта."
-                                                        + " Попробуйте ещё раз.",
-                                                NamedTextColor.RED));
-                                return;
-                            }
-                            failures.remove(player.getUniqueId());
-                            boolean sameIdentity =
-                                    player.getUniqueId()
-                                            .toString()
-                                            .replace("-", "")
-                                            .equals(account);
-                            if (sessionSecret == null && !sameIdentity) {
-                                player.sendMessage(
-                                        Component.text(
-                                                "Сохранённый вход недоступен. Войдите через лаунчер"
-                                                        + " Blockfield.",
-                                                NamedTextColor.RED));
-                                return;
-                            }
-                            if (sessionSecret != null) {
-                                String[] session =
-                                        Sessions.issue(
-                                                sessionSecret,
-                                                player.getUsername(),
-                                                account,
-                                                System.currentTimeMillis() / 1000);
-                                player.sendPluginMessage(
-                                        SESSION, concat(utf(session[0]), utf(session[1])));
-                            }
-                            if (sameIdentity) {
-                                draslIds.put(player.getUniqueId(), account);
-                                authed.add(player.getUniqueId());
-                                player.sendMessage(
-                                        Component.text(
-                                                "Вход выполнен. Выйти — /logout.",
+                                                "Вход сохранён на 30 дней. Переподключитесь к этому"
+                                                    + " же адресу сервера, чтобы войти с UUID"
+                                                    + " аккаунта. Выйти — /logout.",
                                                 NamedTextColor.GREEN));
-                                admitted.accept(player);
-                                return;
                             }
-                            // A play-phase player still has its offline UUID: never forward it to a
-                            // backend.
-                            player.sendMessage(
-                                    Component.text(
-                                            "Вход сохранён на 30 дней. Переподключитесь к этому же"
-                                                + " адресу сервера, чтобы войти с UUID аккаунта."
-                                                + " Выйти — /logout.",
-                                            NamedTextColor.GREEN));
                         });
     }
 
