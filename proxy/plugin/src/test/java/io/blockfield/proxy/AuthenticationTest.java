@@ -18,7 +18,9 @@ class AuthenticationTest {
     @Test
     void draslChecksExactIdentityAndInvalidatesPasswordLoginToken() throws Exception {
         var status = new AtomicReference<>(200);
-        var response = new AtomicReference<>("{\"name\":\"RigPeer\",\"id\":\"profile-id\"}");
+        var response =
+                new AtomicReference<>(
+                        "{\"name\":\"RigPeer\",\"id\":\"74b2f4aeceb14b2dabbfc5f41d0a8846\"}");
         var posted = new AtomicReference<String>();
         var path = new AtomicReference<String>();
         var query = new AtomicReference<String>();
@@ -57,7 +59,7 @@ class AuthenticationTest {
                             "http://127.0.0.1:" + server.getAddress().getPort(),
                             null);
             assertEquals(
-                    "profile-id",
+                    "74b2f4aeceb14b2dabbfc5f41d0a8846",
                     authentication.hasJoined("RigPeer", "challenge").get(5, TimeUnit.SECONDS));
             assertEquals("/session/minecraft/hasJoined", path.get());
             assertEquals("username=RigPeer&serverId=challenge", query.get());

@@ -16,9 +16,9 @@ import javax.crypto.spec.SecretKeySpec;
 
 /**
  * Запомненный вход для игроков без токена Drasl (Prism offline). После /login клиент получает JWT
- * (HS256) и отдельный ключ; при следующем входе он шлёт JWT и HMAC(ключ, serverId). Ключ выводится
- * из jti и секрета прокси и в JWT не лежит, поэтому перехваченный ответ не годится для другого
- * serverId.
+ * (HS256, ник и Drasl UUID) и отдельный ключ; при следующем входе он шлёт JWT и HMAC(ключ,
+ * serverId). Ключ выводится из jti и секрета прокси и в JWT не лежит, поэтому перехваченный ответ
+ * не годится для другого serverId.
  */
 final class Sessions {
     static final long TTL_SECONDS = 30L * 24 * 3600;
@@ -33,12 +33,15 @@ final class Sessions {
     }
 
     /** {jwt, ключ в hex}. */
-    static String[] issue(byte[] secret, String name, long now) {
+    static String[] issue(byte[] secret, String name, String draslId, long now) {
+        if (draslId == null || !draslId.matches("[0-9a-f]{32}"))
+            throw new IllegalArgumentException("Drasl UUID");
         byte[] id = new byte[16];
         RANDOM.nextBytes(id);
         String jti = HexFormat.of().formatHex(id);
         JsonObject claims = new JsonObject();
         claims.addProperty("sub", name);
+        claims.addProperty("uuid", draslId);
         claims.addProperty("jti", jti);
         claims.addProperty("iat", now);
         claims.addProperty("exp", now + TTL_SECONDS);
@@ -50,20 +53,21 @@ final class Sessions {
 
     /**
      * Ответ клиента на login-запрос: байт 2, затем writeUtf(jwt) и writeUtf(hex HMAC(ключ,
-     * serverId)).
+     * serverId)). Возвращает Drasl UUID, либо null. Старые JWT без UUID не различают владельцев
+     * повторно выданного ника и требуют нового /login.
      */
-    static boolean verify(byte[] secret, String name, String serverId, byte[] response, long now) {
+    static String verify(byte[] secret, String name, String serverId, byte[] response, long now) {
         try {
             ByteBuffer in = ByteBuffer.wrap(response);
-            if (in.get() != 2) return false;
+            if (in.get() != 2) return null;
             String jwt = readUtf(in, 2048);
             String proof = readUtf(in, 64);
-            if (in.hasRemaining()) return false;
+            if (in.hasRemaining()) return null;
             String[] parts = jwt.split("\\.");
-            if (parts.length != 3 || !parts[0].equals(HEADER)) return false;
+            if (parts.length != 3 || !parts[0].equals(HEADER)) return null;
             if (!MessageDigest.isEqual(
                     Base64.getUrlDecoder().decode(parts[2]),
-                    hmac(secret, parts[0] + "." + parts[1]))) return false;
+                    hmac(secret, parts[0] + "." + parts[1]))) return null;
             JsonObject claims =
                     JsonParser.parseString(
                                     new String(
@@ -71,11 +75,13 @@ final class Sessions {
                                             StandardCharsets.UTF_8))
                             .getAsJsonObject();
             if (!claims.get("sub").getAsString().equals(name)
-                    || claims.get("exp").getAsLong() <= now) return false;
+                    || claims.get("exp").getAsLong() <= now) return null;
+            String draslId = claims.get("uuid").getAsString();
+            if (!draslId.matches("[0-9a-f]{32}")) return null;
             byte[] expected = hmac(key(secret, claims.get("jti").getAsString()), serverId);
-            return MessageDigest.isEqual(HexFormat.of().parseHex(proof), expected);
+            return MessageDigest.isEqual(HexFormat.of().parseHex(proof), expected) ? draslId : null;
         } catch (RuntimeException e) {
-            return false;
+            return null;
         }
     }
 
