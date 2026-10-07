@@ -72,6 +72,7 @@ final class Authentication {
 
     private final Map<String, Pending> pending = new ConcurrentHashMap<>();
     private final Set<UUID> authed = ConcurrentHashMap.newKeySet();
+    private final Set<UUID> loggingOut = ConcurrentHashMap.newKeySet();
 
     /** Drasl profile id подтверждённого аккаунта: ACL мастерской сверяет id и ник вместе. */
     private final Map<UUID, String> draslIds = new ConcurrentHashMap<>();
@@ -138,6 +139,7 @@ final class Authentication {
     public void onDisconnect(DisconnectEvent event) {
         UUID id = event.getPlayer().getUniqueId();
         authed.remove(id);
+        loggingOut.remove(id);
         draslIds.remove(id);
         failures.remove(id);
     }
@@ -261,7 +263,8 @@ final class Authentication {
         @Override
         public boolean hasPermission(Invocation invocation) {
             return invocation.source() instanceof Player player
-                    && !authed.contains(player.getUniqueId());
+                    && !authed.contains(player.getUniqueId())
+                    && !loggingOut.contains(player.getUniqueId());
         }
 
         @Override
@@ -288,9 +291,18 @@ final class Authentication {
             }
             (register
                             ? register(player.getUsername(), args[0])
+                                    .thenCompose(
+                                            error ->
+                                                    error == null
+                                                            ? authenticate(
+                                                                    player.getUsername(), args[0])
+                                                            : CompletableFuture.completedFuture(
+                                                                    new PasswordProof(null, error)))
                             : authenticate(player.getUsername(), args[0]))
                     .whenComplete(
-                            (error, failure) -> {
+                            (proof, failure) -> {
+                                if (!player.isActive() || loggingOut.contains(player.getUniqueId()))
+                                    return;
                                 if (failure != null) {
                                     logger.warn(
                                             "Drasl request failed for {}",
@@ -301,10 +313,10 @@ final class Authentication {
                                                     "Сервер аккаунтов недоступен, попробуйте ещё"
                                                             + " раз.",
                                                     NamedTextColor.RED));
-                                } else if (error != null) {
-                                    fail(player, ip, error);
+                                } else if (proof.error() != null) {
+                                    fail(player, ip, proof.error());
                                 } else {
-                                    admit(player, admitted);
+                                    admit(player, proof.id(), admitted);
                                 }
                             });
         }
@@ -313,13 +325,15 @@ final class Authentication {
     private final class LogoutCommand implements SimpleCommand {
         @Override
         public boolean hasPermission(Invocation invocation) {
-            return invocation.source() instanceof Player player
-                    && authed.contains(player.getUniqueId());
+            return invocation.source() instanceof Player;
         }
 
         @Override
         public void execute(Invocation invocation) {
             if (!(invocation.source() instanceof Player player)) return;
+            loggingOut.add(player.getUniqueId());
+            authed.remove(player.getUniqueId());
+            draslIds.remove(player.getUniqueId());
             player.sendPluginMessage(SESSION, concat(utf(""), utf("")));
             // Пауза, чтобы сброс сессии дошёл до клиента раньше разрыва соединения.
             proxy.getScheduler()
@@ -350,12 +364,13 @@ final class Authentication {
         }
     }
 
-    private void admit(Player player, Consumer<Player> admitted) {
+    private void admit(Player player, String expected, Consumer<Player> admitted) {
         resolveDrasl(player.getUsername())
                 .thenAccept(
                         account -> {
-                            if (!player.isActive()) return;
-                            if (account == null) {
+                            if (!player.isActive() || loggingOut.contains(player.getUniqueId()))
+                                return;
+                            if (expected == null || !expected.equals(account)) {
                                 player.sendMessage(
                                         Component.text(
                                                 "Не удалось подтвердить профиль аккаунта."
@@ -408,8 +423,10 @@ final class Authentication {
                         });
     }
 
-    /** null — пароль верный и ник совпадает с аккаунтом; иначе текст ошибки для игрока. */
-    CompletableFuture<String> authenticate(String name, String password) {
+    record PasswordProof(String id, String error) {}
+
+    /** UUID comes from the password-proven selectedProfile, never from a nickname lookup. */
+    CompletableFuture<PasswordProof> authenticate(String name, String password) {
         JsonObject body = new JsonObject();
         JsonObject agent = new JsonObject();
         agent.addProperty("name", "Minecraft");
@@ -420,7 +437,8 @@ final class Authentication {
         return post("/auth/authenticate", body)
                 .thenApply(
                         response -> {
-                            if (response.statusCode() != 200) return "Неверный пароль.";
+                            if (response.statusCode() != 200)
+                                return new PasswordProof(null, "Неверный пароль.");
                             JsonObject json =
                                     JsonParser.parseString(response.body()).getAsJsonObject();
                             JsonObject invalidate = new JsonObject();
@@ -433,11 +451,18 @@ final class Authentication {
                                                     .get("name")
                                                     .getAsString()
                                             : "";
-                            return profile.equals(name)
-                                    ? null
-                                    : "Этот аккаунт играет под ником "
-                                            + profile
-                                            + " — зайдите с ним.";
+                            if (!profile.equals(name))
+                                return new PasswordProof(
+                                        null,
+                                        "Этот аккаунт играет под ником "
+                                                + profile
+                                                + " — зайдите с ним.");
+                            String id =
+                                    profileIdentity(json.getAsJsonObject("selectedProfile"), name);
+                            return id == null
+                                    ? new PasswordProof(
+                                            null, "Не удалось подтвердить UUID аккаунта.")
+                                    : new PasswordProof(id, null);
                         });
     }
 
@@ -494,14 +519,19 @@ final class Authentication {
                             if (response.statusCode() != 200) return null;
                             JsonObject json =
                                     JsonParser.parseString(response.body()).getAsJsonObject();
-                            String id = json.get("id").getAsString();
-                            return json.get("name").getAsString().equals(name)
-                                            && (id.matches("[0-9a-fA-F]{32}")
-                                                    || id.matches(
-                                                            "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"))
-                                    ? Gate.normalizeId(id)
-                                    : null;
+                            return profileIdentity(json, name);
                         });
+    }
+
+    private static String profileIdentity(JsonObject json, String name) {
+        if (!json.has("id") || !json.has("name")) return null;
+        String id = json.get("id").getAsString();
+        return json.get("name").getAsString().equals(name)
+                        && (id.matches("[0-9a-fA-F]{32}")
+                                || id.matches(
+                                        "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"))
+                ? Gate.normalizeId(id)
+                : null;
     }
 
     private CompletableFuture<HttpResponse<String>> post(String path, JsonObject body) {

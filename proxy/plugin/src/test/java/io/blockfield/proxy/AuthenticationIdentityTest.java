@@ -5,6 +5,9 @@ import static io.blockfield.proxy.GateEvictionTest.fake;
 import static org.junit.jupiter.api.Assertions.*;
 
 import com.sun.net.httpserver.HttpServer;
+import com.velocitypowered.api.command.CommandManager;
+import com.velocitypowered.api.command.CommandMeta;
+import com.velocitypowered.api.command.SimpleCommand;
 import com.velocitypowered.api.event.Continuation;
 import com.velocitypowered.api.event.EventTask;
 import com.velocitypowered.api.event.connection.LoginEvent;
@@ -12,6 +15,8 @@ import com.velocitypowered.api.event.connection.PreLoginEvent;
 import com.velocitypowered.api.event.player.GameProfileRequestEvent;
 import com.velocitypowered.api.proxy.LoginPhaseConnection;
 import com.velocitypowered.api.proxy.Player;
+import com.velocitypowered.api.proxy.ProxyServer;
+import com.velocitypowered.api.scheduler.Scheduler;
 import com.velocitypowered.api.util.GameProfile;
 
 import org.junit.jupiter.api.Test;
@@ -139,11 +144,15 @@ class AuthenticationIdentityTest {
                                 secret);
                 var admit =
                         Authentication.class.getDeclaredMethod(
-                                "admit", Player.class, java.util.function.Consumer.class);
+                                "admit",
+                                Player.class,
+                                String.class,
+                                java.util.function.Consumer.class);
                 admit.setAccessible(true);
                 admit.invoke(
                         authentication,
                         player,
+                        ACCOUNT,
                         (java.util.function.Consumer<Player>) ignored -> admitted.set(true));
                 finished.get(5, TimeUnit.SECONDS);
                 assertFalse(admitted.get());
@@ -199,11 +208,12 @@ class AuthenticationIdentityTest {
                                     });
             var admit =
                     Authentication.class.getDeclaredMethod(
-                            "admit", Player.class, java.util.function.Consumer.class);
+                            "admit", Player.class, String.class, java.util.function.Consumer.class);
             admit.setAccessible(true);
             admit.invoke(
                     fixture.authentication,
                     player,
+                    ACCOUNT,
                     (java.util.function.Consumer<Player>) ignored -> admitted.complete(null));
             admitted.get(5, TimeUnit.SECONDS);
             assertTrue(fixture.authentication.authenticated(player));
@@ -219,6 +229,65 @@ class AuthenticationIdentityTest {
                             proof,
                             System.currentTimeMillis() / 1000));
         }
+    }
+
+    @Test
+    void passwordProvenUuidCannotFollowNicknameReassignment() throws Exception {
+        try (Fixture fixture = new Fixture()) {
+            fixture.profile.set(
+                    "{\"name\":\"RigPeer\",\"id\":\"5288bba02d4a4c048ff6c7ab862e151c\"}");
+            var packets = new java.util.ArrayList<byte[]>();
+            var finished = new CompletableFuture<Void>();
+            Player player = fixture.passwordPlayer(packets, finished);
+            fixture.commands.get("login").execute(invocation(player, "fixture-password"));
+            finished.get(5, TimeUnit.SECONDS);
+            assertTrue(
+                    packets.isEmpty(), "password UUID A cannot mint a session for lookup UUID B");
+            assertFalse(fixture.authentication.authenticated(player));
+            assertEquals(0, fixture.admissions.get());
+        }
+    }
+
+    @Test
+    void firstPasswordLoginCanLogoutBeforeReconnectWithoutAdmission() throws Exception {
+        try (Fixture fixture = new Fixture()) {
+            var packets = new java.util.ArrayList<byte[]>();
+            var finished = new CompletableFuture<Void>();
+            Player player = fixture.passwordPlayer(packets, finished);
+            fixture.commands.get("login").execute(invocation(player, "fixture-password"));
+            finished.get(5, TimeUnit.SECONDS);
+            assertEquals(1, packets.size());
+            assertFalse(fixture.authentication.authenticated(player));
+            SimpleCommand logout = fixture.commands.get("logout");
+            assertTrue(logout.hasPermission(invocation(player)));
+            logout.execute(invocation(player));
+            assertEquals(2, packets.size());
+            assertArrayEquals(
+                    Authentication.concat(Authentication.utf(""), Authentication.utf("")),
+                    packets.get(1));
+            assertFalse(fixture.authentication.authenticated(player));
+            assertEquals(0, fixture.admissions.get());
+            assertFalse(
+                    fixture.commands
+                            .get("login")
+                            .hasPermission(invocation(player, "fixture-password")));
+            fixture.disconnect.get().run();
+            var reconnect = fixture.login(challenge -> new byte[] {0});
+            assertFalse(fixture.authentication.authenticated(reconnect.player()));
+            assertEquals(
+                    GameProfile.forOfflinePlayer(NAME).getId(), reconnect.player().getUniqueId());
+        }
+    }
+
+    private static SimpleCommand.Invocation invocation(Player player, String... arguments) {
+        return fake(
+                SimpleCommand.Invocation.class,
+                (method, args) ->
+                        switch (method) {
+                            case "source" -> player;
+                            case "arguments" -> arguments;
+                            default -> null;
+                        });
     }
 
     private static String readUtf(ByteBuffer input) {
@@ -270,12 +339,22 @@ class AuthenticationIdentityTest {
         final HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
         final InetSocketAddress remote = new InetSocketAddress("127.0.0.1", 43210);
         final Authentication authentication;
+        final java.util.Map<String, SimpleCommand> commands = new java.util.HashMap<>();
+        final java.util.concurrent.atomic.AtomicInteger admissions =
+                new java.util.concurrent.atomic.AtomicInteger();
+        final AtomicReference<Runnable> disconnect = new AtomicReference<>();
 
         Fixture() throws Exception {
             server.createContext(
                     "/",
                     exchange -> {
-                        byte[] body = profile.get().getBytes(StandardCharsets.UTF_8);
+                        String response =
+                                exchange.getRequestURI().getPath().equals("/auth/authenticate")
+                                        ? "{\"accessToken\":\"fixture-access\",\"clientToken\":\"fixture-client\",\"selectedProfile\":{\"name\":\"RigPeer\",\"id\":\""
+                                                + ACCOUNT
+                                                + "\"}}"
+                                        : profile.get();
+                        byte[] body = response.getBytes(StandardCharsets.UTF_8);
                         exchange.sendResponseHeaders(200, body.length);
                         try (var output = exchange.getResponseBody()) {
                             output.write(body);
@@ -283,14 +362,78 @@ class AuthenticationIdentityTest {
                         exchange.close();
                     });
             server.start();
+            var commandName = new AtomicReference<String>();
+            var builder = new AtomicReference<CommandMeta.Builder>();
+            builder.set(
+                    fake(
+                            CommandMeta.Builder.class,
+                            (method, args) ->
+                                    method.equals("build")
+                                            ? fake(CommandMeta.class, (m, a) -> null)
+                                            : builder.get()));
+            CommandManager manager =
+                    fake(
+                            CommandManager.class,
+                            (method, args) -> {
+                                if (method.equals("metaBuilder")) {
+                                    commandName.set((String) args[0]);
+                                    return builder.get();
+                                }
+                                if (method.equals("register"))
+                                    commands.put(commandName.get(), (SimpleCommand) args[1]);
+                                return null;
+                            });
+            var task = new AtomicReference<Scheduler.TaskBuilder>();
+            task.set(
+                    fake(
+                            Scheduler.TaskBuilder.class,
+                            (method, args) -> method.equals("delay") ? task.get() : null));
+            Scheduler scheduler =
+                    fake(
+                            Scheduler.class,
+                            (method, args) -> {
+                                disconnect.set((Runnable) args[1]);
+                                return task.get();
+                            });
+            ProxyServer proxy =
+                    fake(
+                            ProxyServer.class,
+                            (method, args) ->
+                                    switch (method) {
+                                        case "getCommandManager" -> manager;
+                                        case "getScheduler" -> scheduler;
+                                        default -> null;
+                                    });
             authentication =
                     new Authentication(
                             this,
-                            null,
+                            proxy,
                             LoggerFactory.getLogger("test"),
                             new LoginForwarding(),
                             "http://127.0.0.1:" + server.getAddress().getPort(),
                             SECRET);
+            authentication.registerCommands(ignored -> admissions.incrementAndGet());
+        }
+
+        Player passwordPlayer(java.util.List<byte[]> packets, CompletableFuture<Void> finished) {
+            return fake(
+                    Player.class,
+                    (method, args) ->
+                            switch (method) {
+                                case "getUniqueId" -> GameProfile.forOfflinePlayer(NAME).getId();
+                                case "getUsername" -> NAME;
+                                case "getRemoteAddress" -> remote;
+                                case "isActive" -> true;
+                                case "sendPluginMessage" -> {
+                                    packets.add((byte[]) args[1]);
+                                    yield true;
+                                }
+                                case "sendMessage" -> {
+                                    finished.complete(null);
+                                    yield null;
+                                }
+                                default -> null;
+                            });
         }
 
         GameProfileRequestEvent begin(Function<String, byte[]> response) {

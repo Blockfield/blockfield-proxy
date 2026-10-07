@@ -72,15 +72,18 @@ class AuthenticationTest {
                     "Неверный пароль.",
                     authentication
                             .authenticate("RigPeer", "fixture-password")
-                            .get(5, TimeUnit.SECONDS));
+                            .get(5, TimeUnit.SECONDS)
+                            .error());
 
             status.set(200);
             response.set(
-                    "{\"accessToken\":\"fixture-access\",\"clientToken\":\"fixture-client\",\"selectedProfile\":{\"name\":\"RigPeer\"}}");
-            assertNull(
+                    "{\"accessToken\":\"fixture-access\",\"clientToken\":\"fixture-client\",\"selectedProfile\":{\"name\":\"RigPeer\",\"id\":\"74b2f4aeceb14b2dabbfc5f41d0a8846\"}}");
+            var proof =
                     authentication
                             .authenticate("RigPeer", "fixture-password")
-                            .get(5, TimeUnit.SECONDS));
+                            .get(5, TimeUnit.SECONDS);
+            assertNull(proof.error());
+            assertEquals("74b2f4aeceb14b2dabbfc5f41d0a8846", proof.id());
             assertEquals("/auth/authenticate", path.get());
             var login = JsonParser.parseString(posted.get()).getAsJsonObject();
             assertEquals("RigPeer", login.get("username").getAsString());
@@ -93,6 +96,7 @@ class AuthenticationTest {
                     authentication
                             .authenticate("rigpeer", "fixture-password")
                             .get(5, TimeUnit.SECONDS)
+                            .error()
                             .contains("RigPeer"));
 
             status.set(201);
