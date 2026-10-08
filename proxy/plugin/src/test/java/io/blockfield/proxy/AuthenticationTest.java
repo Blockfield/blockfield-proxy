@@ -18,7 +18,9 @@ class AuthenticationTest {
     @Test
     void draslChecksExactIdentityAndInvalidatesPasswordLoginToken() throws Exception {
         var status = new AtomicReference<>(200);
-        var response = new AtomicReference<>("{\"name\":\"RigPeer\",\"id\":\"profile-id\"}");
+        var response =
+                new AtomicReference<>(
+                        "{\"name\":\"RigPeer\",\"id\":\"74b2f4aeceb14b2dabbfc5f41d0a8846\"}");
         var posted = new AtomicReference<String>();
         var path = new AtomicReference<String>();
         var query = new AtomicReference<String>();
@@ -57,7 +59,7 @@ class AuthenticationTest {
                             "http://127.0.0.1:" + server.getAddress().getPort(),
                             null);
             assertEquals(
-                    "profile-id",
+                    "74b2f4aeceb14b2dabbfc5f41d0a8846",
                     authentication.hasJoined("RigPeer", "challenge").get(5, TimeUnit.SECONDS));
             assertEquals("/session/minecraft/hasJoined", path.get());
             assertEquals("username=RigPeer&serverId=challenge", query.get());
@@ -70,15 +72,18 @@ class AuthenticationTest {
                     "Неверный пароль.",
                     authentication
                             .authenticate("RigPeer", "fixture-password")
-                            .get(5, TimeUnit.SECONDS));
+                            .get(5, TimeUnit.SECONDS)
+                            .error());
 
             status.set(200);
             response.set(
-                    "{\"accessToken\":\"fixture-access\",\"clientToken\":\"fixture-client\",\"selectedProfile\":{\"name\":\"RigPeer\"}}");
-            assertNull(
+                    "{\"accessToken\":\"fixture-access\",\"clientToken\":\"fixture-client\",\"selectedProfile\":{\"name\":\"RigPeer\",\"id\":\"74b2f4aeceb14b2dabbfc5f41d0a8846\"}}");
+            var proof =
                     authentication
                             .authenticate("RigPeer", "fixture-password")
-                            .get(5, TimeUnit.SECONDS));
+                            .get(5, TimeUnit.SECONDS);
+            assertNull(proof.error());
+            assertEquals("74b2f4aeceb14b2dabbfc5f41d0a8846", proof.id());
             assertEquals("/auth/authenticate", path.get());
             var login = JsonParser.parseString(posted.get()).getAsJsonObject();
             assertEquals("RigPeer", login.get("username").getAsString());
@@ -91,6 +96,7 @@ class AuthenticationTest {
                     authentication
                             .authenticate("rigpeer", "fixture-password")
                             .get(5, TimeUnit.SECONDS)
+                            .error()
                             .contains("RigPeer"));
 
             status.set(201);

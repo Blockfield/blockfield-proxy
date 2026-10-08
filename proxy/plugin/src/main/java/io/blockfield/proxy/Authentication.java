@@ -8,6 +8,7 @@ import com.velocitypowered.api.event.Subscribe;
 import com.velocitypowered.api.event.connection.DisconnectEvent;
 import com.velocitypowered.api.event.connection.LoginEvent;
 import com.velocitypowered.api.event.connection.PreLoginEvent;
+import com.velocitypowered.api.event.player.GameProfileRequestEvent;
 import com.velocitypowered.api.proxy.LoginPhaseConnection;
 import com.velocitypowered.api.proxy.Player;
 import com.velocitypowered.api.proxy.ProxyServer;
@@ -35,7 +36,6 @@ import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 import java.util.regex.Pattern;
 
@@ -66,13 +66,13 @@ final class Authentication {
 
     private record Pending(
             long createdAt,
-            CompletableFuture<Boolean> auth,
+            CompletableFuture<String> auth,
             CompletableFuture<byte[]> pack,
-            CompletableFuture<byte[]> contract,
-            AtomicReference<String> drasl) {}
+            CompletableFuture<byte[]> contract) {}
 
     private final Map<String, Pending> pending = new ConcurrentHashMap<>();
     private final Set<UUID> authed = ConcurrentHashMap.newKeySet();
+    private final Set<UUID> loggingOut = ConcurrentHashMap.newKeySet();
 
     /** Drasl profile id подтверждённого аккаунта: ACL мастерской сверяет id и ник вместе. */
     private final Map<UUID, String> draslIds = new ConcurrentHashMap<>();
@@ -137,10 +137,14 @@ final class Authentication {
 
     @Subscribe
     public void onDisconnect(DisconnectEvent event) {
-        UUID id = event.getPlayer().getUniqueId();
-        authed.remove(id);
-        draslIds.remove(id);
-        failures.remove(id);
+        Player player = event.getPlayer();
+        synchronized (player) {
+            UUID id = player.getUniqueId();
+            authed.remove(id);
+            loggingOut.remove(id);
+            draslIds.remove(id);
+            failures.remove(id);
+        }
     }
 
     @Subscribe
@@ -152,13 +156,12 @@ final class Authentication {
             return;
         }
         if (!(event.getConnection() instanceof LoginPhaseConnection connection)) return;
-        var auth = new CompletableFuture<Boolean>();
+        var auth = new CompletableFuture<String>();
         var pack = new CompletableFuture<byte[]>();
         var contract = new CompletableFuture<byte[]>();
-        var drasl = new AtomicReference<String>();
         pending.put(
                 key(event.getConnection().getRemoteAddress(), event.getUsername()),
-                new Pending(System.currentTimeMillis(), auth, pack, contract, drasl));
+                new Pending(System.currentTimeMillis(), auth, pack, contract));
         connection.sendLoginPluginMessage(LoginForwarding.PACK, new byte[0], pack::complete);
         connection.sendLoginPluginMessage(
                 LoginForwarding.CONTRACT, new byte[0], contract::complete);
@@ -171,21 +174,48 @@ final class Authentication {
                         hasJoined(event.getUsername(), serverId)
                                 .whenComplete(
                                         (id, error) -> {
-                                            if (error == null && id != null) drasl.set(id);
-                                            auth.complete(error == null && id != null);
+                                            auth.complete(error == null ? id : null);
                                         });
                     } else if (response != null && response.length > 1 && sessionSecret != null) {
-                        auth.complete(
+                        String expected =
                                 Sessions.verify(
                                         sessionSecret,
                                         event.getUsername(),
                                         serverId,
                                         response,
-                                        System.currentTimeMillis() / 1000));
+                                        System.currentTimeMillis() / 1000);
+                        if (expected == null) {
+                            auth.complete(null);
+                        } else {
+                            resolveDrasl(event.getUsername())
+                                    .thenAccept(
+                                            current ->
+                                                    auth.complete(
+                                                            expected.equals(current)
+                                                                    ? current
+                                                                    : null));
+                        }
                     } else {
-                        auth.complete(false);
+                        auth.complete(null);
                     }
                 });
+    }
+
+    /** UUID becomes immutable at LoginSuccess; resolve it before Velocity creates the player. */
+    @Subscribe
+    public EventTask onProfile(GameProfileRequestEvent event) {
+        Pending entry =
+                pending.get(key(event.getConnection().getRemoteAddress(), event.getUsername()));
+        if (entry == null) return null;
+        return EventTask.resumeWhenComplete(
+                entry.auth()
+                        .completeOnTimeout(null, 15, TimeUnit.SECONDS)
+                        .exceptionally(error -> null)
+                        .thenAccept(
+                                id -> {
+                                    if (id == null) return;
+                                    event.setGameProfile(event.getGameProfile().withUndashedId(id));
+                                }));
     }
 
     @Subscribe
@@ -194,6 +224,15 @@ final class Authentication {
         Pending entry = pending.remove(key(player.getRemoteAddress(), player.getUsername()));
         if (entry == null) return null;
         UUID id = player.getUniqueId();
+        String account = entry.auth().getNow(null);
+        synchronized (player) {
+            if (!loggingOut.contains(id)
+                    && account != null
+                    && id.toString().replace("-", "").equals(account)) {
+                draslIds.put(id, account);
+                authed.add(id);
+            }
+        }
         return EventTask.resumeWhenComplete(
                 CompletableFuture.allOf(
                         entry.pack()
@@ -208,33 +247,14 @@ final class Authentication {
                                         reply -> {
                                             if (reply != null)
                                                 forwarding.rememberContract(id, reply);
-                                        }),
-                        entry.auth()
-                                .completeOnTimeout(false, 15, TimeUnit.SECONDS)
-                                .thenCompose(
-                                        ok -> {
-                                            if (!ok) return CompletableFuture.completedFuture(null);
-                                            authed.add(id);
-                                            return resolveDrasl(
-                                                    id, player.getUsername(), entry.drasl().get());
                                         })));
     }
 
-    /**
-     * Запомненный вход (JWT) несёт только ник: id берём у Drasl по уже подтверждённому нику; сбой —
-     * без доступа в мастерскую.
-     */
-    private CompletableFuture<Void> resolveDrasl(UUID player, String name, String known) {
-        CompletableFuture<String> id =
-                known != null
-                        ? CompletableFuture.completedFuture(known)
-                        : profileId(name)
-                                .exceptionally(error -> null)
-                                .completeOnTimeout(null, 5, TimeUnit.SECONDS);
-        return id.thenAccept(
-                value -> {
-                    if (value != null) draslIds.put(player, value);
-                });
+    /** Called only after a password or challenge proof; a lookup alone never authenticates. */
+    private CompletableFuture<String> resolveDrasl(String name) {
+        return profileId(name)
+                .exceptionally(error -> null)
+                .completeOnTimeout(null, 5, TimeUnit.SECONDS);
     }
 
     private final class AuthCommand implements SimpleCommand {
@@ -250,7 +270,8 @@ final class Authentication {
         @Override
         public boolean hasPermission(Invocation invocation) {
             return invocation.source() instanceof Player player
-                    && !authed.contains(player.getUniqueId());
+                    && !authed.contains(player.getUniqueId())
+                    && !loggingOut.contains(player.getUniqueId());
         }
 
         @Override
@@ -277,9 +298,18 @@ final class Authentication {
             }
             (register
                             ? register(player.getUsername(), args[0])
+                                    .thenCompose(
+                                            error ->
+                                                    error == null
+                                                            ? authenticate(
+                                                                    player.getUsername(), args[0])
+                                                            : CompletableFuture.completedFuture(
+                                                                    new PasswordProof(null, error)))
                             : authenticate(player.getUsername(), args[0]))
                     .whenComplete(
-                            (error, failure) -> {
+                            (proof, failure) -> {
+                                if (!player.isActive() || loggingOut.contains(player.getUniqueId()))
+                                    return;
                                 if (failure != null) {
                                     logger.warn(
                                             "Drasl request failed for {}",
@@ -290,10 +320,10 @@ final class Authentication {
                                                     "Сервер аккаунтов недоступен, попробуйте ещё"
                                                             + " раз.",
                                                     NamedTextColor.RED));
-                                } else if (error != null) {
-                                    fail(player, ip, error);
+                                } else if (proof.error() != null) {
+                                    fail(player, ip, proof.error());
                                 } else {
-                                    admit(player, admitted);
+                                    admit(player, proof.id(), admitted);
                                 }
                             });
         }
@@ -302,14 +332,18 @@ final class Authentication {
     private final class LogoutCommand implements SimpleCommand {
         @Override
         public boolean hasPermission(Invocation invocation) {
-            return invocation.source() instanceof Player player
-                    && authed.contains(player.getUniqueId());
+            return invocation.source() instanceof Player;
         }
 
         @Override
         public void execute(Invocation invocation) {
             if (!(invocation.source() instanceof Player player)) return;
-            player.sendPluginMessage(SESSION, concat(utf(""), utf("")));
+            synchronized (player) {
+                loggingOut.add(player.getUniqueId());
+                authed.remove(player.getUniqueId());
+                draslIds.remove(player.getUniqueId());
+                player.sendPluginMessage(SESSION, concat(utf(""), utf("")));
+            }
             // Пауза, чтобы сброс сессии дошёл до клиента раньше разрыва соединения.
             proxy.getScheduler()
                     .buildTask(
@@ -339,26 +373,74 @@ final class Authentication {
         }
     }
 
-    private void admit(Player player, Consumer<Player> admitted) {
-        authed.add(player.getUniqueId());
-        failures.remove(player.getUniqueId());
-        if (sessionSecret != null) {
-            String[] session =
-                    Sessions.issue(
-                            sessionSecret, player.getUsername(), System.currentTimeMillis() / 1000);
-            player.sendPluginMessage(SESSION, concat(utf(session[0]), utf(session[1])));
-        }
-        player.sendMessage(
-                Component.text(
-                        "Вход выполнен. На этом компьютере игра запомнит его на 30 дней, выйти —"
-                                + " /logout.",
-                        NamedTextColor.GREEN));
-        resolveDrasl(player.getUniqueId(), player.getUsername(), null)
-                .thenRun(() -> admitted.accept(player));
+    private void admit(Player player, String expected, Consumer<Player> admitted) {
+        resolveDrasl(player.getUsername())
+                .thenAccept(
+                        account -> {
+                            // Logout must be the last credential/auth write even when HTTP finishes
+                            // concurrently.
+                            synchronized (player) {
+                                if (!player.isActive() || loggingOut.contains(player.getUniqueId()))
+                                    return;
+                                if (expected == null || !expected.equals(account)) {
+                                    player.sendMessage(
+                                            Component.text(
+                                                    "Не удалось подтвердить профиль аккаунта."
+                                                            + " Попробуйте ещё раз.",
+                                                    NamedTextColor.RED));
+                                    return;
+                                }
+                                failures.remove(player.getUniqueId());
+                                boolean sameIdentity =
+                                        player.getUniqueId()
+                                                .toString()
+                                                .replace("-", "")
+                                                .equals(account);
+                                if (sessionSecret == null && !sameIdentity) {
+                                    player.sendMessage(
+                                            Component.text(
+                                                    "Сохранённый вход недоступен. Войдите через"
+                                                            + " лаунчер Blockfield.",
+                                                    NamedTextColor.RED));
+                                    return;
+                                }
+                                if (sessionSecret != null) {
+                                    String[] session =
+                                            Sessions.issue(
+                                                    sessionSecret,
+                                                    player.getUsername(),
+                                                    account,
+                                                    System.currentTimeMillis() / 1000);
+                                    player.sendPluginMessage(
+                                            SESSION, concat(utf(session[0]), utf(session[1])));
+                                }
+                                if (sameIdentity) {
+                                    draslIds.put(player.getUniqueId(), account);
+                                    authed.add(player.getUniqueId());
+                                    player.sendMessage(
+                                            Component.text(
+                                                    "Вход выполнен. Выйти — /logout.",
+                                                    NamedTextColor.GREEN));
+                                    admitted.accept(player);
+                                    return;
+                                }
+                                // A play-phase player still has its offline UUID: never forward it
+                                // to a
+                                // backend.
+                                player.sendMessage(
+                                        Component.text(
+                                                "Вход сохранён на 30 дней. Переподключитесь к этому"
+                                                        + " же адресу сервера, чтобы войти с UUID"
+                                                        + " аккаунта. Выйти — /logout.",
+                                                NamedTextColor.GREEN));
+                            }
+                        });
     }
 
-    /** null — пароль верный и ник совпадает с аккаунтом; иначе текст ошибки для игрока. */
-    CompletableFuture<String> authenticate(String name, String password) {
+    record PasswordProof(String id, String error) {}
+
+    /** UUID comes from the password-proven selectedProfile, never from a nickname lookup. */
+    CompletableFuture<PasswordProof> authenticate(String name, String password) {
         JsonObject body = new JsonObject();
         JsonObject agent = new JsonObject();
         agent.addProperty("name", "Minecraft");
@@ -369,7 +451,8 @@ final class Authentication {
         return post("/auth/authenticate", body)
                 .thenApply(
                         response -> {
-                            if (response.statusCode() != 200) return "Неверный пароль.";
+                            if (response.statusCode() != 200)
+                                return new PasswordProof(null, "Неверный пароль.");
                             JsonObject json =
                                     JsonParser.parseString(response.body()).getAsJsonObject();
                             JsonObject invalidate = new JsonObject();
@@ -382,11 +465,18 @@ final class Authentication {
                                                     .get("name")
                                                     .getAsString()
                                             : "";
-                            return profile.equals(name)
-                                    ? null
-                                    : "Этот аккаунт играет под ником "
-                                            + profile
-                                            + " — зайдите с ним.";
+                            if (!profile.equals(name))
+                                return new PasswordProof(
+                                        null,
+                                        "Этот аккаунт играет под ником "
+                                                + profile
+                                                + " — зайдите с ним.");
+                            String id =
+                                    profileIdentity(json.getAsJsonObject("selectedProfile"), name);
+                            return id == null
+                                    ? new PasswordProof(
+                                            null, "Не удалось подтвердить UUID аккаунта.")
+                                    : new PasswordProof(id, null);
                         });
     }
 
@@ -443,10 +533,19 @@ final class Authentication {
                             if (response.statusCode() != 200) return null;
                             JsonObject json =
                                     JsonParser.parseString(response.body()).getAsJsonObject();
-                            return json.get("name").getAsString().equals(name)
-                                    ? json.get("id").getAsString()
-                                    : null;
+                            return profileIdentity(json, name);
                         });
+    }
+
+    private static String profileIdentity(JsonObject json, String name) {
+        if (!json.has("id") || !json.has("name")) return null;
+        String id = json.get("id").getAsString();
+        return json.get("name").getAsString().equals(name)
+                        && (id.matches("[0-9a-fA-F]{32}")
+                                || id.matches(
+                                        "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"))
+                ? Gate.normalizeId(id)
+                : null;
     }
 
     private CompletableFuture<HttpResponse<String>> post(String path, JsonObject body) {

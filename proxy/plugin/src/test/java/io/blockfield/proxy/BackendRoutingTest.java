@@ -1,0 +1,307 @@
+package io.blockfield.proxy;
+
+import static io.blockfield.proxy.GateEvictionTest.fake;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+import com.velocitypowered.api.event.connection.DisconnectEvent;
+import com.velocitypowered.api.event.player.KickedFromServerEvent;
+import com.velocitypowered.api.event.player.PlayerChooseInitialServerEvent;
+import com.velocitypowered.api.event.player.ServerPreConnectEvent;
+import com.velocitypowered.api.proxy.ConnectionRequestBuilder;
+import com.velocitypowered.api.proxy.Player;
+import com.velocitypowered.api.proxy.ProxyServer;
+import com.velocitypowered.api.proxy.ServerConnection;
+import com.velocitypowered.api.proxy.server.RegisteredServer;
+import com.velocitypowered.api.proxy.server.ServerInfo;
+import com.velocitypowered.api.proxy.server.ServerPing;
+
+import net.kyori.adventure.text.Component;
+
+import org.junit.jupiter.api.Test;
+import org.slf4j.LoggerFactory;
+
+import java.lang.reflect.Field;
+import java.net.InetSocketAddress;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
+
+class BackendRoutingTest {
+    private static final String DRASL = "6727890496a93613a33463780ae01220";
+
+    @Test
+    void hostNormalizationAndConfiguration() throws Exception {
+        assertEquals("workshop.invalid", BackendRouting.normalizeHost("WORKSHOP.invalid."));
+        assertEquals(
+                BackendRouting.normalizeHost("[2001:db8::1]"),
+                BackendRouting.normalizeHost("2001:0DB8:0:0:0:0:0:1"));
+        for (String invalid :
+                List.of(
+                        "raknet;workshop.invalid",
+                        "workshop.invalid:25566",
+                        "https://workshop.invalid")) {
+            assertThrows(IllegalArgumentException.class, () -> new Fixture(invalid));
+        }
+        var fixture = new Fixture("[2001:db8::1]");
+        Player player = fixture.player(UUID.randomUUID(), "2001:DB8:0:0:0:0:0:1", "Builder");
+        fixture.authenticate(player);
+        fixture.gate("builders", "workshop", "Builder");
+        assertTrue(fixture.connect(player, "workshop").getResult().isAllowed());
+    }
+
+    @Test
+    void builderGameAddressNeverEntersWorkshopAndWorkshopNeverEntersGame() throws Exception {
+        var fixture = new Fixture("workshop.invalid");
+        Player game = fixture.player(UUID.randomUUID(), "game.invalid", "Builder");
+        Player workshop = fixture.player(UUID.randomUUID(), "WORKSHOP.invalid.", "Builder");
+        fixture.authenticate(game);
+        fixture.authenticate(workshop);
+        fixture.gate("builders", "workshop", "Builder");
+        assertEquals(fixture.servers.get("lobby"), fixture.choose(game));
+        assertFalse(fixture.connect(game, "workshop").getResult().isAllowed());
+        fixture.routing.admit(game);
+        fixture.routing.tick();
+        fixture.pings.get("workshop").complete(null);
+        assertEquals(List.of(), fixture.requests.get(game.getUniqueId()));
+        assertEquals(List.of("workshop"), fixture.requests.get(workshop.getUniqueId()));
+
+        fixture.gate("public", "game", null);
+        assertEquals(fixture.servers.get("lobby"), fixture.choose(workshop));
+        assertFalse(fixture.connect(workshop, "game").getResult().isAllowed());
+        assertTrue(fixture.connect(game, "game").getResult().isAllowed());
+        assertFalse(fixture.connect(game, "workshop").getResult().isAllowed());
+    }
+
+    @Test
+    void workshopHostGrantsNoRoleAndEmptyConfigurationDisablesWorkshop() throws Exception {
+        var fixture = new Fixture("workshop.invalid");
+        Player builder = fixture.player(UUID.randomUUID(), "workshop.invalid", "Builder");
+        Player other = fixture.player(UUID.randomUUID(), "workshop.invalid", "Other");
+        fixture.authenticate(builder);
+        fixture.authenticate(other);
+        for (String state : List.of("builders", "testers")) {
+            fixture.gate(state, "workshop", "Builder");
+            assertTrue(fixture.connect(builder, "workshop").getResult().isAllowed());
+            assertFalse(fixture.connect(other, "workshop").getResult().isAllowed());
+        }
+        fixture.gate("closed", "workshop", "Builder");
+        assertFalse(fixture.connect(builder, "workshop").getResult().isAllowed());
+        var unset = new Fixture("");
+        Player legacy = unset.player(UUID.randomUUID(), "workshop.invalid", "Builder");
+        unset.authenticate(legacy);
+        unset.gate("builders", "workshop", "Builder");
+        assertFalse(unset.connect(legacy, "workshop").getResult().isAllowed());
+    }
+
+    @Test
+    void readinessRestartAndReconnectKeepTheSelectedProfile() throws Exception {
+        var fixture = new Fixture("workshop.invalid");
+        UUID id = UUID.randomUUID();
+        Player workshop = fixture.player(id, "workshop.invalid", "Builder");
+        fixture.authenticate(workshop);
+        fixture.gate("builders", "workshop", "Builder");
+        fixture.routing.admit(workshop);
+        fixture.routing.tick();
+        assertEquals(
+                List.of(),
+                fixture.requests.get(id),
+                "a backend that has not answered ping is not entered");
+        fixture.gate("public", "game", null);
+        fixture.pings.get("workshop").complete(null);
+        assertFalse(
+                fixture.connect(workshop, "workshop").getResult().isAllowed(),
+                "preconnect rechecks a gate changed while ping was pending");
+        fixture.current.put(id, fixture.servers.get("workshop"));
+        var kicked =
+                new KickedFromServerEvent(
+                        workshop,
+                        fixture.servers.get("workshop"),
+                        null,
+                        false,
+                        KickedFromServerEvent.DisconnectPlayer.create(Component.empty()));
+        fixture.routing.onKicked(kicked);
+        assertEquals(
+                fixture.servers.get("lobby"),
+                assertInstanceOf(KickedFromServerEvent.RedirectPlayer.class, kicked.getResult())
+                        .getServer());
+        fixture.routing.tick();
+        assertTrue(
+                fixture.requests.get(id).contains("lobby"),
+                "backend transition parks the workshop profile");
+        fixture.pings.get("game").complete(null);
+        assertFalse(fixture.requests.get(id).contains("game"));
+
+        fixture.authentication.onDisconnect(
+                new DisconnectEvent(workshop, DisconnectEvent.LoginStatus.SUCCESSFUL_LOGIN));
+        Player reconnect = fixture.player(id, "game.invalid", "Builder");
+        assertFalse(
+                fixture.connect(reconnect, "game").getResult().isAllowed(),
+                "reconnect must authenticate again");
+        fixture.authenticate(reconnect);
+        assertEquals(fixture.servers.get("game"), fixture.choose(reconnect));
+        fixture.gate("builders", "workshop", "Builder");
+        assertEquals(
+                fixture.servers.get("lobby"),
+                fixture.choose(reconnect),
+                "switching the gate does not switch the reconnected profile");
+    }
+
+    @Test
+    void drainingMembershipStillRequiresGameAddress() throws Exception {
+        var fixture = new Fixture("workshop.invalid");
+        Player game = fixture.player(UUID.randomUUID(), "game.invalid", "Player");
+        Player workshop = fixture.player(UUID.randomUUID(), "workshop.invalid", "Builder");
+        fixture.authenticate(game);
+        fixture.authenticate(workshop);
+        fixture.gate("draining", "game", null);
+        assertFalse(fixture.connect(game, "game").getResult().isAllowed());
+        fixture.current.put(game.getUniqueId(), fixture.servers.get("game"));
+        fixture.current.put(workshop.getUniqueId(), fixture.servers.get("game"));
+        assertTrue(fixture.connect(game, "game").getResult().isAllowed());
+        assertFalse(fixture.connect(workshop, "game").getResult().isAllowed());
+    }
+
+    private static final class Fixture {
+        final Map<String, RegisteredServer> servers = new HashMap<>();
+        final Map<String, CompletableFuture<ServerPing>> pings = new HashMap<>();
+        final List<Player> players = new ArrayList<>();
+        final Map<UUID, RegisteredServer> current = new HashMap<>();
+        final Map<UUID, List<String>> requests = new HashMap<>();
+        final Authentication authentication;
+        final BackendRouting routing;
+
+        Fixture(String host) {
+            for (String name : List.of("lobby", "game", "workshop")) {
+                pings.put(name, new CompletableFuture<>());
+                servers.put(
+                        name,
+                        fake(
+                                RegisteredServer.class,
+                                (method, args) ->
+                                        switch (method) {
+                                            case "getServerInfo" ->
+                                                    new ServerInfo(
+                                                            name,
+                                                            InetSocketAddress.createUnresolved(
+                                                                    "127.0.0.1", 1));
+                                            case "getPlayersConnected" -> playersOn(name);
+                                            case "ping" -> pings.get(name);
+                                            default -> null;
+                                        }));
+            }
+            ProxyServer proxy =
+                    fake(
+                            ProxyServer.class,
+                            (method, args) ->
+                                    switch (method) {
+                                        case "getServer" ->
+                                                Optional.ofNullable(servers.get((String) args[0]));
+                                        case "getAllPlayers" -> players;
+                                        default -> null;
+                                    });
+            authentication =
+                    new Authentication(
+                            this, proxy, LoggerFactory.getLogger("test"), new LoginForwarding());
+            routing =
+                    new BackendRouting(
+                            this, proxy, LoggerFactory.getLogger("test"), authentication, host);
+        }
+
+        Player player(UUID id, String host, String name) {
+            current.put(id, servers.get("lobby"));
+            requests.put(id, new ArrayList<>());
+            players.removeIf(p -> p.getUniqueId().equals(id));
+            ServerConnection connection =
+                    fake(
+                            ServerConnection.class,
+                            (method, args) ->
+                                    switch (method) {
+                                        case "getServer" -> current.get(id);
+                                        case "getServerInfo" -> current.get(id).getServerInfo();
+                                        default -> null;
+                                    });
+            Player player =
+                    fake(
+                            Player.class,
+                            (method, args) ->
+                                    switch (method) {
+                                        case "getUniqueId" -> id;
+                                        case "getUsername" -> name;
+                                        case "getVirtualHost" ->
+                                                Optional.of(
+                                                        InetSocketAddress.createUnresolved(
+                                                                host, 25566));
+                                        case "getCurrentServer" -> Optional.of(connection);
+                                        case "createConnectionRequest" ->
+                                                request(id, (RegisteredServer) args[0]);
+                                        default -> null;
+                                    });
+            players.add(player);
+            return player;
+        }
+
+        private List<Player> playersOn(String name) {
+            return players.stream()
+                    .filter(player -> current.get(player.getUniqueId()) == servers.get(name))
+                    .toList();
+        }
+
+        private ConnectionRequestBuilder request(UUID id, RegisteredServer server) {
+            return fake(
+                    ConnectionRequestBuilder.class,
+                    (method, args) -> {
+                        if (method.equals("fireAndForget"))
+                            requests.get(id).add(server.getServerInfo().getName());
+                        return null;
+                    });
+        }
+
+        void authenticate(Player player) throws Exception {
+            this.<Set<UUID>>field(authentication, "authed").add(player.getUniqueId());
+            this.<Map<UUID, String>>field(authentication, "draslIds")
+                    .put(player.getUniqueId(), DRASL);
+        }
+
+        void gate(String state, String backend, String name) throws Exception {
+            Field field = BackendRouting.class.getDeclaredField("gate");
+            field.setAccessible(true);
+            field.set(
+                    routing,
+                    new Gate(
+                            state,
+                            backend,
+                            "Gate message",
+                            name == null ? Set.of() : Set.of(new Gate.Member(DRASL, name))));
+        }
+
+        RegisteredServer choose(Player player) {
+            var event = new PlayerChooseInitialServerEvent(player, servers.get("game"));
+            routing.onChooseServer(event);
+            return event.getInitialServer().orElseThrow();
+        }
+
+        ServerPreConnectEvent connect(Player player, String backend) {
+            var event =
+                    new ServerPreConnectEvent(player, servers.get(backend), servers.get("lobby"));
+            routing.onPreConnect(event);
+            return event;
+        }
+
+        @SuppressWarnings("unchecked")
+        private <T> T field(Object instance, String name) throws Exception {
+            Field field = instance.getClass().getDeclaredField(name);
+            field.setAccessible(true);
+            return (T) field.get(instance);
+        }
+    }
+}
