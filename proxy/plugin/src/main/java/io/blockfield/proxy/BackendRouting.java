@@ -6,6 +6,7 @@ import com.velocitypowered.api.event.player.PlayerChooseInitialServerEvent;
 import com.velocitypowered.api.event.player.ServerPostConnectEvent;
 import com.velocitypowered.api.event.player.ServerPreConnectEvent;
 import com.velocitypowered.api.event.proxy.ProxyPingEvent;
+import com.velocitypowered.api.proxy.InboundConnection;
 import com.velocitypowered.api.proxy.Player;
 import com.velocitypowered.api.proxy.ProxyServer;
 import com.velocitypowered.api.proxy.server.RegisteredServer;
@@ -24,6 +25,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.attribute.FileTime;
 import java.time.Duration;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
@@ -103,9 +105,10 @@ final class BackendRouting {
         return host;
     }
 
-    private String requestedBackend(Player player) {
+    private String requestedBackend(InboundConnection connection) {
         return !workshopHost.isEmpty()
-                        && player.getVirtualHost()
+                        && connection
+                                .getVirtualHost()
                                 .map(address -> normalizeHost(address.getHostString()))
                                 .filter(workshopHost::equals)
                                 .isPresent()
@@ -114,14 +117,17 @@ final class BackendRouting {
     }
 
     void admit(Player player) {
+        reloadGate();
         target(player)
                 .ifPresentOrElse(
                         backend ->
                                 backend.ping()
                                         .thenRun(
-                                                () ->
+                                                () -> {
+                                                    if (allowed(player, backend))
                                                         player.createConnectionRequest(backend)
-                                                                .fireAndForget()),
+                                                                .fireAndForget();
+                                                }),
                         () ->
                                 player.sendMessage(
                                         Component.text(waitingText(player), NamedTextColor.GOLD)));
@@ -140,12 +146,10 @@ final class BackendRouting {
         Gate next = Gate.load(gateFile);
         if (!next.equals(gate))
             logger.info(
-                    "Gate {}:{} -> {}:{} ({} allowed)",
-                    gate.state(),
-                    gate.backend(),
-                    next.state(),
-                    next.backend(),
-                    next.allowed().size());
+                    "Gate game={} workshop={} ({} workshop members)",
+                    next.forBackend("game").state(),
+                    next.forBackend("workshop").state(),
+                    next.forBackend("workshop").allowed().size());
         gate = next;
     }
 
@@ -173,26 +177,33 @@ final class BackendRouting {
 
     private String waitingText(Player player) {
         String backend = requestedBackend(player);
-        if (!backend.equals(gate.backend()))
-            return backend.equals("workshop")
-                    ? "Мастерская сейчас недоступна. Вернём вас автоматически, когда она откроется."
-                    : "Игровой сервер сейчас недоступен. Вернём вас автоматически, когда он"
-                            + " откроется.";
         if (target(player).isPresent())
             return backend.equals("workshop")
                     ? "Мастерская запускается. Вернём вас автоматически, когда она поднимется."
                     : RESTARTING;
-        return gate.message().isBlank() ? "Игровой сервер недоступен." : gate.message();
+        Gate selected = gate.forBackend(backend);
+        return selected.message().isBlank()
+                ? backend.equals("workshop")
+                        ? "Мастерская сейчас недоступна."
+                        : "Игровой сервер недоступен."
+                : selected.message();
     }
 
     @Subscribe
     public void onPing(ProxyPingEvent event) {
         reloadGate();
-        if (!gate.open()) {
+        String backend = requestedBackend(event.getConnection());
+        Gate selected = gate.forBackend(backend);
+        if (!selected.open() || backend.equals("workshop")) {
             event.setPing(
                     event.getPing()
                             .asBuilder()
-                            .description(Component.text(gate.message(), NamedTextColor.GOLD))
+                            .description(
+                                    Component.text(
+                                            selected.message().isBlank()
+                                                    ? "Мастерская Blockfield"
+                                                    : selected.message(),
+                                            NamedTextColor.GOLD))
                             .build());
         }
     }
@@ -338,21 +349,25 @@ final class BackendRouting {
                                 });
             }
         }
-        Optional<RegisteredServer> backend = server(gate.backend());
-        if (backend.isEmpty()) return;
-        var waiting =
-                lobby.get().getPlayersConnected().stream()
-                        .filter(p -> allowed(p, backend.get()))
-                        .toList();
-        if (waiting.isEmpty()) return;
-        backend.get()
-                .ping()
-                .thenRun(
-                        () ->
-                                waiting.forEach(
-                                        p ->
-                                                p.createConnectionRequest(backend.get())
-                                                        .fireAndForget()));
+        for (String name : List.of("game", "workshop")) {
+            Optional<RegisteredServer> backend = server(name);
+            if (backend.isEmpty()) continue;
+            var waiting =
+                    lobby.get().getPlayersConnected().stream()
+                            .filter(p -> allowed(p, backend.get()))
+                            .toList();
+            if (waiting.isEmpty()) continue;
+            backend.get()
+                    .ping()
+                    .thenRun(
+                            () ->
+                                    waiting.stream()
+                                            .filter(p -> allowed(p, backend.get()))
+                                            .forEach(
+                                                    p ->
+                                                            p.createConnectionRequest(backend.get())
+                                                                    .fireAndForget()));
+        }
     }
 
     private Optional<RegisteredServer> server(String name) {

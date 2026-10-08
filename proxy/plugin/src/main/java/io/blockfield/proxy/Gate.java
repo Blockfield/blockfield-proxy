@@ -12,6 +12,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.HashSet;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Set;
 import java.util.regex.Pattern;
 
@@ -20,7 +21,12 @@ import java.util.regex.Pattern;
  * Без BLOCKFIELD_GATE_FILE прокси работает как раньше; с ним отсутствующий, битый или незнакомый
  * файл закрывает вход.
  */
-record Gate(String state, String backend, String message, Set<Member> allowed) {
+record Gate(
+        String state,
+        String backend,
+        String message,
+        Set<Member> allowed,
+        Map<String, Gate> backends) {
     static final String DEFAULT_MESSAGE =
             "На сервере проводятся технические работы. Обычный вход временно недоступен.";
     static final Gate OPEN = new Gate("public", "game", "", Set.of());
@@ -29,8 +35,17 @@ record Gate(String state, String backend, String message, Set<Member> allowed) {
 
     record Member(String draslId, String name) {}
 
+    Gate(String state, String backend, String message, Set<Member> allowed) {
+        this(state, backend, message, allowed, Map.of());
+    }
+
     static Gate closed() {
         return new Gate("closed", "game", DEFAULT_MESSAGE, Set.of());
+    }
+
+    Gate forBackend(String server) {
+        if (!backends.isEmpty()) return backends.getOrDefault(server, closed());
+        return server.equals(backend) ? this : closed();
     }
 
     boolean open() {
@@ -45,14 +60,16 @@ record Gate(String state, String backend, String message, Set<Member> allowed) {
      * @param gameMember игрок сейчас или недавно был на игровом сервере (доигрывает DRAINING)
      */
     boolean allows(String server, String draslId, String name, boolean gameMember) {
-        if (!server.equals(backend)) return false;
-        return switch (state) {
+        Gate selected = forBackend(server);
+        if (!server.equals(selected.backend)) return false;
+        return switch (selected.state) {
             case "public" -> true;
             case "draining" -> gameMember;
             // testers: closed playtest of a workshop candidate on the same backend, same member
             // list.
             case "builders", "testers" ->
-                    draslId != null && allowed.contains(new Member(normalizeId(draslId), name));
+                    draslId != null
+                            && selected.allowed.contains(new Member(normalizeId(draslId), name));
             default -> false;
         };
     }
@@ -72,29 +89,65 @@ record Gate(String state, String backend, String message, Set<Member> allowed) {
     static Gate parse(String text) {
         try {
             JsonObject json = JsonParser.parseString(text).getAsJsonObject();
-            if (json.get("schema").getAsInt() != 1) return closed();
-            String state = json.get("gate").getAsString();
-            String backend = json.get("backend").getAsString();
-            if (!Set.of("public", "draining", "closed", "builders", "testers").contains(state)
-                    || !Set.of("game", "workshop").contains(backend)) {
-                return closed();
-            }
-            String message = json.get("message").getAsString().strip();
-            if (message.length() > 500) message = message.substring(0, 500);
-            if (message.isEmpty() && !state.equals("public")) message = DEFAULT_MESSAGE;
-            Set<Member> allowed = new HashSet<>();
-            JsonArray members = json.getAsJsonArray("allowed");
-            for (JsonElement element : members) {
-                JsonObject member = element.getAsJsonObject();
-                String id = normalizeId(member.get("draslId").getAsString());
-                String name = member.get("name").getAsString();
-                if (!DRASL_ID.matcher(id).matches() || !Authentication.NAME.matcher(name).matches())
-                    return closed();
-                allowed.add(new Member(id, name));
-            }
-            return new Gate(state, backend, message, Set.copyOf(allowed));
+            JsonElement schema = json.get("schema");
+            if (!schema.isJsonPrimitive()
+                    || !schema.getAsJsonPrimitive().isNumber()
+                    || !schema.getAsString().equals("1")) return closed();
+            Gate legacy = parseEntry(json, string(json, "backend"));
+            if (!json.has("backends")) return legacy;
+            JsonObject entries = json.getAsJsonObject("backends");
+            // A present backends object is authoritative, including missing or corrupt entries.
+            Map<String, Gate> backends =
+                    Map.of(
+                            "game", parseBackend(entries, "game"),
+                            "workshop", parseBackend(entries, "workshop"));
+            return new Gate(legacy.state, legacy.backend, legacy.message, legacy.allowed, backends);
         } catch (RuntimeException e) {
             return closed();
         }
+    }
+
+    private static Gate parseBackend(JsonObject entries, String backend) {
+        try {
+            return parseEntry(entries.getAsJsonObject(backend), backend);
+        } catch (RuntimeException e) {
+            return new Gate("closed", backend, DEFAULT_MESSAGE, Set.of());
+        }
+    }
+
+    private static String string(JsonObject json, String key) {
+        JsonElement value = json.get(key);
+        if (!value.isJsonPrimitive() || !value.getAsJsonPrimitive().isString()) {
+            throw new IllegalArgumentException("Expected a string");
+        }
+        return value.getAsString();
+    }
+
+    private static Gate parseEntry(JsonObject json, String backend) {
+        String state = string(json, "gate");
+        boolean validState =
+                switch (backend) {
+                    case "game" -> Set.of("public", "draining", "closed").contains(state);
+                    case "workshop" -> Set.of("builders", "testers", "closed").contains(state);
+                    default -> false;
+                };
+        if (!validState || json.has("backend") && !backend.equals(string(json, "backend"))) {
+            throw new IllegalArgumentException("Unknown gate or backend");
+        }
+        String message = string(json, "message").strip();
+        if (message.length() > 500) message = message.substring(0, 500);
+        if (message.isEmpty() && !state.equals("public")) message = DEFAULT_MESSAGE;
+        Set<Member> allowed = new HashSet<>();
+        JsonArray members = json.getAsJsonArray("allowed");
+        for (JsonElement element : members) {
+            JsonObject member = element.getAsJsonObject();
+            String id = normalizeId(string(member, "draslId"));
+            String name = string(member, "name");
+            if (!DRASL_ID.matcher(id).matches() || !Authentication.NAME.matcher(name).matches()) {
+                throw new IllegalArgumentException("Invalid gate member");
+            }
+            allowed.add(new Member(id, name));
+        }
+        return new Gate(state, backend, message, Set.copyOf(allowed));
     }
 }

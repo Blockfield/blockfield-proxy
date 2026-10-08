@@ -12,7 +12,9 @@ import com.velocitypowered.api.event.connection.DisconnectEvent;
 import com.velocitypowered.api.event.player.KickedFromServerEvent;
 import com.velocitypowered.api.event.player.PlayerChooseInitialServerEvent;
 import com.velocitypowered.api.event.player.ServerPreConnectEvent;
+import com.velocitypowered.api.event.proxy.ProxyPingEvent;
 import com.velocitypowered.api.proxy.ConnectionRequestBuilder;
+import com.velocitypowered.api.proxy.InboundConnection;
 import com.velocitypowered.api.proxy.Player;
 import com.velocitypowered.api.proxy.ProxyServer;
 import com.velocitypowered.api.proxy.ServerConnection;
@@ -171,6 +173,117 @@ class BackendRoutingTest {
         assertFalse(fixture.connect(workshop, "game").getResult().isAllowed());
     }
 
+    @Test
+    void simultaneousProfilesReconnectAndWorkshopClosureLeavesGameAlone() throws Exception {
+        var fixture = new Fixture("workshop.invalid");
+        Player game = fixture.player(UUID.randomUUID(), "game.invalid", "Player");
+        Player builder = fixture.player(UUID.randomUUID(), "workshop.invalid", "Builder");
+        Player outsider = fixture.player(UUID.randomUUID(), "workshop.invalid", "Other");
+        for (Player player : List.of(game, builder, outsider)) fixture.authenticate(player);
+        fixture.dualGate("builders", "Builder");
+        assertEquals(fixture.servers.get("game"), fixture.choose(game));
+        assertEquals(fixture.servers.get("workshop"), fixture.choose(builder));
+        assertEquals(fixture.servers.get("lobby"), fixture.choose(outsider));
+        assertFalse(fixture.connect(builder, "game").getResult().isAllowed());
+        assertFalse(fixture.connect(game, "workshop").getResult().isAllowed());
+        fixture.routing.tick();
+        fixture.pings.get("game").complete(null);
+        fixture.pings.get("workshop").complete(null);
+        assertEquals(List.of("game"), fixture.requests.get(game.getUniqueId()));
+        assertEquals(List.of("workshop"), fixture.requests.get(builder.getUniqueId()));
+        assertEquals(List.of(), fixture.requests.get(outsider.getUniqueId()));
+        fixture.current.put(game.getUniqueId(), fixture.servers.get("game"));
+        fixture.current.put(builder.getUniqueId(), fixture.servers.get("workshop"));
+        fixture.dualGate("closed", "Builder");
+        fixture.routing.tick();
+        assertEquals(List.of("game"), fixture.requests.get(game.getUniqueId()));
+        assertEquals(List.of("workshop", "lobby"), fixture.requests.get(builder.getUniqueId()));
+        assertTrue(fixture.connect(game, "game").getResult().isAllowed());
+        assertFalse(fixture.connect(builder, "workshop").getResult().isAllowed());
+    }
+
+    @Test
+    void workshopAclRevocationDoesNotEvictGameAndPendingPingCannotReadmit() throws Exception {
+        var fixture = new Fixture("workshop.invalid");
+        Player game = fixture.player(UUID.randomUUID(), "game.invalid", "Player");
+        Player builder = fixture.player(UUID.randomUUID(), "workshop.invalid", "Builder");
+        fixture.authenticate(game);
+        fixture.authenticate(builder);
+        fixture.dualGate("testers", "Builder");
+        fixture.current.put(game.getUniqueId(), fixture.servers.get("game"));
+        fixture.routing.admit(builder);
+        fixture.routing.tick();
+        fixture.dualGate("testers", null);
+        fixture.pings.get("workshop").complete(null);
+        assertEquals(List.of(), fixture.requests.get(builder.getUniqueId()));
+        fixture.current.put(builder.getUniqueId(), fixture.servers.get("workshop"));
+        fixture.routing.tick();
+        assertEquals(List.of("lobby"), fixture.requests.get(builder.getUniqueId()));
+        assertEquals(List.of(), fixture.requests.get(game.getUniqueId()));
+        assertTrue(fixture.connect(game, "game").getResult().isAllowed());
+    }
+
+    @Test
+    void disconnectDuringReadinessRevokesWorkshopAdmission() throws Exception {
+        var fixture = new Fixture("workshop.invalid");
+        Player builder = fixture.player(UUID.randomUUID(), "workshop.invalid", "Builder");
+        fixture.authenticate(builder);
+        fixture.dualGate("builders", "Builder");
+        fixture.routing.admit(builder);
+        fixture.routing.tick();
+        fixture.authentication.onDisconnect(
+                new DisconnectEvent(builder, DisconnectEvent.LoginStatus.SUCCESSFUL_LOGIN));
+        fixture.pings.get("workshop").complete(null);
+        assertEquals(List.of(), fixture.requests.get(builder.getUniqueId()));
+        assertFalse(fixture.connect(builder, "workshop").getResult().isAllowed());
+    }
+
+    @Test
+    void gameClosureKeepsWorkshopMembersOnTheirBackend() throws Exception {
+        var fixture = new Fixture("workshop.invalid");
+        Player game = fixture.player(UUID.randomUUID(), "game.invalid", "Player");
+        Player builder = fixture.player(UUID.randomUUID(), "workshop.invalid", "Builder");
+        fixture.authenticate(game);
+        fixture.authenticate(builder);
+        fixture.current.put(game.getUniqueId(), fixture.servers.get("game"));
+        fixture.current.put(builder.getUniqueId(), fixture.servers.get("workshop"));
+        fixture.dualGate("closed", "builders", "Builder");
+        fixture.routing.tick();
+        assertEquals(List.of("lobby"), fixture.requests.get(game.getUniqueId()));
+        assertEquals(List.of(), fixture.requests.get(builder.getUniqueId()));
+        assertTrue(fixture.connect(builder, "workshop").getResult().isAllowed());
+    }
+
+    @Test
+    void pingDescriptionUsesTheRequestedProfileGate() throws Exception {
+        var fixture = new Fixture("workshop.invalid");
+        fixture.dualGate("builders", "Builder");
+        Component gameMessage = Component.text("Game MOTD");
+        ServerPing original =
+                ServerPing.builder()
+                        .version(new ServerPing.Version(767, "1.21.1"))
+                        .description(gameMessage)
+                        .build();
+        var gamePing = new ProxyPingEvent(connection("game.invalid"), original);
+        fixture.routing.onPing(gamePing);
+        assertEquals(gameMessage, gamePing.getPing().getDescriptionComponent());
+        var workshopPing = new ProxyPingEvent(connection("WORKSHOP.invalid."), original);
+        fixture.routing.onPing(workshopPing);
+        assertEquals(
+                Component.text(
+                        "Workshop gate", net.kyori.adventure.text.format.NamedTextColor.GOLD),
+                workshopPing.getPing().getDescriptionComponent());
+    }
+
+    private static InboundConnection connection(String host) {
+        return fake(
+                InboundConnection.class,
+                (method, args) ->
+                        method.equals("getVirtualHost")
+                                ? Optional.of(InetSocketAddress.createUnresolved(host, 25565))
+                                : null);
+    }
+
     private static final class Fixture {
         final Map<String, RegisteredServer> servers = new HashMap<>();
         final Map<String, CompletableFuture<ServerPing>> pings = new HashMap<>();
@@ -273,15 +386,42 @@ class BackendRoutingTest {
         }
 
         void gate(String state, String backend, String name) throws Exception {
-            Field field = BackendRouting.class.getDeclaredField("gate");
-            field.setAccessible(true);
-            field.set(
-                    routing,
+            gate(
                     new Gate(
                             state,
                             backend,
                             "Gate message",
                             name == null ? Set.of() : Set.of(new Gate.Member(DRASL, name))));
+        }
+
+        void dualGate(String workshopState, String name) throws Exception {
+            dualGate("public", workshopState, name);
+        }
+
+        void dualGate(String gameState, String workshopState, String name) throws Exception {
+            gate(
+                    Gate.parse(
+                            GateTest.dual(
+                                    "{\"game\":"
+                                            + GateTest.entry(gameState, "", "")
+                                            + ",\"workshop\":"
+                                            + GateTest.entry(
+                                                    workshopState,
+                                                    "Workshop gate",
+                                                    name == null
+                                                            ? ""
+                                                            : "{\"draslId\":\""
+                                                                    + DRASL
+                                                                    + "\",\"name\":\""
+                                                                    + name
+                                                                    + "\"}")
+                                            + "}")));
+        }
+
+        void gate(Gate gate) throws Exception {
+            Field field = BackendRouting.class.getDeclaredField("gate");
+            field.setAccessible(true);
+            field.set(routing, gate);
         }
 
         RegisteredServer choose(Player player) {

@@ -21,6 +21,21 @@ class GateTest {
                 + "]}";
     }
 
+    static String dual(String entries) {
+        String legacy = gate("public", "game", "");
+        return legacy.substring(0, legacy.length() - 1) + ",\"backends\":" + entries + "}";
+    }
+
+    static String entry(String state, String message, String members) {
+        return "{\"gate\":\""
+                + state
+                + "\",\"message\":\""
+                + message
+                + "\",\"allowed\":["
+                + members
+                + "]}";
+    }
+
     @Test
     void withoutGateFileProxyStaysOpen() {
         assertSame(Gate.OPEN, Gate.load(null));
@@ -110,5 +125,103 @@ class GateTest {
                         "{\"schema\":1,\"gate\":\"closed\",\"backend\":\"game\",\"message\":\""
                                 + " \",\"allowed\":[]}");
         assertEquals(Gate.DEFAULT_MESSAGE, gate.message());
+    }
+
+    @Test
+    void gameAndRestrictedWorkshopOpenIndependently() {
+        for (String state : new String[] {"builders", "testers"}) {
+            Gate gate =
+                    Gate.parse(
+                            dual(
+                                    "{\"game\":"
+                                            + entry("public", "Game", "")
+                                            + ",\"workshop\":"
+                                            + entry(
+                                                    state,
+                                                    "Workshop",
+                                                    "{\"draslId\":\""
+                                                            + ID
+                                                            + "\",\"name\":\"Nether\"}")
+                                            + "}"));
+            assertTrue(gate.allows("game", null, "Anyone", false));
+            assertTrue(gate.allows("workshop", ID, "Nether", false));
+            assertFalse(gate.allows("workshop", ID, "Anyone", true));
+            assertFalse(gate.allows("workshop", null, "Nether", false));
+            assertEquals("Workshop", gate.forBackend("workshop").message());
+        }
+    }
+
+    @Test
+    void missingOrInvalidTargetNeverFallsBackToLegacy() {
+        for (String invalid :
+                new String[] {
+                    "null",
+                    "[]",
+                    "{}",
+                    entry("unknown", "", ""),
+                    entry("public", "", ""),
+                    entry("draining", "", ""),
+                    entry("builders", "", "{\"draslId\":\"x\",\"name\":\"Nether\"}"),
+                    "{\"gate\":true,\"message\":\"\",\"allowed\":[]}",
+                    "{\"gate\":\"public\",\"message\":false,\"allowed\":[]}",
+                    "{\"gate\":\"public\",\"message\":\"\",\"allowed\":null}",
+                    "{\"backend\":\"game\",\"gate\":\"public\",\"message\":\"\",\"allowed\":[]}"
+                }) {
+            Gate gate =
+                    Gate.parse(
+                            dual(
+                                    "{\"game\":"
+                                            + entry("public", "", "")
+                                            + ",\"workshop\":"
+                                            + invalid
+                                            + "}"));
+            assertTrue(gate.allows("game", ID, "Nether", false), invalid);
+            assertFalse(gate.allows("workshop", ID, "Nether", true), invalid);
+        }
+        Gate missingWorkshop = Gate.parse(dual("{\"game\":" + entry("public", "", "") + "}"));
+        assertTrue(missingWorkshop.allows("game", ID, "Nether", false));
+        assertFalse(missingWorkshop.allows("workshop", ID, "Nether", true));
+        String workshop = entry("builders", "", "{\"draslId\":\"" + ID + "\",\"name\":\"Nether\"}");
+        Gate missingGame = Gate.parse(dual("{\"workshop\":" + workshop + "}"));
+        assertFalse(missingGame.allows("game", ID, "Nether", true));
+        assertTrue(missingGame.allows("workshop", ID, "Nether", false));
+        for (String malformed : new String[] {"null", "[]", "true", "{}"}) {
+            Gate gate = Gate.parse(dual(malformed));
+            assertFalse(gate.allows("game", ID, "Nether", true), malformed);
+            assertFalse(gate.allows("workshop", ID, "Nether", true), malformed);
+        }
+    }
+
+    @Test
+    void gameRejectsWorkshopStatesWithoutClosingHealthyWorkshop() {
+        String members = "{\"draslId\":\"" + ID + "\",\"name\":\"Nether\"}";
+        for (String state : new String[] {"builders", "testers"}) {
+            Gate gate =
+                    Gate.parse(
+                            dual(
+                                    "{\"game\":"
+                                            + entry(state, "", members)
+                                            + ",\"workshop\":"
+                                            + entry("builders", "", members)
+                                            + "}"));
+            assertFalse(gate.allows("game", ID, "Nether", true), state);
+            assertTrue(gate.allows("workshop", ID, "Nether", false), state);
+        }
+    }
+
+    @Test
+    void legacyGateRejectsStatesOfTheOtherBackend() {
+        String members = "{\"draslId\":\"" + ID + "\",\"name\":\"Nether\"}";
+        for (String backend : new String[] {"game", "workshop"}) {
+            String[] invalid =
+                    backend.equals("game")
+                            ? new String[] {"builders", "testers"}
+                            : new String[] {"public", "draining"};
+            for (String state : invalid) {
+                Gate gate = Gate.parse(gate(state, backend, members));
+                assertFalse(gate.allows("game", ID, "Nether", true), backend + ":" + state);
+                assertFalse(gate.allows("workshop", ID, "Nether", true), backend + ":" + state);
+            }
+        }
     }
 }
