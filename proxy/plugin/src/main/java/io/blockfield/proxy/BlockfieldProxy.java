@@ -32,7 +32,7 @@ public final class BlockfieldProxy {
                 OfflineAccess.requireDirectPeer(proxy.getConfiguration());
                 logger.warn(
                         "DEV OFFLINE LOGIN ENABLED: allowlisted transport peers can impersonate any"
-                            + " name; never enable in production");
+                                + " name; never enable in production");
             }
             authentication = new Authentication(this, proxy, logger, forwarding);
         } catch (IllegalArgumentException error) {
