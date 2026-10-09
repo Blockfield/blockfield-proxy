@@ -125,3 +125,26 @@ backend. Поэтому прокси с поддержкой нового фор
 Подключение выбранной версии и проверка её spawn описаны в [LIMBO.md](docs/LIMBO.md).
 
 Условия использования: [LICENSE](LICENSE).
+
+## Вход в dev без аккаунта
+
+`BLOCKFIELD_OFFLINE_ALLOWED_IPS` — список literal IP/CIDR через запятую (IPv4 и IPv6).
+Пустое/отсутствующее значение отключает режим; неверный адрес, prefix или host bits
+останавливают proxy. Для разрешённого peer Drasl и login Limbo пропускаются:
+точный регистр ника задаёт стандартный UUID `OfflinePlayer:<name>`, который
+передаётся backend через modern forwarding. Ответы pack version/contract и перенос
+TaCZ Tweaks остаются прежними. Для остальных peer сохраняется Drasl.
+Offline identity не получает Drasl id и не проходит ACL мастерской.
+
+Peer берётся из Velocity `InboundConnection.getRemoteAddress()`, то есть TCP peer
+при выключенном HAProxy PROXY protocol. Режим отказывается стартовать при включённом
+PROXY protocol или неизвестной реализации конфигурации. Dev подключается напрямую,
+без front proxy: не ставьте перед ним NAT/proxy, чей адрес входит в allowlist,
+и не добавляйте плагины, переписывающие remote address. Virtual host и клиентские
+forwarded headers не участвуют в проверке. Разрешённый peer может выбрать любой ник,
+включая OP: этот режим предназначен только для отдельного dev, никогда для prod.
+
+Push в `dev` проходит ту же проверку plugin/Limbo и публикует только
+`ghcr.io/blockfield/blockfield-proxy:dev`; Docker job работает на Blacksmith.
+Это не создаёт release/tag и не вызывает Dokploy webhook. `main` и prod deploy
+сохраняют прежнее поведение. Digest сборки указан в image job workflow Proxy.

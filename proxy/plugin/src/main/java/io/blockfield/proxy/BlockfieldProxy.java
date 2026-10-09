@@ -25,7 +25,21 @@ public final class BlockfieldProxy {
     public BlockfieldProxy(ProxyServer proxy, Logger logger) {
         this.proxy = proxy;
         forwarding = new LoginForwarding();
-        authentication = new Authentication(this, proxy, logger, forwarding);
+        try {
+            OfflineAccess offline =
+                    new OfflineAccess(System.getenv("BLOCKFIELD_OFFLINE_ALLOWED_IPS"));
+            if (offline.enabled()) {
+                OfflineAccess.requireDirectPeer(proxy.getConfiguration());
+                logger.warn(
+                        "DEV OFFLINE LOGIN ENABLED: allowlisted transport peers can impersonate any"
+                                + " name; never enable in production");
+            }
+            authentication = new Authentication(this, proxy, logger, forwarding);
+        } catch (IllegalArgumentException error) {
+            logger.error("Refusing proxy startup: invalid offline dev configuration", error);
+            proxy.shutdown();
+            throw error;
+        }
         routing = new BackendRouting(this, proxy, logger, authentication);
     }
 
