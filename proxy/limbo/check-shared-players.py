@@ -45,12 +45,13 @@ def read_string(stream):
 
 
 def nbt(stream, tag=None):
+    """Compound children come back as (tag id, value): the client decodes by tag type."""
     tag = stream.read(1)[0] if tag is None else tag
     if tag == 10:
         value = {}
         while (child := stream.read(1)[0]) != 0:
             name = stream.read(struct.unpack(">H", stream.read(2))[0]).decode()
-            value[name] = nbt(stream, child)
+            value[name] = (child, nbt(stream, child))
         return value
     if tag == 9:
         child, size = stream.read(1)[0], struct.unpack(">i", stream.read(4))[0]
@@ -60,7 +61,8 @@ def nbt(stream, tag=None):
     number = {1: ">b", 2: ">h", 3: ">i", 4: ">q", 5: ">f", 6: ">d"}.get(tag)
     if number:
         return struct.unpack(number, stream.read(struct.calcsize(number)))[0]
-    width = {7: 1, 11: 4, 12: 8}[tag]
+    width = {7: 1, 11: 4, 12: 8}.get(tag)
+    assert width, ("Unknown NBT tag", tag)
     return stream.read(struct.unpack(">i", stream.read(4))[0] * width)
 
 
@@ -209,10 +211,10 @@ def main():
     second = None
     try:
         # Limbo never sends the time; without fixed_time each client runs its own cycle into night.
-        overworld = registry(first.seen, "minecraft:dimension_type")[
+        overworld = registry(first.seen, "minecraft:dimension_type").get(
             "minecraft:overworld"
-        ]
-        assert overworld.get("fixed_time") == 6000, (
+        )
+        assert (overworld or {}).get("fixed_time") == (4, 6000), (
             "Lobby must stay at noon",
             overworld,
         )
