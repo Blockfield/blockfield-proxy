@@ -1,0 +1,12 @@
+diff --git a/src/main/resources/data/minecraft/dimension_type/overworld.json b/src/main/resources/data/minecraft/dimension_type/overworld.json
+index 4cffd20..7ca7e99 100644
+--- a/src/main/resources/data/minecraft/dimension_type/overworld.json
++++ b/src/main/resources/data/minecraft/dimension_type/overworld.json
+@@ -3,6 +3,7 @@
+   "bed_works": true,
+   "coordinate_scale": 1.0,
+   "effects": "minecraft:overworld",
++  "fixed_time": 6000,
+   "has_ceiling": false,
+   "has_raids": true,
+   "has_skylight": true,
