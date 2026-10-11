@@ -24,10 +24,13 @@ import java.lang.reflect.Proxy;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 class OfflineAccessTest {
     @Test
@@ -82,6 +85,52 @@ class OfflineAccessTest {
         assertThrows(
                 IllegalArgumentException.class,
                 () -> OfflineAccess.requireDirectPeer(new Object()));
+    }
+
+    @Test
+    void productionWiringRefusesOfflineLogin() {
+        assertDoesNotThrow(() -> OfflineAccess.requireDevEnvironment(Map.of()));
+        Map<String, String> blank = new HashMap<>();
+        blank.put("BLOCKFIELD_GATE_FILE", "");
+        blank.put("BLOCKFIELD_WORKSHOP_HOST", "   ");
+        blank.put("BLOCKFIELD_LIMBO_SELECTION_FILE", "");
+        blank.put("BLOCKFIELD_MAP_ACTIVE_DIR", "  ");
+        blank.put("BLOCKFIELD_LIMBO_ARTIFACTS_DIR", "");
+        blank.put("BLOCKFIELD_WORKSHOP_INBOX_DIR", " ");
+        assertDoesNotThrow(() -> OfflineAccess.requireDevEnvironment(blank));
+        OfflineAccess.requireDevEnvironment(Map.of("BLOCKFIELD_WORKSHOP_HOST", ""));
+        for (String name : OfflineAccess.PRODUCTION_WIRING) {
+            assertThrows(
+                    IllegalArgumentException.class,
+                    () -> OfflineAccess.requireDevEnvironment(Map.of(name, "prod-value")),
+                    name);
+        }
+    }
+
+    @Test
+    void productionWiringRefusesStartup() {
+        for (String name : OfflineAccess.PRODUCTION_WIRING) {
+            var shutdown = new AtomicBoolean();
+            ProxyServer proxy =
+                    fake(
+                            ProxyServer.class,
+                            (method, args) -> {
+                                if (method.equals("getConfiguration"))
+                                    return proxyWithPeer(false).getConfiguration();
+                                if (method.equals("shutdown")) shutdown.set(true);
+                                return null;
+                            });
+            assertThrows(
+                    IllegalArgumentException.class,
+                    () ->
+                            new BlockfieldProxy(
+                                    proxy,
+                                    LoggerFactory.getLogger("test"),
+                                    "127.0.0.0/24",
+                                    Map.of(name, "prod-value")),
+                    name);
+            assertTrue(shutdown.get(), name);
+        }
     }
 
     /** Test-only transport flag: Velocity's API omits it, the server class carries it. */

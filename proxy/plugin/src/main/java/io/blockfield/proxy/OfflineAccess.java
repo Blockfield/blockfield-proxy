@@ -6,6 +6,7 @@ import java.net.InetAddress;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 
 /** Explicit dev admission based only on the transport peer, never a handshake host. */
@@ -55,6 +56,28 @@ final class OfflineAccess {
 
     static UUID uuid(String name) {
         return UUID.nameUUIDFromBytes(("OfflinePlayer:" + name).getBytes(StandardCharsets.UTF_8));
+    }
+
+    /**
+     * Production wiring (gate file, Workshop host, Limbo paths, Workshop inbox) means a
+     * misconfigured prod proxy: fail closed.
+     */
+    static final List<String> PRODUCTION_WIRING =
+            List.of(
+                    "BLOCKFIELD_GATE_FILE",
+                    "BLOCKFIELD_WORKSHOP_HOST",
+                    "BLOCKFIELD_LIMBO_SELECTION_FILE",
+                    "BLOCKFIELD_MAP_ACTIVE_DIR",
+                    "BLOCKFIELD_LIMBO_ARTIFACTS_DIR",
+                    "BLOCKFIELD_WORKSHOP_INBOX_DIR");
+
+    static void requireDevEnvironment(Map<String, String> environment) {
+        for (String name : PRODUCTION_WIRING) {
+            String value = environment.get(name);
+            if (value != null && !value.isBlank())
+                throw new IllegalArgumentException(
+                        "Offline dev login is refused with production " + name + " set");
+        }
     }
 
     static void requireDirectPeer(Object configuration) {
