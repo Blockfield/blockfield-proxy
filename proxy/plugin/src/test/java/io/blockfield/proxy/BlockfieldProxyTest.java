@@ -20,6 +20,7 @@ import org.slf4j.LoggerFactory;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
 class BlockfieldProxyTest {
@@ -106,6 +107,36 @@ class BlockfieldProxyTest {
         assertTrue(owners.stream().allMatch(owner -> owner == plugin));
         assertNotNull(tick.get());
         tick.get().run();
+    }
+
+    @Test
+    void forwardedOfflineConfigurationRefusesStartup() {
+        var shutdown = new AtomicBoolean();
+        ProxyServer proxy =
+                fake(
+                        ProxyServer.class,
+                        (method, args) -> {
+                            if (method.equals("getConfiguration"))
+                                return OfflineAccessTest.proxyWithPeer(true).getConfiguration();
+                            if (method.equals("shutdown")) shutdown.set(true);
+                            return null;
+                        });
+        assertThrows(
+                IllegalArgumentException.class,
+                () -> new BlockfieldProxy(proxy, LoggerFactory.getLogger("test"), "127.0.0.0/24"));
+        assertTrue(shutdown.get());
+    }
+
+    @Test
+    void directOfflineConfigurationStartsUp() {
+        ProxyServer proxy =
+                fake(
+                        ProxyServer.class,
+                        (method, args) ->
+                                method.equals("getConfiguration")
+                                        ? OfflineAccessTest.proxyWithPeer(false).getConfiguration()
+                                        : null);
+        new BlockfieldProxy(proxy, LoggerFactory.getLogger("test"), "127.0.0.0/24");
     }
 
     @Test

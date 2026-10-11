@@ -23,11 +23,14 @@ public final class BlockfieldProxy {
 
     @Inject
     public BlockfieldProxy(ProxyServer proxy, Logger logger) {
+        this(proxy, logger, System.getenv("BLOCKFIELD_OFFLINE_ALLOWED_IPS"));
+    }
+
+    BlockfieldProxy(ProxyServer proxy, Logger logger, String offlineAllowedIps) {
         this.proxy = proxy;
         forwarding = new LoginForwarding();
         try {
-            OfflineAccess offline =
-                    new OfflineAccess(System.getenv("BLOCKFIELD_OFFLINE_ALLOWED_IPS"));
+            OfflineAccess offline = new OfflineAccess(offlineAllowedIps);
             if (offline.enabled()) {
                 OfflineAccess.requireDirectPeer(proxy.getConfiguration());
                 logger.warn(

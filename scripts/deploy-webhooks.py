@@ -113,17 +113,18 @@ def runs(service, digest):
 
 
 def swarm_update(service):
-    """completed/updating/paused/rollback_* of the last service update; '' when there is none or no swarm."""
-    try:
-        return docker(
-            "service",
-            "inspect",
-            APPS[service][0],
-            "--format",
-            "{{if .UpdateStatus}}{{.UpdateStatus.State}}{{end}}",
-        )
-    except subprocess.CalledProcessError:
-        return ""
+    """completed/updating/paused/rollback_* of the last service update; '' when it has none.
+
+    Raises CalledProcessError when the inspect itself fails: the state is unknown, which
+    deploy() must never read as a completed update.
+    """
+    return docker(
+        "service",
+        "inspect",
+        APPS[service][0],
+        "--format",
+        "{{if .UpdateStatus}}{{.UpdateStatus.State}}{{end}}",
+    )
 
 
 def monitor_window(service):
@@ -287,12 +288,23 @@ def deploy(service, digest):
             # the previous update's paused or rollback.
             elif log and (monitoring or runs(service, digest)):
                 # Swarm may still pause or roll back the update inside its monitor window.
-                state = swarm_update(service)
-                if state.startswith("rollback") or state == "paused":
+                try:
+                    state = swarm_update(service)
+                except subprocess.CalledProcessError:
+                    # The update state is unknown, never a completed update: keep waiting
+                    # for a readable state within the deadline instead of reporting success.
+                    print(
+                        f"{service}: cannot read the swarm update state, retrying",
+                        flush=True,
+                    )
+                    state = None
+                if state is not None and (
+                    state.startswith("rollback") or state == "paused"
+                ):
                     raise SystemExit(
                         f"{service}: swarm update {state}; see docker service ps"
                     )
-                if state != "updating" and runs(service, digest):
+                if state is not None and state != "updating" and runs(service, digest):
                     print(f"{service}: runs {digest}")
                     return
                 if not monitoring:
