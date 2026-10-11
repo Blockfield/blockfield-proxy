@@ -25,6 +25,7 @@ import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
@@ -82,6 +83,21 @@ class OfflineAccessTest {
         assertThrows(
                 IllegalArgumentException.class,
                 () -> OfflineAccess.requireDirectPeer(new Object()));
+    }
+
+    @Test
+    void productionWiringRefusesOfflineLogin() {
+        OfflineAccess.requireDevEnvironment(Map.of("BLOCKFIELD_WORKSHOP_HOST", ""));
+        assertThrows(
+                IllegalArgumentException.class,
+                () ->
+                        OfflineAccess.requireDevEnvironment(
+                                Map.of("BLOCKFIELD_GATE_FILE", "/data/gate.json")));
+        assertThrows(
+                IllegalArgumentException.class,
+                () ->
+                        OfflineAccess.requireDevEnvironment(
+                                Map.of("BLOCKFIELD_WORKSHOP_HOST", "workshop.blockfield.pro")));
     }
 
     /** Test-only transport flag: Velocity's API omits it, the server class carries it. */

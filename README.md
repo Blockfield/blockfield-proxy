@@ -164,6 +164,8 @@ PROXY protocol или неизвестной реализации конфигу
 и не добавляйте плагины, переписывающие remote address. Virtual host и клиентские
 forwarded headers не участвуют в проверке. Разрешённый peer может выбрать любой ник,
 включая OP: этот режим предназначен только для отдельного dev, никогда для prod.
+Proxy не стартует, если вместе с allowlist заданы prod-переменные
+`BLOCKFIELD_GATE_FILE` или непустой `BLOCKFIELD_WORKSHOP_HOST`.
 
 Push в `dev` проходит ту же проверку plugin/Limbo и публикует только
 `ghcr.io/blockfield/blockfield-proxy:dev`; Docker job работает на Blacksmith.

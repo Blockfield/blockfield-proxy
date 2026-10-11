@@ -33,6 +33,7 @@ public final class BlockfieldProxy {
             OfflineAccess offline = new OfflineAccess(offlineAllowedIps);
             if (offline.enabled()) {
                 OfflineAccess.requireDirectPeer(proxy.getConfiguration());
+                OfflineAccess.requireDevEnvironment(System.getenv());
                 logger.warn(
                         "DEV OFFLINE LOGIN ENABLED: allowlisted transport peers can impersonate any"
                                 + " name; never enable in production");
