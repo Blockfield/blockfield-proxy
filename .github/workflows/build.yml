@@ -66,7 +66,7 @@ jobs:
       - name: Run Java unit tests
         run: just test
       - name: Publish Java test results
-        if: failure()
+        if: failure() || cancelled()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: proxy-java-tests
@@ -149,6 +149,8 @@ jobs:
           tags: ${{ github.event_name == 'pull_request' && format('ghcr.io/blockfield/blockfield-proxy:pr-{0}', github.event.pull_request.number) || format('ghcr.io/blockfield/blockfield-proxy:{0}', github.ref_name) }}
       # Handoff only: free the org artifact quota now; a failed job keeps them for a rerun.
       - name: Delete the consumed image inputs
+        # Best effort: a failed cleanup must not turn a built image red; the artifacts then just expire.
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
         run: >-
