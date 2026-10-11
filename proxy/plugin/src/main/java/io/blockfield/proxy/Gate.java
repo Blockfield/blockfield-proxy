@@ -52,6 +52,20 @@ record Gate(
         return state.equals("public");
     }
 
+    /** Cold Workshop: the controller stopped the backend to save RAM; members may wake it. */
+    boolean sleeping() {
+        return state.equals("sleeping");
+    }
+
+    /** Sleeping or already starting after a wake: do not connect, show the waking message. */
+    boolean waking() {
+        return sleeping() || state.equals("starting") || state.equals("STARTING");
+    }
+
+    boolean member(String draslId, String name) {
+        return draslId != null && allowed.contains(new Member(normalizeId(draslId), name));
+    }
+
     static String normalizeId(String id) {
         return id == null ? null : id.replace("-", "").toLowerCase(Locale.ROOT);
     }
@@ -66,10 +80,8 @@ record Gate(
             case "public" -> true;
             case "draining" -> gameMember;
             // testers: closed playtest of a workshop candidate on the same backend, same member
-            // list.
-            case "builders", "testers" ->
-                    draslId != null
-                            && selected.allowed.contains(new Member(normalizeId(draslId), name));
+            // list. sleeping/starting never admit: BackendRouting parks members in the lobby.
+            case "builders", "testers" -> selected.member(draslId, name);
             default -> false;
         };
     }
@@ -128,7 +140,17 @@ record Gate(
         boolean validState =
                 switch (backend) {
                     case "game" -> Set.of("public", "draining", "closed").contains(state);
-                    case "workshop" -> Set.of("builders", "testers", "closed").contains(state);
+                    // sleeping/STARTING come from the cold-Workshop controller; STARTING keeps
+                    // its phase name, so both cases are accepted here.
+                    case "workshop" ->
+                            Set.of(
+                                            "builders",
+                                            "testers",
+                                            "closed",
+                                            "sleeping",
+                                            "starting",
+                                            "STARTING")
+                                    .contains(state);
                     default -> false;
                 };
         if (!validState || json.has("backend") && !backend.equals(string(json, "backend"))) {
