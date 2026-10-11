@@ -40,6 +40,42 @@ def string(value):
     return varint(len(raw)) + raw
 
 
+def read_string(stream):
+    return stream.read(read_varint(stream)).decode()
+
+
+def nbt(stream, tag=None):
+    tag = stream.read(1)[0] if tag is None else tag
+    if tag == 10:
+        value = {}
+        while (child := stream.read(1)[0]) != 0:
+            name = stream.read(struct.unpack(">H", stream.read(2))[0]).decode()
+            value[name] = nbt(stream, child)
+        return value
+    if tag == 9:
+        child, size = stream.read(1)[0], struct.unpack(">i", stream.read(4))[0]
+        return [nbt(stream, child) for _ in range(size)]
+    if tag == 8:
+        return stream.read(struct.unpack(">H", stream.read(2))[0]).decode()
+    number = {1: ">b", 2: ">h", 3: ">i", 4: ">q", 5: ">f", 6: ">d"}.get(tag)
+    if number:
+        return struct.unpack(number, stream.read(struct.calcsize(number)))[0]
+    width = {7: 1, 11: 4, 12: 8}[tag]
+    return stream.read(struct.unpack(">i", stream.read(4))[0] * width)
+
+
+def registry(seen, name):
+    for key, data in seen:
+        body = io.BytesIO(data)
+        if key == "registry_data" and read_string(body) == name:
+            entries = {}
+            for _ in range(read_varint(body)):
+                entry = read_string(body)
+                entries[entry] = nbt(body) if body.read(1)[0] else None
+            return entries
+    raise AssertionError(("Registry was not sent", name))
+
+
 class Client:
     def __init__(self, name, port, packets, player_type):
         self.packets = packets
@@ -172,6 +208,14 @@ def main():
     first = Client("LobbyCheckA", port, packets, player_type)
     second = None
     try:
+        # Limbo never sends the time; without fixed_time each client runs its own cycle into night.
+        overworld = registry(first.seen, "minecraft:dimension_type")[
+            "minecraft:overworld"
+        ]
+        assert overworld.get("fixed_time") == 6000, (
+            "Lobby must stay at noon",
+            overworld,
+        )
         second = Client("LobbyCheckB", port, packets, player_type)
         first.sees(second)
         second.sees(first)
@@ -200,7 +244,7 @@ def main():
         first.sees(second)
         second.sees(first)
         print(
-            "PASS: player entity type, mutual visibility, profile ordering, no self-spawn, movement, head rotation, quit, reconnect"
+            "PASS: fixed noon, player entity type, mutual visibility, profile ordering, no self-spawn, movement, head rotation, quit, reconnect"
         )
     finally:
         first.close()
