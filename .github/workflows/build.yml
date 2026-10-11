@@ -31,7 +31,7 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           REF_TYPE: ${{ github.ref_type }}
         run: |
-          # Unknown comparisons and tags always validate; PRs retain self-hosted checks.
+          # Unknown comparisons and tags always validate; PRs skip the image job.
           if [ "$EVENT_NAME" != push ] || [ "$REF_TYPE" = tag ] || ! git cat-file -e "$BASE_SHA^{commit}" 2>/dev/null; then
             image=true
           elif git diff --quiet "$BASE_SHA" HEAD -- proxy/ distribution/ scripts/quality.py scripts/toolchain.py .github/workflows/build.yml justfile .dockerignore; then

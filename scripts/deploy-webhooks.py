@@ -63,6 +63,17 @@ def docker(*args):
             flush=True,
         )
         raise
+    except subprocess.TimeoutExpired as error:
+        # TimeoutExpired is not a CalledProcessError: translate it so every caller
+        # keeps the documented docker() failure contract.
+        print(
+            f"docker {' '.join(args[:4])}: timed out after {error.timeout} s",
+            file=sys.stderr,
+            flush=True,
+        )
+        raise subprocess.CalledProcessError(
+            124, error.cmd, error.stdout, error.stderr
+        ) from error
 
 
 def registry_digest(ref):
