@@ -8,6 +8,7 @@ import com.velocitypowered.api.proxy.ProxyServer;
 
 import org.slf4j.Logger;
 
+import java.util.Map;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -27,13 +28,21 @@ public final class BlockfieldProxy {
     }
 
     BlockfieldProxy(ProxyServer proxy, Logger logger, String offlineAllowedIps) {
+        this(proxy, logger, offlineAllowedIps, System.getenv());
+    }
+
+    BlockfieldProxy(
+            ProxyServer proxy,
+            Logger logger,
+            String offlineAllowedIps,
+            Map<String, String> environment) {
         this.proxy = proxy;
         forwarding = new LoginForwarding();
         try {
             OfflineAccess offline = new OfflineAccess(offlineAllowedIps);
             if (offline.enabled()) {
                 OfflineAccess.requireDirectPeer(proxy.getConfiguration());
-                OfflineAccess.requireDevEnvironment(System.getenv());
+                OfflineAccess.requireDevEnvironment(environment);
                 logger.warn(
                         "DEV OFFLINE LOGIN ENABLED: allowlisted transport peers can impersonate any"
                                 + " name; never enable in production");

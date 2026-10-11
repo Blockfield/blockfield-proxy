@@ -59,10 +59,20 @@ final class OfflineAccess {
     }
 
     /**
-     * Production wiring (gate file, Workshop host) means a misconfigured prod proxy: fail closed.
+     * Production wiring (gate file, Workshop host, Limbo paths, Workshop inbox) means a
+     * misconfigured prod proxy: fail closed.
      */
+    static final List<String> PRODUCTION_WIRING =
+            List.of(
+                    "BLOCKFIELD_GATE_FILE",
+                    "BLOCKFIELD_WORKSHOP_HOST",
+                    "BLOCKFIELD_LIMBO_SELECTION_FILE",
+                    "BLOCKFIELD_MAP_ACTIVE_DIR",
+                    "BLOCKFIELD_LIMBO_ARTIFACTS_DIR",
+                    "BLOCKFIELD_WORKSHOP_INBOX_DIR");
+
     static void requireDevEnvironment(Map<String, String> environment) {
-        for (String name : List.of("BLOCKFIELD_GATE_FILE", "BLOCKFIELD_WORKSHOP_HOST")) {
+        for (String name : PRODUCTION_WIRING) {
             String value = environment.get(name);
             if (value != null && !value.isBlank())
                 throw new IllegalArgumentException(
