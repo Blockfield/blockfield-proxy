@@ -17,12 +17,17 @@ import net.kyori.adventure.text.format.NamedTextColor;
 
 import org.slf4j.Logger;
 
+import java.io.IOException;
 import java.net.InetAddress;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.net.UnknownHostException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+import java.nio.file.StandardOpenOption;
 import java.nio.file.attribute.FileTime;
 import java.time.Duration;
 import java.util.List;
@@ -46,6 +51,9 @@ final class BackendRouting {
     private static final long GAME_MEMBER_MS = TimeUnit.MINUTES.toMillis(10);
     private static final String RESTARTING =
             "Игровой сервер перезапускается. Вернём вас автоматически, как только он поднимется.";
+    static final String WORKSHOP_WAKING =
+            "Мастерская просыпается, это займёт 1–2 минуты. Переподключитесь позже.";
+    private static final long WAKE_INTERVAL_MS = TimeUnit.MINUTES.toMillis(1);
 
     private final Path gateFile =
             Optional.ofNullable(System.getenv("BLOCKFIELD_GATE_FILE"))
@@ -62,6 +70,10 @@ final class BackendRouting {
     private Gate enforced = gate;
 
     private final Map<UUID, Long> lastOnGame = new ConcurrentHashMap<>();
+    private final Path inboxDir;
+
+    /** Last wake request, epoch ms; at most one inbox file per minute per proxy. */
+    private long lastWakeMs;
 
     BackendRouting(Object plugin, ProxyServer proxy, Logger logger, Authentication authentication) {
         this(plugin, proxy, logger, authentication, System.getenv("BLOCKFIELD_WORKSHOP_HOST"));
@@ -73,6 +85,16 @@ final class BackendRouting {
             Logger logger,
             Authentication authentication,
             String workshopHost) {
+        this(plugin, proxy, logger, authentication, workshopHost, inboxDirFromEnv());
+    }
+
+    BackendRouting(
+            Object plugin,
+            ProxyServer proxy,
+            Logger logger,
+            Authentication authentication,
+            String workshopHost,
+            Path inboxDir) {
         this.plugin = plugin;
         this.proxy = proxy;
         this.logger = logger;
@@ -88,6 +110,12 @@ final class BackendRouting {
             }
         }
         this.workshopHost = normalizeHost(host);
+        this.inboxDir = inboxDir;
+    }
+
+    private static Path inboxDirFromEnv() {
+        String dir = System.getenv("BLOCKFIELD_WORKSHOP_INBOX_DIR");
+        return dir == null || dir.isBlank() ? null : Path.of(dir);
     }
 
     static String normalizeHost(String value) {
@@ -128,9 +156,11 @@ final class BackendRouting {
                                                         player.createConnectionRequest(backend)
                                                                 .fireAndForget();
                                                 }),
-                        () ->
-                                player.sendMessage(
-                                        Component.text(waitingText(player), NamedTextColor.GOLD)));
+                        () -> {
+                            maybeRequestWake(player);
+                            player.sendMessage(
+                                    Component.text(waitingText(player), NamedTextColor.GOLD));
+                        });
     }
 
     private void reloadGate() {
@@ -151,6 +181,67 @@ final class BackendRouting {
                     next.forBackend("workshop").state(),
                     next.forBackend("workshop").allowed().size());
         gate = next;
+    }
+
+    /**
+     * Cold Workshop wake-on-connect: a sleeping workshop keeps members in the lobby and takes one
+     * inbox wake request per minute per proxy. No inbox mount means message only; STARTING means
+     * the request is already in flight, so only sleeping writes.
+     */
+    void maybeRequestWake(Player player) {
+        Path dir = inboxDir;
+        if (dir == null || !authentication.authenticated(player)) return;
+        if (!requestedBackend(player).equals("workshop")) return;
+        Gate workshop = gate.forBackend("workshop");
+        if (!workshop.sleeping()) return;
+        String draslId = authentication.profileId(player.getUniqueId());
+        String name = player.getUsername();
+        if (!workshop.member(draslId, name)) return;
+        long now = System.currentTimeMillis();
+        synchronized (this) {
+            if (now - lastWakeMs < WAKE_INTERVAL_MS) return;
+            lastWakeMs = now;
+        }
+        // Off the event thread: the scheduler runs this async, a tiny write is all it does.
+        proxy.getScheduler().buildTask(plugin, () -> writeWake(dir, draslId, name)).schedule();
+    }
+
+    private void writeWake(Path dir, String draslId, String name) {
+        try {
+            writeWakeRequest(dir, draslId, name, System.currentTimeMillis());
+        } catch (IOException | RuntimeException e) {
+            logger.warn("Workshop wake request failed", e);
+        }
+    }
+
+    /** Controller inbox envelope, exactly as other kinds; file name matches id; no secrets. */
+    static void writeWakeRequest(Path dir, String draslId, String name, long nowMs)
+            throws IOException {
+        String id = UUID.randomUUID().toString();
+        // draslId is hex, name matches Authentication.NAME, id is a UUID: no escaping needed.
+        String json =
+                "{\"schema\":1,\"id\":\""
+                        + id
+                        + "\",\"kind\":\"wake\",\"actor\":{\"draslId\":\""
+                        + draslId
+                        + "\",\"name\":\""
+                        + name
+                        + "\"},\"createdAt\":"
+                        + nowMs
+                        + "}";
+        Path tmp = dir.resolve("." + id + ".tmp");
+        Path dst = dir.resolve(id + ".json");
+        Files.writeString(
+                tmp,
+                json,
+                StandardCharsets.UTF_8,
+                StandardOpenOption.CREATE,
+                StandardOpenOption.TRUNCATE_EXISTING);
+        try {
+            Files.move(tmp, dst, StandardCopyOption.ATOMIC_MOVE);
+        } catch (AtomicMoveNotSupportedException e) {
+            Files.move(tmp, dst);
+        }
     }
 
     private boolean allowed(Player player, RegisteredServer server) {
@@ -182,6 +273,11 @@ final class BackendRouting {
                     ? "Мастерская запускается. Вернём вас автоматически, когда она поднимется."
                     : RESTARTING;
         Gate selected = gate.forBackend(backend);
+        if (backend.equals("workshop")
+                && selected.waking()
+                && selected.member(
+                        authentication.profileId(player.getUniqueId()), player.getUsername()))
+            return WORKSHOP_WAKING;
         return selected.message().isBlank()
                 ? backend.equals("workshop")
                         ? "Мастерская сейчас недоступна."
@@ -213,6 +309,7 @@ final class BackendRouting {
         reloadGate();
         boolean ok = authentication.authenticated(event.getPlayer());
         Optional<RegisteredServer> target = ok ? target(event.getPlayer()) : Optional.empty();
+        if (ok) maybeRequestWake(event.getPlayer());
         (target.isPresent() ? target : server("lobby")).ifPresent(event::setInitialServer);
         if (!ok) {
             proxy.getScheduler()
@@ -243,6 +340,8 @@ final class BackendRouting {
             }
         } else if (!allowed(player, event.getOriginalServer())) {
             event.setResult(ServerPreConnectEvent.ServerResult.denied());
+            if (event.getOriginalServer().getServerInfo().getName().equals("workshop"))
+                maybeRequestWake(player);
             if (event.getPreviousServer() != null) {
                 String text =
                         event.getOriginalServer()
@@ -348,6 +447,10 @@ final class BackendRouting {
                                     player.createConnectionRequest(lobby.get()).fireAndForget();
                                 });
             }
+        }
+        if (gate.forBackend("workshop").sleeping()) {
+            // Wake on connect: members parked in the lobby trigger one inbox request.
+            for (Player parked : lobby.get().getPlayersConnected()) maybeRequestWake(parked);
         }
         for (String name : List.of("game", "workshop")) {
             Optional<RegisteredServer> backend = server(name);
