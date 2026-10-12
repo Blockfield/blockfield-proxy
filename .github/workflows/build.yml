@@ -75,7 +75,15 @@ jobs:
           if-no-files-found: ignore
       - name: Build checked plugin
         run: just build
-      - name: Build pinned Limbo with checked patches
+      # The JAR depends only on the pinned upstream commit, the patches and Maven: rebuilding it took ~2.5 min a run.
+      - name: Restore the built Limbo
+        id: limbo
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: proxy/limbo-build/Limbo-0.7.10-ALPHA-1.21.1.jar
+          key: limbo-29571119f9df-maven-3.9.11-${{ hashFiles('proxy/limbo/*.patch') }}
+      - if: steps.limbo.outputs.cache-hit != 'true'
+        name: Build pinned Limbo with checked patches
         env:
           MAVEN_OPTS: -Xmx2G
         run: |
@@ -117,7 +125,7 @@ jobs:
   release:
     if: github.ref_type == 'tag'
     needs: build
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     timeout-minutes: 15
     permissions:
       contents: write
