@@ -63,11 +63,9 @@ final class Authentication {
 
     private final Object plugin;
     private final LoginForwarding forwarding;
-    private final OfflineAccess offline;
 
     private record Pending(
             long createdAt,
-            boolean offline,
             CompletableFuture<String> auth,
             CompletableFuture<byte[]> pack,
             CompletableFuture<byte[]> contract) {}
@@ -93,8 +91,7 @@ final class Authentication {
                 Optional.ofNullable(System.getenv("VELOCITY_FORWARDING_SECRET"))
                         .filter(s -> !s.isBlank())
                         .map(Sessions::secret)
-                        .orElse(null),
-                new OfflineAccess(System.getenv("BLOCKFIELD_OFFLINE_ALLOWED_IPS")));
+                        .orElse(null));
     }
 
     Authentication(
@@ -104,18 +101,6 @@ final class Authentication {
             LoginForwarding forwarding,
             String drasl,
             byte[] sessionSecret) {
-        this(plugin, proxy, logger, forwarding, drasl, sessionSecret, new OfflineAccess(null));
-    }
-
-    Authentication(
-            Object plugin,
-            ProxyServer proxy,
-            Logger logger,
-            LoginForwarding forwarding,
-            String drasl,
-            byte[] sessionSecret,
-            OfflineAccess offline) {
-        this.offline = offline;
         this.plugin = plugin;
         this.proxy = proxy;
         this.logger = logger;
@@ -171,32 +156,15 @@ final class Authentication {
             return;
         }
         if (!(event.getConnection() instanceof LoginPhaseConnection connection)) return;
-        boolean offlinePeer = offline.allows(connection.getRemoteAddress().getAddress());
-        if (offlinePeer && proxy != null) {
-            try {
-                OfflineAccess.requireDirectPeer(proxy.getConfiguration());
-            } catch (IllegalArgumentException error) {
-                logger.error("Refusing offline login: transport peer cannot be trusted", error);
-                event.setResult(
-                        PreLoginEvent.PreLoginComponentResult.denied(
-                                Component.text("Dev proxy configuration is unsafe")));
-                return;
-            }
-        }
         var auth = new CompletableFuture<String>();
         var pack = new CompletableFuture<byte[]>();
         var contract = new CompletableFuture<byte[]>();
         pending.put(
                 key(event.getConnection().getRemoteAddress(), event.getUsername()),
-                new Pending(System.currentTimeMillis(), offlinePeer, auth, pack, contract));
+                new Pending(System.currentTimeMillis(), auth, pack, contract));
         connection.sendLoginPluginMessage(LoginForwarding.PACK, new byte[0], pack::complete);
         connection.sendLoginPluginMessage(
                 LoginForwarding.CONTRACT, new byte[0], contract::complete);
-        if (offlinePeer) {
-            event.setResult(PreLoginEvent.PreLoginComponentResult.forceOfflineMode());
-            auth.complete(OfflineAccess.uuid(event.getUsername()).toString().replace("-", ""));
-            return;
-        }
         String serverId = HexFormat.of().formatHex(bytes(20));
         connection.sendLoginPluginMessage(
                 AUTH,
@@ -261,7 +229,7 @@ final class Authentication {
             if (!loggingOut.contains(id)
                     && account != null
                     && id.toString().replace("-", "").equals(account)) {
-                if (!entry.offline()) draslIds.put(id, account);
+                draslIds.put(id, account);
                 authed.add(id);
             }
         }
