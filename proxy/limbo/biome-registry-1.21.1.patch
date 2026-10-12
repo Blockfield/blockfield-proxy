@@ -1,0 +1,32 @@
+diff --git a/src/main/java/com/loohp/limbo/network/protocol/packets/ClientboundLevelChunkWithLightPacket.java b/src/main/java/com/loohp/limbo/network/protocol/packets/ClientboundLevelChunkWithLightPacket.java
+--- a/src/main/java/com/loohp/limbo/network/protocol/packets/ClientboundLevelChunkWithLightPacket.java
++++ b/src/main/java/com/loohp/limbo/network/protocol/packets/ClientboundLevelChunkWithLightPacket.java
+@@ -21,6 +21,7 @@
+ 
+ import com.loohp.limbo.registry.BuiltInRegistries;
+ import com.loohp.limbo.registry.PacketRegistry;
++import com.loohp.limbo.registry.RegistryCustom;
+ import com.loohp.limbo.utils.BitsUtils;
+ import com.loohp.limbo.utils.DataTypeIO;
+ import com.loohp.limbo.world.Environment;
+@@ -223,13 +224,16 @@
+ 			}
+ 			int biome;
+ 			if (environment.equals(Environment.END)) {
+-				biome = 55; //the_end
++				biome = RegistryCustom.WORLDGEN_BIOME.indexOf(Key.key("minecraft:the_end"));
+ 			} else if (environment.equals(Environment.NETHER)) {
+-				biome = 34; //nether_waste
++				biome = RegistryCustom.WORLDGEN_BIOME.indexOf(Key.key("minecraft:nether_wastes"));
+ 			} else if (environment.equals(Environment.NORMAL)) {
+-				biome = 39; //plains
++				biome = RegistryCustom.WORLDGEN_BIOME.indexOf(Key.key("minecraft:plains"));
+ 			} else {
+-				biome = 39; //plains
++				biome = RegistryCustom.WORLDGEN_BIOME.indexOf(Key.key("minecraft:plains"));
++			}
++			if (biome < 0) {
++				throw new IOException("Missing biome for dimension " + environment.getKey());
+ 			}
+ 			dataOut.writeByte(0);
+ 			DataTypeIO.writeVarInt(dataOut, biome);
