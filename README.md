@@ -167,8 +167,3 @@ forwarded headers не участвуют в проверке. Разрешён�
 Proxy не стартует, если вместе с allowlist задана любая непустая prod-переменная:
 `BLOCKFIELD_GATE_FILE`, `BLOCKFIELD_WORKSHOP_HOST`, `BLOCKFIELD_LIMBO_SELECTION_FILE`,
 `BLOCKFIELD_MAP_ACTIVE_DIR`, `BLOCKFIELD_LIMBO_ARTIFACTS_DIR`, `BLOCKFIELD_WORKSHOP_INBOX_DIR`.
-
-Push в `dev` проходит ту же проверку plugin/Limbo и публикует только
-`ghcr.io/blockfield/blockfield-proxy:dev`; Docker job работает на Blacksmith.
-Это не создаёт release/tag и не вызывает Dokploy webhook. `main` и prod deploy
-сохраняют прежнее поведение. Digest сборки указан в image job workflow Proxy.
