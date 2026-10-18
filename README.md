@@ -19,25 +19,27 @@ Blacksmith проверяет main и PR. Тег `v*` публикует `ghcr.i
 
 ## Транспорт клиента
 
-По умолчанию клиент подключается к `raknet;play.blockfield.pro:25566` через
-Raknetify `0.1.0+alpha.5.196` (Velocity, immutable Modrinth version `u3LRuC7t`,
-SHA256 закреплён в Dockerfile). TCP `play.blockfield.pro:25565` остаётся доступен
-для ручного подключения и однократного fallback клиента до завершения login.
-Клиент запоминает TCP для этого сервера до закрытия игры; отмена подключения и
-отключение после login не вызывают retry. Backend Fabric не требует Raknetify:
-UDP завершается на Velocity, внутреннее соединение с game/workshop остаётся TCP.
+Игрок входит только по RakNet (решение владельца 2026-10-18): адрес
+`raknet;play.blockfield.pro:25566`, Raknetify `0.1.0+alpha.5.196` (Velocity,
+immutable Modrinth version `u3LRuC7t`, SHA256 закреплён в Dockerfile). TCP
+`play.blockfield.pro:25565` обслуживает только status ping (launcher >= 1.0.11
+пингует `raknet;` адрес по TCP 25565 того же хоста): `PreLoginEvent` отклоняет
+login без pipeline handler `raknetify-velocity-event-listener`, который Raknetify
+добавляет только каналам `RakNet$Config` (`RaknetOnly`). Исключений по адресу нет:
+локальные стенды подключаются напрямую к backend, минуя Velocity. Если внутренности
+Velocity/Raknetify после обновления не совпали, proxy пишет ERROR и пропускает вход,
+а не блокирует всех; при обновлении Velocity или Raknetify перепроверьте отказ TCP.
+Backend Fabric не требует Raknetify: UDP завершается на Velocity, внутреннее
+соединение с game/workshop остаётся TCP.
 
 Velocity запускается с `-Draknetify.velocity.portOverride=25566` через `JVM_OPTS`.
 При настройке `JVM_OPTS` в Dokploy сохраните эту property. UDP 25565 занят Simple
-Voice Chat; его конфигурация не меняется. Перед выпуском клиента требуется
-проверка Raknetify с закреплённым Velocity **3.5.1 build 615**: plugin собран
-против 3.4.0, совместимость и вход через Limbo/auth/PackVersionGate ещё не проверены.
+Voice Chat; его конфигурация не меняется.
 
-В Dokploy для приложения `blockfield-proxy-niocmj` требуется добавить публикацию
-**UDP published 25566 → target 25566, mode host** и разрешить UDP 25566 в firewall.
-Сохраните TCP 25565 и UDP 25565 (voice chat). `EXPOSE` не публикует порт сам.
+Dokploy `blockfield-proxy-niocmj` публикует **UDP 25566 → 25566, mode host** (порт
+открыт в firewall), TCP 25565 (status ping) и UDP 25565 (voice chat); `EXPOSE` не
+публикует порт сам. Не снимайте TCP 25565: без него launcher не видит статус сервера.
 Изменение Dokploy и Deploy proxy выполняет владелец отдельно; PR их не выполняет.
-Порядок включения: публикация порта и проверенный proxy, затем клиент с RakNet default.
 
 Raknetify all-in-one распространяется под **GPLv3** (включает netty-raknet);
 исходники и условия: [Raknetify](https://github.com/RelativityMC/raknetify),
@@ -76,9 +78,9 @@ DNS-имени и завершающая точка не влияют на ср�
 
 В лаунчере профиль `workshop` использует `workshopServer` (необязательное начальное
 значение `BLOCKFIELD_WORKSHOP_SERVER`), профиль `game` — опубликованный адрес
-игры. Укажите в `workshopServer` тот же хост, что в `BLOCKFIELD_WORKSHOP_HOST`, с
-нужным портом и транспортом. Хосты игры и мастерской должны различаться: разные
-порты или TCP/Raknet на одном хосте не разделяют профили. Адрес мастерской нужно
+игры. Укажите в `workshopServer` тот же хост, что в `BLOCKFIELD_WORKSHOP_HOST`, в
+виде `raknet;<host>:25566`: вход по TCP отклоняется и для мастерской. Хосты игры и
+мастерской должны различаться: разные порты на одном хосте не разделяют профили. Адрес мастерской нужно
 явно настроить с обеих сторон; DNS и развёртывание этим репозиторием не создаются.
 
 Прокси выбирает профиль по хосту Minecraft-подключения (`Player.getVirtualHost`):
