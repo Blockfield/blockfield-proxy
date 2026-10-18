@@ -509,26 +509,31 @@ class AuthenticationIdentityTest {
 
         GameProfileRequestEvent begin(Function<String, byte[]> response) {
             LoginPhaseConnection connection =
-                    fake(
+                    RaknetOnlyTest.overRaknet(
                             LoginPhaseConnection.class,
-                            (method, args) -> {
-                                if (method.equals("getRemoteAddress")) return remote;
-                                if (method.equals("sendLoginPluginMessage")) {
-                                    byte[] reply = new byte[] {0};
-                                    if (args[0].equals(Authentication.AUTH)) {
-                                        ByteBuffer challenge = ByteBuffer.wrap((byte[]) args[1]);
-                                        int length = challenge.get();
-                                        byte[] text = new byte[length];
-                                        challenge.get(text);
-                                        reply =
-                                                response.apply(
-                                                        new String(text, StandardCharsets.UTF_8));
-                                    }
-                                    ((LoginPhaseConnection.MessageConsumer) args[2])
-                                            .onMessageResponse(reply);
-                                }
-                                return null;
-                            });
+                            fake(
+                                    LoginPhaseConnection.class,
+                                    (method, args) -> {
+                                        if (method.equals("getRemoteAddress")) return remote;
+                                        if (method.equals("sendLoginPluginMessage")) {
+                                            byte[] reply = new byte[] {0};
+                                            if (args[0].equals(Authentication.AUTH)) {
+                                                ByteBuffer challenge =
+                                                        ByteBuffer.wrap((byte[]) args[1]);
+                                                int length = challenge.get();
+                                                byte[] text = new byte[length];
+                                                challenge.get(text);
+                                                reply =
+                                                        response.apply(
+                                                                new String(
+                                                                        text,
+                                                                        StandardCharsets.UTF_8));
+                                            }
+                                            ((LoginPhaseConnection.MessageConsumer) args[2])
+                                                    .onMessageResponse(reply);
+                                        }
+                                        return null;
+                                    }));
             authentication.onPreLogin(new PreLoginEvent(connection, NAME));
             return new GameProfileRequestEvent(
                     connection, GameProfile.forOfflinePlayer(NAME), false);

@@ -149,6 +149,19 @@ final class Authentication {
 
     @Subscribe
     public void onPreLogin(PreLoginEvent event) {
+        Component denial =
+                RaknetOnly.denial(
+                        event.getConnection(),
+                        error ->
+                                logger.error(
+                                        "Velocity/Raknetify internals mismatch: cannot detect the"
+                                                + " login transport, refusing {}",
+                                        event.getUsername(),
+                                        error));
+        if (denial != null) {
+            event.setResult(PreLoginEvent.PreLoginComponentResult.denied(denial));
+            return;
+        }
         if (!NAME.matcher(event.getUsername()).matches()) {
             event.setResult(
                     PreLoginEvent.PreLoginComponentResult.denied(
