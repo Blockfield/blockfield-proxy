@@ -27,8 +27,10 @@ immutable Modrinth version `u3LRuC7t`, SHA256 закреплён в Dockerfile).
 login без pipeline handler `raknetify-velocity-event-listener`, который Raknetify
 добавляет только каналам `RakNet$Config` (`RaknetOnly`). Исключений по адресу нет:
 локальные стенды подключаются напрямую к backend, минуя Velocity. Если внутренности
-Velocity/Raknetify после обновления не совпали, proxy пишет ERROR и пропускает вход,
-а не блокирует всех; при обновлении Velocity или Raknetify перепроверьте отказ TCP.
+Velocity/Raknetify после обновления не совпали, proxy пишет ERROR
+`Velocity/Raknetify internals mismatch` и отклоняет **каждый** вход (fail closed,
+решение владельца 2026-10-18); status ping не затронут. При обновлении Velocity или
+Raknetify перепроверьте вход по RakNet и отказ TCP.
 Backend Fabric не требует Raknetify: UDP завершается на Velocity, внутреннее
 соединение с game/workshop остаётся TCP.
 

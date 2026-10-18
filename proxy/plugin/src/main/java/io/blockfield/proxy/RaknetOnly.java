@@ -3,6 +3,7 @@ package io.blockfield.proxy;
 import net.kyori.adventure.text.Component;
 
 import java.lang.reflect.Method;
+import java.util.function.Consumer;
 
 /** Players log in only over RakNet; TCP 25565 stays open for status pings. */
 final class RaknetOnly {
@@ -18,7 +19,25 @@ final class RaknetOnly {
                     "Вход только через лаунчер Blockfield или по адресу"
                             + " raknet;play.blockfield.pro:25566");
 
+    static final Component UNAVAILABLE =
+            Component.text("Вход временно недоступен: прокси не может проверить RakNet");
+
     private RaknetOnly() {}
+
+    /**
+     * Fails closed (owner decision 2026-10-18): when Velocity/Raknetify internals no longer match,
+     * every login is refused rather than letting TCP logins in unnoticed.
+     *
+     * @return the denial reason, or {@code null} for a RakNet login
+     */
+    static Component denial(Object connection, Consumer<Exception> mismatch) {
+        try {
+            return raknet(connection) ? null : DENIED;
+        } catch (ReflectiveOperationException | RuntimeException error) {
+            mismatch.accept(error);
+            return UNAVAILABLE;
+        }
+    }
 
     /**
      * Velocity 3.5.1 internals: PreLoginEvent carries {@code LoginInboundConnection}, whose

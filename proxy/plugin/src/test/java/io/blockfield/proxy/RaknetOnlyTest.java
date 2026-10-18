@@ -6,6 +6,9 @@ import com.velocitypowered.api.proxy.InboundConnection;
 
 import org.junit.jupiter.api.Test;
 
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Proxy;
+import java.util.ArrayList;
 import java.util.Map;
 
 class RaknetOnlyTest {
@@ -49,6 +52,29 @@ class RaknetOnlyTest {
         }
     }
 
+    interface Delegating {
+        Minecraft delegatedConnection();
+    }
+
+    /** Makes a Velocity API fake look like a login that arrived over RakNet. */
+    @SuppressWarnings("unchecked")
+    static <T> T overRaknet(Class<T> type, T fake) {
+        Minecraft raknet =
+                new Login(Map.of(RaknetOnly.RAKNET_HANDLER, new Object())).delegatedConnection();
+        return (T)
+                Proxy.newProxyInstance(
+                        RaknetOnlyTest.class.getClassLoader(),
+                        new Class<?>[] {type, Delegating.class},
+                        (self, method, args) -> {
+                            if (method.getName().equals("delegatedConnection")) return raknet;
+                            try {
+                                return method.invoke(fake, args);
+                            } catch (InvocationTargetException error) {
+                                throw error.getCause();
+                            }
+                        });
+    }
+
     @Test
     void onlyRaknetifyPipelinesMayLogIn() throws Exception {
         assertTrue(RaknetOnly.raknet(new Login(Map.of(RaknetOnly.RAKNET_HANDLER, new Object()))));
@@ -59,5 +85,20 @@ class RaknetOnlyTest {
     void unknownInternalsAreReportedInsteadOfGuessed() {
         InboundConnection api = GateEvictionTest.fake(InboundConnection.class, (m, a) -> null);
         assertThrows(ReflectiveOperationException.class, () -> RaknetOnly.raknet(api));
+    }
+
+    @Test
+    void mismatchedInternalsRefuseEveryLogin() {
+        InboundConnection api = GateEvictionTest.fake(InboundConnection.class, (m, a) -> null);
+        var reported = new ArrayList<Exception>();
+        assertSame(RaknetOnly.UNAVAILABLE, RaknetOnly.denial(api, reported::add));
+        assertEquals(1, reported.size());
+        assertSame(
+                RaknetOnly.DENIED,
+                RaknetOnly.denial(new Login(Map.of("handler", new Object())), reported::add));
+        assertNull(
+                RaknetOnly.denial(
+                        new Login(Map.of(RaknetOnly.RAKNET_HANDLER, new Object())), reported::add));
+        assertEquals(1, reported.size());
     }
 }

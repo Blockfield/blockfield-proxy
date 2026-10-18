@@ -149,15 +149,18 @@ final class Authentication {
 
     @Subscribe
     public void onPreLogin(PreLoginEvent event) {
-        try {
-            if (!RaknetOnly.raknet(event.getConnection())) {
-                event.setResult(PreLoginEvent.PreLoginComponentResult.denied(RaknetOnly.DENIED));
-                return;
-            }
-        } catch (ReflectiveOperationException | RuntimeException error) {
-            // Fail open: a Velocity/Raknetify bump must not lock every player out.
-            logger.error(
-                    "Cannot detect the login transport; allowing {}", event.getUsername(), error);
+        Component denial =
+                RaknetOnly.denial(
+                        event.getConnection(),
+                        error ->
+                                logger.error(
+                                        "Velocity/Raknetify internals mismatch: cannot detect the"
+                                                + " login transport, refusing {}",
+                                        event.getUsername(),
+                                        error));
+        if (denial != null) {
+            event.setResult(PreLoginEvent.PreLoginComponentResult.denied(denial));
+            return;
         }
         if (!NAME.matcher(event.getUsername()).matches()) {
             event.setResult(
