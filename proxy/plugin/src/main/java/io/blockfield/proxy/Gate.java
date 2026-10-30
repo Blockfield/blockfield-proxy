@@ -43,6 +43,23 @@ record Gate(
         return new Gate("closed", "game", DEFAULT_MESSAGE, Set.of());
     }
 
+    /**
+     * Control-plane projection (U1): CP modes open/draining/maintenance. Unknown or corrupt answers
+     * fail closed; draining keeps its message (entry stays open for game members, unlike
+     * maintenance).
+     */
+    static Gate fromCp(String mode, String message) {
+        String msg = message == null ? "" : message.strip();
+        if (msg.length() > 500) msg = msg.substring(0, 500);
+        return switch (mode) {
+            case "open" -> OPEN;
+            case "draining" -> new Gate("draining", "game", msg, Set.of());
+            case "maintenance" ->
+                    new Gate("closed", "game", msg.isEmpty() ? DEFAULT_MESSAGE : msg, Set.of());
+            default -> closed();
+        };
+    }
+
     Gate forBackend(String server) {
         if (!backends.isEmpty()) return backends.getOrDefault(server, closed());
         return server.equals(backend) ? this : closed();

@@ -62,6 +62,8 @@ final class BackendRouting {
                     .orElse(null);
     private volatile Gate gate = Gate.load(gateFile);
     private volatile FileTime gateStamp;
+    // U1: с BLOCKFIELD_CP_URL вход читается из control-plane (файл — запасной путь лишь без CP).
+    private final GatePoller gatePoller = GatePoller.fromEnv();
 
     /**
      * Gate whose evictions tick() last applied. A ping or connect may reload the file first; tick
@@ -164,6 +166,14 @@ final class BackendRouting {
     }
 
     private void reloadGate() {
+        if (gatePoller != null) {
+            Gate next = gatePoller.current();
+            if (!next.equals(gate)) {
+                logger.info("Gate from control-plane: game={}", next.forBackend("game").state());
+                gate = next;
+            }
+            return;
+        }
         if (gateFile == null) return;
         FileTime stamp;
         try {
