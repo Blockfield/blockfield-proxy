@@ -88,4 +88,24 @@ class GatePollerTest {
         clock.addAndGet(GatePoller.POLL_MS);
         assertTrue(poller.pollOnce().open());
     }
+
+    @Test
+    void openThenDownClosesOnlyPastTheLease() {
+        AtomicLong clock = new AtomicLong(0);
+        Script script = new Script();
+        script.answers.add(cp("open", ""));
+        GatePoller poller = new GatePoller(script, clock::get);
+        // До первого успешного опроса вход закрыт (fail closed на старте).
+        assertEquals("closed", poller.current().state());
+        assertTrue(poller.pollOnce().open());
+        // CP недоступен: внутри лизы держим open, за лизой вход закрыт.
+        script.answers.add(new RuntimeException("down"));
+        clock.addAndGet(GatePoller.LEASE_MS - 1);
+        assertTrue(poller.pollOnce().open());
+        script.answers.add(new RuntimeException("down"));
+        clock.addAndGet(2);
+        Gate closed = poller.pollOnce();
+        assertEquals("closed", closed.state());
+        assertFalse(closed.allows("game", null, "Anyone", true));
+    }
 }
