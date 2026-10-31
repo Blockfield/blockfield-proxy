@@ -15,12 +15,15 @@ What each probe proves:
   here and names the CP leg.
 - tcp_workshop: the Workshop virtual host answers with its gate applied
   (proves proxy routing to the Workshop leg, not just the default backend).
-- raknet: the RakNet listener players actually use answers Open Connection
-  Request 1 (transport alive; raknetify answers below the login gate, but
-  never answers an unconnected ping).
+- raknet: the Game RakNet listener answers Open Connection Request 1
+  (transport alive; raknetify answers below the login gate, but never answers
+  an unconnected ping).
+- raknet_workshop: the Workshop RakNet UDP port answers Open Connection
+  Request 1 (proves the second listener builders use is bound).
 - gate_file: the host file leg matches the expected states, so an intended
   maintenance reads as SKIP-worthy instead of a mysterious ping failure.
-  --game-only skips the Workshop legs (tcp_workshop, Workshop gate-file leg):
+  --game-only skips the Workshop legs (tcp_workshop, raknet_workshop,
+  Workshop gate-file leg):
   Game deploys use it so a down/asleep/mid-transition Workshop never blocks
   Game entry verification; Workshop releases keep the full gate.
 
@@ -307,6 +310,22 @@ def check(args):
         record(False, "raknet", f"open connection request 1 failed ({error})")
     else:
         record(True, "raknet", f"open reply 1 guid={guid}")
+    if args.game_only:
+        # Game deploys never consult the Workshop: skip its RakNet port probe
+        # with the vhost probe, which would fail while the Workshop listener
+        # is down or mid-transition.
+        record(True, "raknet_workshop", "skipped: Game-only gate")
+    else:
+        try:
+            guid = raknet_ping(args.proxy_host, args.workshop_udp_port)
+        except Exception as error:
+            record(
+                False,
+                "raknet_workshop",
+                f"workshop RakNet port {args.workshop_udp_port} unreachable ({error})",
+            )
+        else:
+            record(True, "raknet_workshop", f"open reply 1 guid={guid}")
     if args.gate_file is not None:
         try:
             states = gate_file_states(args.gate_file)
@@ -335,6 +354,12 @@ def main(argv=None):
     parser.add_argument("--proxy-host", default="127.0.0.1")
     parser.add_argument("--tcp-port", type=int, default=25565)
     parser.add_argument("--udp-port", type=int, default=25566)
+    parser.add_argument(
+        "--workshop-udp-port",
+        type=int,
+        default=25567,
+        help="Workshop RakNet UDP port the raknet_workshop leg dials",
+    )
     parser.add_argument("--rooms-url", default="https://blockfield.pro/api/rooms")
     parser.add_argument("--gate-file", default=None)
     parser.add_argument("--workshop-host", default=None)
@@ -343,8 +368,9 @@ def main(argv=None):
     parser.add_argument(
         "--game-only",
         action="store_true",
-        help="check the Game legs only: skip the Workshop vhost probe and "
-        "the Workshop gate-file leg (Game deploys never consult the Workshop)",
+        help="check the Game legs only: skip the Workshop vhost probe, "
+        "the Workshop RakNet port probe and the Workshop gate-file leg "
+        "(Game deploys never consult the Workshop)",
     )
     args = parser.parse_args(argv)
     if args.tag is not None and not TAG.fullmatch(args.tag):

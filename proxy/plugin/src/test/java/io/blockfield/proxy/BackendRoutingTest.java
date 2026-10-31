@@ -5,15 +5,18 @@ import static io.blockfield.proxy.GateEvictionTest.fake;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.velocitypowered.api.event.connection.DisconnectEvent;
+import com.velocitypowered.api.event.connection.PreLoginEvent;
 import com.velocitypowered.api.event.player.KickedFromServerEvent;
 import com.velocitypowered.api.event.player.PlayerChooseInitialServerEvent;
 import com.velocitypowered.api.event.player.ServerPreConnectEvent;
 import com.velocitypowered.api.event.proxy.ProxyPingEvent;
 import com.velocitypowered.api.proxy.ConnectionRequestBuilder;
 import com.velocitypowered.api.proxy.InboundConnection;
+import com.velocitypowered.api.proxy.LoginPhaseConnection;
 import com.velocitypowered.api.proxy.Player;
 import com.velocitypowered.api.proxy.ProxyServer;
 import com.velocitypowered.api.proxy.ServerConnection;
@@ -110,6 +113,88 @@ class BackendRoutingTest {
         unset.authenticate(legacy);
         unset.gate("builders", "workshop", "Builder");
         assertFalse(unset.connect(legacy, "workshop").getResult().isAllowed());
+    }
+
+    @Test
+    void workshopPortSelectsWorkshopProfile() throws Exception {
+        var fixture = new Fixture("workshop.invalid");
+        // Game-looking vhost, Workshop inbound port: the port decides, not the vhost.
+        Player workshop = fixture.player(UUID.randomUUID(), "game.invalid", "WsBuilder");
+        fixture.authentication.noteInboundPort("WsBuilder", 25567);
+        fixture.authenticate(workshop);
+        fixture.gate("builders", "workshop", "WsBuilder");
+        assertEquals(fixture.servers.get("workshop"), fixture.choose(workshop));
+        assertTrue(fixture.connect(workshop, "workshop").getResult().isAllowed());
+        assertFalse(fixture.connect(workshop, "game").getResult().isAllowed());
+    }
+
+    @Test
+    void gamePortIgnoresWorkshopVhost() throws Exception {
+        var fixture = new Fixture("workshop.invalid");
+        // Even a workshop vhost (crafted hostname) on the Game port stays on Game.
+        Player game = fixture.player(UUID.randomUUID(), "workshop.invalid", "Crafty");
+        fixture.authentication.noteInboundPort("Crafty", 25566);
+        fixture.authenticate(game);
+        fixture.dualGate("public", "builders", "Crafty");
+        assertEquals(fixture.servers.get("game"), fixture.choose(game));
+        assertFalse(fixture.connect(game, "workshop").getResult().isAllowed());
+    }
+
+    @Test
+    void unknownPortKeepsLegacyVhostRule() throws Exception {
+        var fixture = new Fixture("workshop.invalid");
+        // No recorded port (e.g. direct backend wiring in tests): vhost decides.
+        Player legacy = fixture.player(UUID.randomUUID(), "workshop.invalid", "Legacy");
+        fixture.authenticate(legacy);
+        fixture.gate("builders", "workshop", "Legacy");
+        assertEquals(fixture.servers.get("workshop"), fixture.choose(legacy));
+    }
+
+    @Test
+    void disabledWorkshopPortRoutesToGame() throws Exception {
+        var fixture = new Fixture("workshop.invalid", -1);
+        Player game = fixture.player(UUID.randomUUID(), "game.invalid", "NoWs");
+        fixture.authentication.noteInboundPort("NoWs", 25567);
+        fixture.authenticate(game);
+        fixture.dualGate("public", "closed", null);
+        assertEquals(fixture.servers.get("game"), fixture.choose(game));
+    }
+
+    @Test
+    void preLoginRecordsInboundPortAndKeepsTcpRefused() {
+        var fixture = new Fixture("workshop.invalid");
+        var raknetEvent =
+                new PreLoginEvent(
+                        RaknetOnlyTest.overRaknetOnPort(
+                                LoginPhaseConnection.class, remote("1.2.3.4"), 25567),
+                        "PortNick");
+        fixture.authentication.onPreLogin(raknetEvent);
+        assertTrue(raknetEvent.getResult().isAllowed());
+        assertEquals(Integer.valueOf(25567), fixture.authentication.inboundPort("PortNick"));
+        // TCP still refused at PreLogin: nothing is recorded for it.
+        var tcpEvent =
+                new PreLoginEvent(
+                        RaknetOnlyTest.overTcp(LoginPhaseConnection.class, remote("5.6.7.8")),
+                        "TcpNick");
+        fixture.authentication.onPreLogin(tcpEvent);
+        assertFalse(tcpEvent.getResult().isAllowed());
+        assertNull(fixture.authentication.inboundPort("TcpNick"));
+        // Internals mismatch still fails closed.
+        var badEvent =
+                new PreLoginEvent(
+                        GateEvictionTest.fake(LoginPhaseConnection.class, (m, a) -> null),
+                        "BadNick");
+        fixture.authentication.onPreLogin(badEvent);
+        assertFalse(badEvent.getResult().isAllowed());
+    }
+
+    private static LoginPhaseConnection remote(String host) {
+        return GateEvictionTest.fake(
+                LoginPhaseConnection.class,
+                (method, args) ->
+                        method.equals("getRemoteAddress")
+                                ? InetSocketAddress.createUnresolved(host, 1000)
+                                : null);
     }
 
     @Test
@@ -319,6 +404,10 @@ class BackendRoutingTest {
         final BackendRouting routing;
 
         Fixture(String host) {
+            this(host, BackendRouting.DEFAULT_WORKSHOP_PORT);
+        }
+
+        Fixture(String host, int port) {
             for (String name : List.of("lobby", "game", "workshop")) {
                 pings.put(name, new CompletableFuture<>());
                 servers.put(
@@ -352,7 +441,13 @@ class BackendRoutingTest {
                             this, proxy, LoggerFactory.getLogger("test"), new LoginForwarding());
             routing =
                     new BackendRouting(
-                            this, proxy, LoggerFactory.getLogger("test"), authentication, host);
+                            this,
+                            proxy,
+                            LoggerFactory.getLogger("test"),
+                            authentication,
+                            host,
+                            port,
+                            null);
         }
 
         Player player(UUID id, String host, String name) {

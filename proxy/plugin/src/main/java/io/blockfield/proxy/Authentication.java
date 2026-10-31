@@ -80,6 +80,22 @@ final class Authentication {
     private final Map<UUID, Integer> failures = new ConcurrentHashMap<>();
     private final Map<InetAddress, long[]> ipFailures = new ConcurrentHashMap<>();
 
+    /** Inbound RakNet port by lowercase nickname, recorded at PreLogin for profile routing. */
+    private final Map<String, Integer> portByUser = new ConcurrentHashMap<>();
+
+    /** Inbound RakNet port of the login; null when no PreLogin was seen. */
+    Integer inboundPort(String username) {
+        return username == null ? null : portByUser.get(key(username));
+    }
+
+    void noteInboundPort(String username, int port) {
+        if (username != null) portByUser.put(key(username), port);
+    }
+
+    private static String key(String username) {
+        return username.toLowerCase(java.util.Locale.ROOT);
+    }
+
     Authentication(Object plugin, ProxyServer proxy, Logger logger, LoginForwarding forwarding) {
         this(
                 plugin,
@@ -144,6 +160,7 @@ final class Authentication {
             loggingOut.remove(id);
             draslIds.remove(id);
             failures.remove(id);
+            portByUser.remove(key(player.getUsername()));
         }
     }
 
@@ -169,6 +186,16 @@ final class Authentication {
             return;
         }
         if (!(event.getConnection() instanceof LoginPhaseConnection connection)) return;
+        // Inbound RakNet port selects the profile (BackendRouting): the 1.21.1 handshake
+        // carries rDNS/IP instead of the typed hostname, so only the port distinguishes
+        // Game (25566) from Workshop. Best effort: mismatch already fails closed above.
+        try {
+            noteInboundPort(event.getUsername(), RaknetOnly.inboundPort(event.getConnection()));
+        } catch (ReflectiveOperationException | RuntimeException error) {
+            logger.warn(
+                    "cannot detect the inbound RakNet port of {}, falling back to vhost routing",
+                    event.getUsername());
+        }
         var auth = new CompletableFuture<String>();
         var pack = new CompletableFuture<byte[]>();
         var contract = new CompletableFuture<byte[]>();
