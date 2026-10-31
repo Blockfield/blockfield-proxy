@@ -1,9 +1,10 @@
-"""Deploy an exact release through the app's Dokploy webhook. Actions hold only webhook URLs, never a Dokploy API key.
+"""Deploy an exact release by pinning the Dokploy app to its digest. Actions hold a Dokploy API token, never registry credentials.
 
-The Dokploy webhook redeploys only the image configured in the app and answers before pulling. So every app is
-configured once with its channel tag ghcr.io/blockfield/<app>:latest. deploy() points the channel at the validated
-digest, calls the webhook and returns only when the Dokploy log shows the pull of that digest, every running task
-of the swarm service runs it healthy and swarm has closed the update's monitor window.
+The Dokploy app is configured with a digest-pinned image ghcr.io/blockfield/<app>@sha256:<digest> (Docker provider:
+only dockerImage; authentication uses the centrally configured GHCR registry, so no per-app registry credentials).
+deploy() pins the validated digest via the Dokploy API, redeploys and returns only when the Dokploy log shows the
+pull of that digest, every running task of the swarm service runs it healthy and swarm has closed the update's
+monitor window. Rollback re-pins the previous digest (see docs in README).
 
     deploy-webhooks.py digest <app> <vX.Y.Z>   registry digest of a release image
     deploy-webhooks.py current <app>           digest of the running image (the exact rollback target)
@@ -28,15 +29,19 @@ except ImportError:
     fcntl = None
 
 REGISTRY = "ghcr.io/blockfield/"
-# Dokploy app name (= swarm service and log directory) and the repository secret holding its webhook URL.
+# Dokploy app name (= swarm service and log directory).
 APPS = {
-    "blockfield-server": ("blockfield-server-lfcxy0", "DOKPLOY_SERVER_WEBHOOK"),
-    "blockfield-proxy": ("blockfield-proxy-niocmj", "DOKPLOY_PROXY_WEBHOOK"),
+    "blockfield-server": "blockfield-server-lfcxy0",
+    "blockfield-proxy": "blockfield-proxy-niocmj",
+}
+# Dokploy application IDs for the digest pin (stable; see the app URLs in Dokploy).
+APPLICATION_IDS = {
+    "blockfield-proxy": "3ssgIwfLJCYJ62BIsFvkZ",
 }
 TAG = re.compile(r"v[0-9]+\.[0-9]+\.[0-9]+")
 DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 LOGS = Path("/etc/dokploy/logs")
-# One channel move and rollout at a time on the deploy host, whichever repository runs it.
+# One pin and rollout at a time on the deploy host, whichever repository runs it.
 LOCK = "/tmp/blockfield-deploy.lock"
 # Held for a whole server or client deploy (validation to rollback), so the pair is never checked by one job and
 # switched by another. Deploy server holds it from its workflow with flock(1).
@@ -94,7 +99,7 @@ def running(service):
         "ps",
         "--no-trunc",
         "--filter",
-        "label=com.docker.swarm.service.name=" + APPS[service][0],
+        "label=com.docker.swarm.service.name=" + APPS[service],
         "--format",
         "{{.ID}}",
     ).split()
@@ -132,7 +137,7 @@ def swarm_update(service):
     return docker(
         "service",
         "inspect",
-        APPS[service][0],
+        APPS[service],
         "--format",
         "{{if .UpdateStatus}}{{.UpdateStatus.State}}{{end}}",
     )
@@ -144,7 +149,7 @@ def monitor_window(service):
         nanoseconds = docker(
             "service",
             "inspect",
-            APPS[service][0],
+            APPS[service],
             "--format",
             "{{with .Spec.UpdateConfig}}{{json .Monitor}}{{end}}",
         )
@@ -177,44 +182,66 @@ def current(service):
     )
 
 
-def call(service, note):
-    # Docker Hub payload: Dokploy refuses (301) when the image or tag differs from the app's channel,
-    # so a secret pasted into the wrong repository cannot redeploy another app.
-    body = {
-        "repository": {"repo_name": REGISTRY + service},
-        "push_data": {"tag": "latest", "pusher": note},
-    }
+def dokploy_api(service, path, payload):
+    base = os.environ.get("DOKPLOY_API_URL", "").rstrip("/")
+    token = os.environ.get("DOKPLOY_API_TOKEN", "")
+    if not base or not token:
+        raise SystemExit(
+            f"{service}: set DOKPLOY_API_URL (Dokploy dashboard base URL) and DOKPLOY_API_TOKEN "
+            "(Dokploy profile settings -> API/CLI) repository secrets before deploying; "
+            "see the deployment section in README.md"
+        )
     request = urllib.request.Request(
-        os.environ[APPS[service][1]],
-        data=json.dumps(body).encode(),
+        base + path,
+        data=json.dumps(payload).encode(),
         method="POST",
-        headers={
-            "Content-Type": "application/json",
-            "User-Agent": "Go-http-client/1.1",
-        },
+        headers={"Content-Type": "application/json", "x-api-key": token},
     )
     try:
         with urllib.request.urlopen(request, timeout=30) as response:
             response.read()
     except urllib.error.HTTPError as error:
-        try:
-            message = json.loads(error.read()).get("message", "")
-        except ValueError:
-            message = ""
-        # Never print the URL: its path is the secret.
+        # Never print the token: it travels only in the request header.
         raise SystemExit(
-            f"{service}: Dokploy webhook refused ({error.code}) {message}"
+            f"{service}: Dokploy API {path} refused ({error.code})"
         ) from None
     except urllib.error.URLError as error:
         raise SystemExit(
-            f"{service}: Dokploy webhook unreachable ({type(error.reason).__name__})"
+            f"{service}: Dokploy API unreachable ({type(error.reason).__name__})"
         ) from None
+
+
+def pin(service, digest):
+    """Point the Dokploy app at the exact digest (Docker provider: image only, no registry credentials in app fields)."""
+    if service not in APPLICATION_IDS or not DIGEST.fullmatch(digest):
+        raise ValueError("Unexpected deployment target")
+    dokploy_api(
+        service,
+        "/api/application.saveDockerProvider",
+        {
+            "applicationId": APPLICATION_IDS[service],
+            "dockerImage": f"{REGISTRY}{service}@{digest}",
+            "username": None,
+            "password": None,
+            "registryUrl": None,
+        },
+    )
+
+
+def redeploy(service):
+    if service not in APPLICATION_IDS:
+        raise ValueError("Unexpected deployment target")
+    dokploy_api(
+        service,
+        "/api/application.redeploy",
+        {"applicationId": APPLICATION_IDS[service]},
+    )
 
 
 def dokploy_log(service, since, seen):
     logs = [
         p
-        for p in (LOGS / APPS[service][0]).glob("*.log")
+        for p in (LOGS / APPS[service]).glob("*.log")
         if p.stat().st_mtime >= since and p not in seen
     ]
     newest = max(logs, key=lambda p: p.stat().st_mtime, default=None)
@@ -254,29 +281,15 @@ def deploy(service, digest):
         raise ValueError("Unexpected deployment target")
     if fcntl is None:
         raise RuntimeError("Production deployment locking requires a Linux runner")
-    image = REGISTRY + service
     with open(LOCK, "a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        # The channel always names what should run, so a redeploy from the Dokploy UI repeats it.
-        docker(
-            "buildx",
-            "imagetools",
-            "create",
-            "--tag",
-            f"{image}:latest",
-            f"{image}@{digest}",
-        )
-        wait(
-            lambda: registry_digest(f"{image}:latest") == digest,
-            120,
-            f"{service}: registry does not serve the new channel",
-        )
+        # The pin always names what should run, so a redeploy from the Dokploy UI repeats it.
+        pin(service, digest)
         if runs(service, digest):
-            print(f"{service}: {digest} already runs, webhook not sent")
+            print(f"{service}: {digest} already runs, redeploy not sent")
             return
-        note = f"{os.environ.get('GITHUB_REPOSITORY', 'local')} run {os.environ.get('GITHUB_RUN_ID', '-')} {digest}"
         sent, resent, seen = time.time() - 1, False, set()
-        call(service, note)
+        redeploy(service)
         limit, monitoring = STARTUP, False
         deadline = time.monotonic() + limit
         while time.monotonic() < deadline:
@@ -289,12 +302,12 @@ def deploy(service, digest):
                         + "\n".join(log.splitlines()[-8:])
                     )
                 print(
-                    f"{service}: Dokploy pull failed, resending the webhook once",
+                    f"{service}: Dokploy pull failed, resending the redeploy once",
                     flush=True,
                 )
                 seen.add(path)
                 resent = True
-                call(service, note)
+                redeploy(service)
             # The update state is only this update's once a task of the digest ran healthy; before that it can be
             # the previous update's paused or rollback.
             elif log and (monitoring or runs(service, digest)):
