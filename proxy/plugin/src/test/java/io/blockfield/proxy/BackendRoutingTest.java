@@ -5,7 +5,6 @@ import static io.blockfield.proxy.GateEvictionTest.fake;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
-import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.velocitypowered.api.event.connection.DisconnectEvent;
@@ -29,6 +28,7 @@ import org.slf4j.LoggerFactory;
 
 import java.lang.reflect.Field;
 import java.net.InetSocketAddress;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -52,7 +52,14 @@ class BackendRoutingTest {
                         "raknet;workshop.invalid",
                         "workshop.invalid:25566",
                         "https://workshop.invalid")) {
-            assertThrows(IllegalArgumentException.class, () -> new Fixture(invalid));
+            // P0-1: опечатка не роняет плагин (и gate-хуки), мастерская отключается.
+            var fixture = new Fixture(invalid);
+            Player player = fixture.player(UUID.randomUUID(), "workshop.invalid", "Builder");
+            fixture.authenticate(player);
+            fixture.gate("builders", "workshop", "Builder");
+            assertFalse(
+                    fixture.connect(player, "workshop").getResult().isAllowed(),
+                    "invalid workshop host disables Workshop entry, like an empty one");
         }
         var fixture = new Fixture("[2001:db8::1]");
         Player player = fixture.player(UUID.randomUUID(), "2001:DB8:0:0:0:0:0:1", "Builder");
@@ -103,6 +110,24 @@ class BackendRoutingTest {
         unset.authenticate(legacy);
         unset.gate("builders", "workshop", "Builder");
         assertFalse(unset.connect(legacy, "workshop").getResult().isAllowed());
+    }
+
+    @Test
+    void gateSourceNamesTheActiveSource() {
+        Path file = Path.of("gate.json");
+        assertEquals(
+                "control-plane", BackendRouting.gateSource("https://cp.invalid", "token", file));
+        assertEquals(
+                "control-plane", BackendRouting.gateSource("https://cp.invalid/", "token", file));
+        assertTrue(
+                BackendRouting.gateSource("not a url", "token", file)
+                        .startsWith("control-plane URL invalid"));
+        assertTrue(
+                BackendRouting.gateSource("https://cp.invalid", null, file)
+                        .contains("half-configured"));
+        assertTrue(BackendRouting.gateSource(null, "token", file).contains("half-configured"));
+        assertTrue(BackendRouting.gateSource(null, null, file).contains("gate.json"));
+        assertTrue(BackendRouting.gateSource(null, null, null).contains("bundled default"));
     }
 
     @Test

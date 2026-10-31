@@ -64,7 +64,9 @@ final class BackendRouting {
     private volatile Gate gate = fileGate;
     private volatile FileTime gateStamp;
     // U1: с BLOCKFIELD_CP_URL вход читается из control-plane (файл — запасной путь лишь без CP).
-    private final GatePoller gatePoller = GatePoller.fromEnv();
+    // Никогда не null из-за битого окружения: fromEnv не бросает, а битый хост мастерской
+    // лишь отключает мастерскую (как пустой), а не роняет весь плагин.
+    private GatePoller gatePoller;
 
     /**
      * Gate whose evictions tick() last applied. A ping or connect may reload the file first; tick
@@ -103,17 +105,57 @@ final class BackendRouting {
         this.logger = logger;
         this.authentication = authentication;
         String host = workshopHost == null ? "" : workshopHost.strip();
-        if (!host.isEmpty()) {
-            try {
-                if (new URI("minecraft", null, host, -1, null, null, null).getHost() == null)
-                    throw new URISyntaxException(host, "Not a host");
-            } catch (URISyntaxException e) {
-                throw new IllegalArgumentException(
-                        "BLOCKFIELD_WORKSHOP_HOST must be a plain hostname or IP, without a port");
-            }
+        if (!host.isEmpty() && !validWorkshopHost(host)) {
+            // Fail closed, never throw: опечатка не должна ронять плагин (и вместе с ним
+            // gate-хуки, после чего /server пускает всех без авторизации). Мастерская
+            // отключается, как при пустом значении.
+            logger.error(
+                    "BLOCKFIELD_WORKSHOP_HOST is not a plain hostname or IP ({});"
+                            + " Workshop entry is disabled",
+                    host);
+            host = "";
         }
         this.workshopHost = normalizeHost(host);
         this.inboxDir = inboxDir;
+        this.gatePoller = GatePoller.fromEnv(logger);
+        String source =
+                gateSource(
+                        System.getenv("BLOCKFIELD_CP_URL"),
+                        System.getenv("BLOCKFIELD_CP_TOKEN"),
+                        gateFile);
+        if (source.startsWith("file (") || source.startsWith("control-plane URL invalid"))
+            logger.warn("gate source: {}", source);
+        else logger.info("gate source: {}", source);
+    }
+
+    /** Plain hostname or IP, without a port: the constructor never throws, this decides. */
+    static boolean validWorkshopHost(String host) {
+        try {
+            return new URI("minecraft", null, host, -1, null, null, null).getHost() != null;
+        } catch (URISyntaxException e) {
+            return false;
+        }
+    }
+
+    /**
+     * Active gate source for the startup log; pure for tests. A half-configured CP (URL without
+     * token or vice versa) silently falls back to the file: the log names it so a maintenance
+     * toggle that "doesn't take" points at the env, not at the gate.
+     */
+    static String gateSource(String cpUrl, String cpToken, Path gateFile) {
+        boolean hasUrl = cpUrl != null && !cpUrl.isBlank();
+        boolean hasToken = cpToken != null && !cpToken.isBlank();
+        if (hasUrl && hasToken) {
+            try {
+                GatePoller.gateUri(cpUrl);
+                return "control-plane";
+            } catch (IllegalArgumentException e) {
+                return "control-plane URL invalid, entry stays closed: " + e.getMessage();
+            }
+        }
+        if (hasUrl || hasToken)
+            return "file (BLOCKFIELD_CP_URL/TOKEN half-configured, control-plane disabled)";
+        return "file (" + (gateFile == null ? "bundled default" : gateFile.toString()) + ")";
     }
 
     private static Path inboxDirFromEnv() {
