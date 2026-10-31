@@ -41,9 +41,11 @@ jobs:
           WITHOUT_ROLLBACK: ${{ inputs.without_rollback }}
         run: |
           just python - <<'PYCODE'
-          import os, sys
+          import os, subprocess, sys
           sys.path.insert(0, 'scripts')
           hooks = __import__('deploy-webhooks')
+          entry = [sys.executable, 'scripts/entry_liveness.py',
+                   '--gate-file', '/srv/minecraft/workshop/gate/gate.json']
           digest = hooks.release_digest('blockfield-proxy', os.environ['TAG'])
           try:
               previous = hooks.current('blockfield-proxy')
@@ -53,8 +55,16 @@ jobs:
               previous = None
           try:
               hooks.deploy('blockfield-proxy', digest)
+              # Synthetic post-deploy gate: a player must get in (proxy#48
+              # closed Workshop for ~16 h with no gate catching it).
+              probe = subprocess.run(entry, capture_output=True, text=True, timeout=300)
+              if probe.returncode != 0:
+                  raise SystemExit('entry dead after proxy deploy:\n' + probe.stdout + probe.stderr)
           except BaseException:
               if previous:
                   hooks.deploy('blockfield-proxy', previous)
+                  recheck = subprocess.run(entry, capture_output=True, text=True, timeout=300)
+                  if recheck.returncode != 0:
+                      raise SystemExit('entry still dead after proxy rollback:\n' + recheck.stdout + recheck.stderr)
               raise
           PYCODE
