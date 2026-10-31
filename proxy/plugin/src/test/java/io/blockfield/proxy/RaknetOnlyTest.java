@@ -8,6 +8,8 @@ import org.junit.jupiter.api.Test;
 
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Proxy;
+import java.net.InetSocketAddress;
+import java.net.SocketAddress;
 import java.util.ArrayList;
 import java.util.Map;
 
@@ -17,7 +19,11 @@ class RaknetOnlyTest {
         private final Minecraft minecraft;
 
         Login(Map<String, Object> handlers) {
-            minecraft = new Minecraft(new Channel(new Pipeline(handlers)));
+            this(handlers, null);
+        }
+
+        Login(Map<String, Object> handlers, SocketAddress local) {
+            minecraft = new Minecraft(new Channel(new Pipeline(handlers), local));
         }
 
         @SuppressWarnings("unused")
@@ -41,8 +47,15 @@ class RaknetOnlyTest {
     }
 
     static final class Channel extends AbstractChannel {
-        Channel(Pipeline pipeline) {
+        private final SocketAddress local;
+
+        Channel(Pipeline pipeline, SocketAddress local) {
             super(pipeline);
+            this.local = local;
+        }
+
+        public SocketAddress localAddress() {
+            return local;
         }
     }
 
@@ -59,14 +72,36 @@ class RaknetOnlyTest {
     /** Makes a Velocity API fake look like a login that arrived over RakNet. */
     @SuppressWarnings("unchecked")
     static <T> T overRaknet(Class<T> type, T fake) {
-        Minecraft raknet =
-                new Login(Map.of(RaknetOnly.RAKNET_HANDLER, new Object())).delegatedConnection();
+        return overTransport(type, fake, true, null);
+    }
+
+    /** Makes a Velocity API fake look like a login that arrived over plain TCP. */
+    @SuppressWarnings("unchecked")
+    static <T> T overTcp(Class<T> type, T fake) {
+        return overTransport(type, fake, false, null);
+    }
+
+    /** Makes a Velocity API fake look like a RakNet login on the given inbound port. */
+    @SuppressWarnings("unchecked")
+    static <T> T overRaknetOnPort(Class<T> type, T fake, int port) {
+        return overTransport(type, fake, true, new InetSocketAddress("127.0.0.1", port));
+    }
+
+    @SuppressWarnings("unchecked")
+    static <T> T overTransport(Class<T> type, T fake, boolean raknet, SocketAddress local) {
+        Minecraft channel =
+                new Login(
+                                Map.of(
+                                        raknet ? RaknetOnly.RAKNET_HANDLER : "handler",
+                                        new Object()),
+                                local)
+                        .delegatedConnection();
         return (T)
                 Proxy.newProxyInstance(
                         RaknetOnlyTest.class.getClassLoader(),
                         new Class<?>[] {type, Delegating.class},
                         (self, method, args) -> {
-                            if (method.getName().equals("delegatedConnection")) return raknet;
+                            if (method.getName().equals("delegatedConnection")) return channel;
                             try {
                                 return method.invoke(fake, args);
                             } catch (InvocationTargetException error) {
@@ -79,6 +114,15 @@ class RaknetOnlyTest {
     void onlyRaknetifyPipelinesMayLogIn() throws Exception {
         assertTrue(RaknetOnly.raknet(new Login(Map.of(RaknetOnly.RAKNET_HANDLER, new Object()))));
         assertFalse(RaknetOnly.raknet(new Login(Map.of("handler", new Object()))));
+    }
+
+    @Test
+    void inboundPortReadsChannelLocalAddress() throws Exception {
+        var login =
+                new Login(
+                        Map.of(RaknetOnly.RAKNET_HANDLER, new Object()),
+                        new InetSocketAddress("127.0.0.1", 25567));
+        assertEquals(25567, RaknetOnly.inboundPort(login));
     }
 
     @Test

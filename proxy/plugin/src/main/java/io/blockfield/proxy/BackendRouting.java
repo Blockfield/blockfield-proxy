@@ -45,6 +45,13 @@ final class BackendRouting {
     private final Logger logger;
     private final Authentication authentication;
     private final String workshopHost;
+
+    /** Inbound RakNet UDP port of the Workshop profile; -1 disables port routing. */
+    private final int workshopPort;
+
+    /** Default Workshop port; the proxy image binds it via raknetify's workshopPort property. */
+    static final int DEFAULT_WORKSHOP_PORT = 25567;
+
     private static final Duration LOGIN_TIMEOUT = Duration.ofMinutes(5);
     // ponytail: участник доигрываемой Кампании = был на игровом сервере за 10 минут; точный резерв
     // проверяет мод. Передавать резервы в gate.json, если окна не хватит.
@@ -100,6 +107,17 @@ final class BackendRouting {
             Authentication authentication,
             String workshopHost,
             Path inboxDir) {
+        this(plugin, proxy, logger, authentication, workshopHost, workshopPortFromEnv(), inboxDir);
+    }
+
+    BackendRouting(
+            Object plugin,
+            ProxyServer proxy,
+            Logger logger,
+            Authentication authentication,
+            String workshopHost,
+            int workshopPort,
+            Path inboxDir) {
         this.plugin = plugin;
         this.proxy = proxy;
         this.logger = logger;
@@ -116,6 +134,15 @@ final class BackendRouting {
             host = "";
         }
         this.workshopHost = normalizeHost(host);
+        if (workshopPort != -1 && (workshopPort <= 0 || workshopPort >= 65535)) {
+            // Fail closed, never throw: an invalid value disables Workshop routing, so every
+            // login falls through to Game instead of failing open to Workshop.
+            logger.error(
+                    "BLOCKFIELD_WORKSHOP_PORT is not a valid port ({}); Workshop entry is disabled",
+                    workshopPort);
+            workshopPort = -1;
+        }
+        this.workshopPort = workshopPort;
         this.inboxDir = inboxDir;
         this.gatePoller = GatePoller.fromEnv(logger);
         String source =
@@ -163,6 +190,16 @@ final class BackendRouting {
         return dir == null || dir.isBlank() ? null : Path.of(dir);
     }
 
+    private static int workshopPortFromEnv() {
+        String raw = System.getenv("BLOCKFIELD_WORKSHOP_PORT");
+        if (raw == null || raw.isBlank()) return DEFAULT_WORKSHOP_PORT;
+        try {
+            return Integer.parseInt(raw.strip());
+        } catch (NumberFormatException ignored) {
+            return -1;
+        }
+    }
+
     static String normalizeHost(String value) {
         String host = value.strip().toLowerCase(Locale.ROOT);
         if (host.startsWith("[") && host.endsWith("]")) host = host.substring(1, host.length() - 1);
@@ -187,6 +224,18 @@ final class BackendRouting {
                                 .isPresent()
                 ? "workshop"
                 : "game";
+    }
+
+    /**
+     * Login profile. 1.21.1 clients handshake with the resolved address rDNS/IP, never the typed
+     * hostname, so the vhost host cannot select the profile: the inbound RakNet port does (Workshop
+     * port → Workshop, any other RakNet port → Game). A login with no recorded port falls back to
+     * the legacy vhost rule.
+     */
+    private String requestedBackend(Player player) {
+        Integer port = authentication.inboundPort(player.getUsername());
+        if (port != null) return port == workshopPort ? "workshop" : "game";
+        return requestedBackend((InboundConnection) player);
     }
 
     void admit(Player player) {
@@ -360,18 +409,27 @@ final class BackendRouting {
     @Subscribe
     public void onChooseServer(PlayerChooseInitialServerEvent event) {
         reloadGate();
-        boolean ok = authentication.authenticated(event.getPlayer());
-        Optional<RegisteredServer> target = ok ? target(event.getPlayer()) : Optional.empty();
-        if (ok) maybeRequestWake(event.getPlayer());
+        Player player = event.getPlayer();
+        boolean ok = authentication.authenticated(player);
+        Optional<RegisteredServer> target = ok ? target(player) : Optional.empty();
+        logger.info(
+                "entry {} profile={} port={} vhost={}",
+                player.getUsername(),
+                requestedBackend(player),
+                inboundPort(player),
+                player.getVirtualHost()
+                        .map(address -> address.getHostString() + ":" + address.getPort())
+                        .orElse("-"));
+        if (ok) maybeRequestWake(player);
         (target.isPresent() ? target : server("lobby")).ifPresent(event::setInitialServer);
         if (!ok) {
             proxy.getScheduler()
                     .buildTask(
                             plugin,
                             () -> {
-                                Player player = event.getPlayer();
-                                if (player.isActive() && !authentication.authenticated(player)) {
-                                    player.disconnect(Component.text("Время на вход истекло."));
+                                Player pending = event.getPlayer();
+                                if (pending.isActive() && !authentication.authenticated(pending)) {
+                                    pending.disconnect(Component.text("Время на вход истекло."));
                                 }
                             })
                     .delay(LOGIN_TIMEOUT)
@@ -524,6 +582,11 @@ final class BackendRouting {
                                                             p.createConnectionRequest(backend.get())
                                                                     .fireAndForget()));
         }
+    }
+
+    private String inboundPort(Player player) {
+        Integer port = authentication.inboundPort(player.getUsername());
+        return port == null ? "unknown" : String.valueOf(port);
     }
 
     private Optional<RegisteredServer> server(String name) {

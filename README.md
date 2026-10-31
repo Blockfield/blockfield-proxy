@@ -19,29 +19,36 @@ Blacksmith проверяет main и PR. Тег `v*` публикует `ghcr.i
 
 ## Транспорт клиента
 
-Игрок входит только по RakNet (решение владельца 2026-10-18): адрес
-`raknet;play.blockfield.pro:25566`, Raknetify `0.1.0+alpha.5.196` (Velocity,
-immutable Modrinth version `u3LRuC7t`, SHA256 закреплён в Dockerfile). TCP
-`play.blockfield.pro:25565` обслуживает только status ping (launcher >= 1.0.11
-пингует `raknet;` адрес по TCP 25565 того же хоста): `PreLoginEvent` отклоняет
-login без pipeline handler `raknetify-velocity-event-listener`, который Raknetify
-добавляет только каналам `RakNet$Config` (`RaknetOnly`). Исключений по адресу нет:
-локальные стенды подключаются напрямую к backend, минуя Velocity. Если внутренности
+Игроки входят только по RakNet (решение владельца 2026-10-18): Game —
+`raknet;play.blockfield.pro:25566`, Workshop —
+`raknet;workshop.blockfield.pro:25567`. Raknetify — сборка Blockfield `bf3`
+(GitHub Release `Blockfield/raknetify`, SHA256 закреплён в Dockerfile):
+upstream `76ab30a` + фикс утечки SYNC FrameData + второй UDP-порт мастерской
+(`raknetify.velocity.workshopPort`). TCP `play.blockfield.pro:25565`
+обслуживает только status ping (launcher >= 1.0.11 пингует `raknet;` адрес по
+TCP 25565 того же хоста): `PreLoginEvent` отклоняет login без pipeline handler
+`raknetify-velocity-event-listener`, который Raknetify добавляет только каналам
+`RakNet$Config` (`RaknetOnly`). Исключений по адресу нет: локальные стенды
+подключаются напрямую к backend, минуя Velocity. Если внутренности
 Velocity/Raknetify после обновления не совпали, proxy пишет ERROR
 `Velocity/Raknetify internals mismatch` и отклоняет **каждый** вход (fail closed,
 решение владельца 2026-10-18); status ping не затронут. При обновлении Velocity или
-Raknetify перепроверьте вход по RakNet и отказ TCP.
+Raknetify перепроверьте вход по RakNet (оба порта) и отказ TCP.
 Backend Fabric не требует Raknetify: UDP завершается на Velocity, внутреннее
 соединение с game/workshop остаётся TCP.
 
-Velocity запускается с `-Draknetify.velocity.portOverride=25566` через `JVM_OPTS`.
-При настройке `JVM_OPTS` в Dokploy сохраните эту property. UDP 25565 занят Simple
+Velocity запускается с `-Draknetify.velocity.portOverride=25566
+-Draknetify.velocity.workshopPort=25567` через `JVM_OPTS`.
+При настройке `JVM_OPTS` в Dokploy сохраните обе property. UDP 25565 занят Simple
 Voice Chat; его конфигурация не меняется.
 
-Dokploy `blockfield-proxy-niocmj` публикует **UDP 25566 → 25566, mode host** (порт
-открыт в firewall), TCP 25565 (status ping) и UDP 25565 (voice chat); `EXPOSE` не
-публикует порт сам. Не снимайте TCP 25565: без него launcher не видит статус сервера.
-Изменение Dokploy и Deploy proxy выполняет владелец отдельно; PR их не выполняет.
+Dokploy `blockfield-proxy-niocmj` публикует **UDP 25566 → 25566 и UDP 25567 → 25567,
+mode host** (порты открыты в firewall), TCP 25565 (status ping) и UDP 25565
+(voice chat); `EXPOSE` не публикует порт сам. Не снимайте TCP 25565: без него
+launcher не видит статус сервера.
+Изменение Dokploy и Deploy proxy выполняет владелец отдельно; PR их не выполняет. `BLOCKFIELD_WORKSHOP_HOST` (имя хоста мастерской) остаётся для
+совместимости ping-выдачи; выбор профиля при входе — только по входящему
+RakNet-порту (`BLOCKFIELD_WORKSHOP_PORT`, default `25567`).
 
 Raknetify all-in-one распространяется под **GPLv3** (включает netty-raknet);
 исходники и условия: [Raknetify](https://github.com/RelativityMC/raknetify),
@@ -85,14 +92,17 @@ DNS-имени и завершающая точка не влияют на ср�
 
 В лаунчере профиль `workshop` использует `workshopServer` (необязательное начальное
 значение `BLOCKFIELD_WORKSHOP_SERVER`), профиль `game` — опубликованный адрес
-игры. Укажите в `workshopServer` тот же хост, что в `BLOCKFIELD_WORKSHOP_HOST`, в
-виде `raknet;<host>:25566`: вход по TCP отклоняется и для мастерской. Хосты игры и
-мастерской должны различаться: разные порты на одном хосте не разделяют профили. Адрес мастерской нужно
-явно настроить с обеих сторон; DNS и развёртывание этим репозиторием не создаются.
+игры. Укажите в `workshopServer` RakNet-адрес мастерской
+(`raknet;workshop.blockfield.pro:25567`), в game — `raknet;play.blockfield.pro:25566`.
+Адрес мастерской нужно явно настроить с обеих сторон; DNS и развёртывание этим
+репозиторием не создаются. Разные хосты на одном порту профили не разделяют
+(клиент 1.21.1 присылает rDNS/IP вместо набранного хоста) — профили разделяют
+только входящие RakNet-порты.
 
-Прокси выбирает профиль по хосту Minecraft-подключения (`Player.getVirtualHost`):
-совпадение с `BLOCKFIELD_WORKSHOP_HOST` означает мастерскую; остальные существующие
-адреса означают игру. Этот выбор не даёт прав: авторизация Drasl, ACL и `gate.json`
+Прокси выбирает профиль по входящему RakNet-порту (`Player.getVirtualHost` для
+выбора больше не используется): порт `BLOCKFIELD_WORKSHOP_PORT` (default `25567`)
+означает мастерскую, остальные RakNet-порты — игру. `BLOCKFIELD_WORKSHOP_HOST`
+остался только для совместимости ping-выдачи. Этот выбор не даёт прав: авторизация Drasl, ACL и `gate.json`
 проверяются дополнительно при каждом входе в backend. Игра и мастерская могут
 работать одновременно: допуск каждого backend задаётся отдельно. Если выбранный
 backend закрыт или не отвечает на ping, игрок ждёт в Limbo и автоматически

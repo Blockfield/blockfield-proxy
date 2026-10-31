@@ -158,6 +158,8 @@ class EntryLivenessTest(unittest.TestCase):
         self.tcp.start()
         self.udp = UdpFake()
         self.udp.start()
+        self.udp_workshop = UdpFake()
+        self.udp_workshop.start()
         self.rooms = RoomsFake({"build": TAG, "available": True})
         self.addCleanup(self.rooms.close)
         gate = {
@@ -177,6 +179,7 @@ class EntryLivenessTest(unittest.TestCase):
             proxy_host="127.0.0.1",
             tcp_port=self.tcp.port,
             udp_port=self.udp.port,
+            workshop_udp_port=self.udp_workshop.port,
             rooms_url=self.rooms.url,
             gate_file=str(self.gate_file),
             workshop_host="workshop.test",
@@ -191,8 +194,8 @@ class EntryLivenessTest(unittest.TestCase):
         results = probe.check(self.args())
         self.assertTrue(all(ok for ok, _, _ in results), results)
         self.assertEqual(
-            len(results), 5
-        )  # rooms, tcp_game, tcp_workshop, raknet, gate_file
+            len(results), 6
+        )  # rooms, tcp_game, tcp_workshop, raknet, raknet_workshop, gate_file
 
     def test_missing_workshop_host_fails_not_skips(self):
         # proxy#48: an unverified Workshop leg must fail the gate, never slip
@@ -308,6 +311,19 @@ class EntryLivenessTest(unittest.TestCase):
         results = probe.check(self.args(rooms_url=rooms.url))
         self.assertIn("rooms", [name for ok, name, _ in results if not ok])
 
+    def test_dead_workshop_raknet_port_fails(self):
+        closed = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        closed.bind(("127.0.0.1", 0))
+        port = closed.getsockname()[1]
+        closed.close()
+        results = probe.check(self.args(workshop_udp_port=port))
+        by_name = {item[1]: item[0] for item in results}
+        self.assertFalse(by_name["raknet_workshop"], results)
+        self.assertTrue(
+            all(ok for name, ok in by_name.items() if name != "raknet_workshop"),
+            results,
+        )
+
     def test_dead_raknet_fails(self):
         closed = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         closed.bind(("127.0.0.1", 0))
@@ -350,6 +366,7 @@ class EntryLivenessTest(unittest.TestCase):
         by_name = {item[1]: (item[0], item[2]) for item in results}
         self.assertTrue(all(ok for ok, _, _ in results), results)
         self.assertIn("skipped", by_name["tcp_workshop"][1].lower())
+        self.assertIn("skipped", by_name["raknet_workshop"][1].lower())
 
     def test_game_only_still_fails_a_closed_game(self):
         tcp = TcpFake(game=CLOSED, workshop=CLOSED)

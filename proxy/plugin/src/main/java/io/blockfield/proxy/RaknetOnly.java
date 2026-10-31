@@ -3,6 +3,7 @@ package io.blockfield.proxy;
 import net.kyori.adventure.text.Component;
 
 import java.lang.reflect.Method;
+import java.net.InetSocketAddress;
 import java.util.function.Consumer;
 
 /** Players log in only over RakNet; TCP 25565 stays open for status pings. */
@@ -49,6 +50,19 @@ final class RaknetOnly {
         Object minecraft = call(connection, "delegatedConnection");
         Object pipeline = call(call(minecraft, "getChannel"), "pipeline");
         return call(pipeline, "get", RAKNET_HANDLER) != null;
+    }
+
+    /**
+     * Inbound UDP port of a RakNet login: netty-raknet keeps the server-side local address (bound
+     * interface + port) on each child channel, so this is the port the client dialed. TCP has no
+     * channel here (refused by {@link #denial} before this is read).
+     *
+     * @throws ReflectiveOperationException when Velocity/Netty internals no longer match
+     */
+    static int inboundPort(Object connection) throws ReflectiveOperationException {
+        Object minecraft = call(connection, "delegatedConnection");
+        Object local = call(call(minecraft, "getChannel"), "localAddress");
+        return ((InetSocketAddress) local).getPort();
     }
 
     private static Object call(Object target, String name, Object... args)
