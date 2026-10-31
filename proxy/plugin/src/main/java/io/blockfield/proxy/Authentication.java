@@ -202,11 +202,15 @@ final class Authentication {
                         } else {
                             resolveDrasl(event.getUsername())
                                     .thenAccept(
-                                            current ->
-                                                    auth.complete(
-                                                            expected.equals(current)
-                                                                    ? current
-                                                                    : null));
+                                            current -> {
+                                                if (!expected.equals(current))
+                                                    logger.warn(
+                                                            "Remembered session for {} not"
+                                                                    + " confirmed by Drasl,"
+                                                                    + " parking in lobby",
+                                                            event.getUsername());
+                                                auth.complete(confirmSession(expected, current));
+                                            });
                         }
                     } else {
                         auth.complete(null);
@@ -268,6 +272,15 @@ final class Authentication {
         return profileId(name)
                 .exceptionally(error -> null)
                 .completeOnTimeout(null, 5, TimeUnit.SECONDS);
+    }
+
+    /**
+     * Remembered sessions never bypass Drasl: a valid token whose id Drasl cannot confirm right now
+     * parks the player in the lobby instead of entering. Drasl is a hard entry dependency for every
+     * join path, sessions included — deliberate fail-closed, no offline grace.
+     */
+    static String confirmSession(String expected, String current) {
+        return expected != null && expected.equals(current) ? current : null;
     }
 
     private final class AuthCommand implements SimpleCommand {

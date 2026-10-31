@@ -3,8 +3,11 @@ package io.blockfield.proxy;
 import static org.junit.jupiter.api.Assertions.*;
 
 import org.junit.jupiter.api.Test;
+import org.slf4j.LoggerFactory;
 
 import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Queue;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -112,6 +115,54 @@ class GatePollerTest {
         script.answers.add("{broken");
         clock.addAndGet(GatePoller.POLL_MS);
         assertTrue(poller.pollOnce().open());
+    }
+
+    @Test
+    void gateUriNormalizesSlashesAndRejectsGarbage() {
+        // P1-2: trailing slash делал путь //v1/gate и закрывал вход навсегда.
+        assertEquals(
+                "https://cp.invalid:8080/v1/gate",
+                GatePoller.gateUri("https://cp.invalid:8080/").toString());
+        assertEquals(
+                "https://cp.invalid:8080/v1/gate",
+                GatePoller.gateUri("  https://cp.invalid:8080  ").toString());
+        assertEquals(
+                "https://cp.invalid:8080/v1/gate",
+                GatePoller.gateUri("https://cp.invalid:8080").toString());
+        assertThrows(
+                IllegalArgumentException.class, () -> GatePoller.gateUri("not a url with spaces"));
+    }
+
+    @Test
+    void malformedUrlFailsClosedInsteadOfThrowing() {
+        // P0-1: битый BLOCKFIELD_CP_URL не роняет плагин: опросник закрыт с первого опроса.
+        GatePoller poller =
+                GatePoller.fromParts(
+                        "not a url with spaces", "token", LoggerFactory.getLogger("test"));
+        assertEquals("closed", poller.current().state());
+        assertEquals("closed", poller.pollOnce().state());
+        assertNull(GatePoller.fromParts(null, "token", LoggerFactory.getLogger("test")));
+        assertNull(
+                GatePoller.fromParts("https://cp.invalid", null, LoggerFactory.getLogger("test")));
+    }
+
+    @Test
+    void brokenPollerStaysClosedAndWarnsWithBackoff() {
+        AtomicLong clock = new AtomicLong(0);
+        List<String> warnings = new ArrayList<>();
+        Script script = new Script();
+        script.answers.add(new RuntimeException("down"));
+        GatePoller poller = new GatePoller(script, clock::get, warnings::add);
+        assertEquals("closed", poller.pollOnce().state());
+        assertEquals(1, warnings.size());
+        script.answers.add(new RuntimeException("still down"));
+        clock.addAndGet(1_000);
+        poller.pollOnce();
+        assertEquals(1, warnings.size(), "backoff: no repeat warn within a minute");
+        script.answers.add(new RuntimeException("still down"));
+        clock.addAndGet(GatePoller.WARN_MS);
+        poller.pollOnce();
+        assertEquals(2, warnings.size());
     }
 
     @Test

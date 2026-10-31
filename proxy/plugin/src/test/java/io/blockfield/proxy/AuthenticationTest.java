@@ -129,4 +129,16 @@ class AuthenticationTest {
             server.stop(0);
         }
     }
+
+    @Test
+    void rememberedSessionsNeedLiveDraslConfirmation() {
+        // P1-4: sessions never bypass Drasl; an unconfirmed id parks in the lobby.
+        assertEquals("id", Authentication.confirmSession("id", "id"));
+        assertNull(
+                Authentication.confirmSession("id", null),
+                "Drasl down parks a valid session, no offline grace");
+        assertNull(Authentication.confirmSession("id", "other"));
+        assertNull(Authentication.confirmSession(null, null));
+        assertNull(Authentication.confirmSession(null, "id"));
+    }
 }

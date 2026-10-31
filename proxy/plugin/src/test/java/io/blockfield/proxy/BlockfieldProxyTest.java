@@ -71,6 +71,7 @@ class BlockfieldProxyTest {
                         });
         var task = new AtomicReference<Scheduler.TaskBuilder>();
         var tick = new AtomicReference<Runnable>();
+        var shutdown = new AtomicReference<String>();
         task.set(
                 fake(
                         Scheduler.TaskBuilder.class,
@@ -93,10 +94,12 @@ class BlockfieldProxyTest {
                                     case "getCommandManager" -> manager;
                                     case "getChannelRegistrar" -> registrar;
                                     case "getScheduler" -> scheduler;
+                                    case "shutdown" -> shutdown.getAndSet("shutdown");
                                     default -> null;
                                 });
         BlockfieldProxy plugin = new BlockfieldProxy(proxy, LoggerFactory.getLogger("test"));
         plugin.onInit(new ProxyInitializeEvent());
+        assertNull(shutdown.get(), "healthy init never stops the proxy");
         assertEquals(
                 List.of(Authentication.class, BackendRouting.class, LoginForwarding.class),
                 listeners.stream().map(Object::getClass).toList());

@@ -24,9 +24,21 @@ public final class BlockfieldProxy {
     @Inject
     public BlockfieldProxy(ProxyServer proxy, Logger logger) {
         this.proxy = proxy;
-        forwarding = new LoginForwarding();
-        authentication = new Authentication(this, proxy, logger, forwarding);
-        routing = new BackendRouting(this, proxy, logger, authentication);
+        try {
+            forwarding = new LoginForwarding();
+            authentication = new Authentication(this, proxy, logger, forwarding);
+            routing = new BackendRouting(this, proxy, logger, authentication);
+        } catch (RuntimeException e) {
+            // Fail closed: a half-built plugin leaves Velocity serving with no auth
+            // gate, so stop the proxy instead of running open.
+            logger.error("Blockfield plugin failed to initialize, stopping the proxy", e);
+            try {
+                proxy.shutdown();
+            } catch (RuntimeException shutdownError) {
+                logger.error("Proxy shutdown failed", shutdownError);
+            }
+            throw e;
+        }
     }
 
     @Subscribe
