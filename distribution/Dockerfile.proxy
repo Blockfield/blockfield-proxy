@@ -16,8 +16,8 @@ LABEL org.opencontainers.image.source="https://github.com/Blockfield/blockfield-
 ENV TYPE=VELOCITY VELOCITY_VERSION=3.5.1 VELOCITY_BUILD_ID=615 MEMORY=256m JVM_OPTS="-Draknetify.velocity.portOverride=25566"
 ADD --checksum=sha256:b03cebc45c1583edf8c7456fa67f0a6248eb95a856249378173cc1ea8b8d0d68 \
     https://cdn.modrinth.com/data/9eGKb6K1/versions/ES87t4lm/voicechat-velocity-2.6.18.jar /plugins/voicechat-velocity-2.6.18.jar
-ADD --checksum=sha256:87fc0ca3ac5614c77f657c2c1337e589438f4d1bf4a8e90523409ea15d6465bd \
-    https://cdn.modrinth.com/data/5IovSY3u/versions/u3LRuC7t/raknetify-velocity-0.1.0%2Balpha.5.196-all.jar /plugins/raknetify-velocity-0.1.0+alpha.5.196-all.jar
+ADD --checksum=sha256:539c975ce52feabf6b7d41a98573c6e29e73b16a9c7acae9aa8460ce3ff1fec7 \
+    https://github.com/Blockfield/raknetify/releases/download/bf2/raknetify-velocity-0.1.0+alpha.5.1-bf2-all.jar /plugins/raknetify-velocity-0.1.0+alpha.5.1-bf2-all.jar
 COPY proxy/plugin/build/libs/blockfield-proxy-1.0.0.jar /plugins/blockfield-proxy.jar
 COPY proxy/velocity.toml /config/velocity.toml
 COPY proxy/lobby/ /opt/lobby/
