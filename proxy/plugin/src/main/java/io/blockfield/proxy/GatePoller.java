@@ -37,7 +37,7 @@ final class GatePoller {
     private final Consumer<String> warn;
     private volatile Gate gate = Gate.closed();
     private volatile long freshAt = 0;
-    private volatile long lastWarnMs = 0;
+    private volatile long lastWarnMs = -WARN_MS;
 
     GatePoller(Fetcher fetcher, Clock clock) {
         this(fetcher, clock, message -> {});
