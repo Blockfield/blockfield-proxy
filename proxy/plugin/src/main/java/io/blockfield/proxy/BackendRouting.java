@@ -49,7 +49,7 @@ final class BackendRouting {
     /** Inbound RakNet UDP port of the Workshop profile; -1 disables port routing. */
     private final int workshopPort;
 
-    /** Default Workshop port; the proxy image binds it via raknetify's workshopPort property. */
+    /** Default Workshop port; bound by raknetify via start-proxy.sh defaults. */
     static final int DEFAULT_WORKSHOP_PORT = 25567;
 
     private static final Duration LOGIN_TIMEOUT = Duration.ofMinutes(5);
@@ -138,7 +138,8 @@ final class BackendRouting {
             // Fail closed, never throw: an invalid value disables Workshop routing, so every
             // login falls through to Game instead of failing open to Workshop.
             logger.error(
-                    "BLOCKFIELD_WORKSHOP_PORT is not a valid port ({}); Workshop entry is disabled",
+                    "BLOCKFIELD_RAKNET_WORKSHOP_PORT is not a valid port ({}); Workshop entry is"
+                            + " disabled",
                     workshopPort);
             workshopPort = -1;
         }
@@ -191,7 +192,7 @@ final class BackendRouting {
     }
 
     private static int workshopPortFromEnv() {
-        String raw = System.getenv("BLOCKFIELD_WORKSHOP_PORT");
+        String raw = System.getenv("BLOCKFIELD_RAKNET_WORKSHOP_PORT");
         if (raw == null || raw.isBlank()) return DEFAULT_WORKSHOP_PORT;
         try {
             return Integer.parseInt(raw.strip());
