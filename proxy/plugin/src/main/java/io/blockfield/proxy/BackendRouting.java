@@ -60,7 +60,8 @@ final class BackendRouting {
                     .filter(s -> !s.isBlank())
                     .map(Path::of)
                     .orElse(null);
-    private volatile Gate gate = Gate.load(gateFile);
+    private volatile Gate fileGate = Gate.load(gateFile);
+    private volatile Gate gate = fileGate;
     private volatile FileTime gateStamp;
     // U1: с BLOCKFIELD_CP_URL вход читается из control-plane (файл — запасной путь лишь без CP).
     private final GatePoller gatePoller = GatePoller.fromEnv();
@@ -166,24 +167,10 @@ final class BackendRouting {
     }
 
     private void reloadGate() {
-        if (gatePoller != null) {
-            Gate next = gatePoller.current();
-            if (!next.equals(gate)) {
-                logger.info("Gate from control-plane: game={}", next.forBackend("game").state());
-                gate = next;
-            }
-            return;
-        }
-        if (gateFile == null) return;
-        FileTime stamp;
-        try {
-            stamp = Files.getLastModifiedTime(gateFile);
-        } catch (java.io.IOException e) {
-            stamp = null;
-        }
-        if (stamp != null && stamp.equals(gateStamp)) return;
-        gateStamp = stamp;
-        Gate next = Gate.load(gateFile);
+        boolean fileChanged = reloadGateFile();
+        if (gatePoller == null && !fileChanged) return;
+        // CP owns game entry only; the Workshop keeps the controller's gate.json rules.
+        Gate next = gatePoller == null ? fileGate : fileGate.withGame(gatePoller.current());
         if (!next.equals(gate))
             logger.info(
                     "Gate game={} workshop={} ({} workshop members)",
@@ -191,6 +178,20 @@ final class BackendRouting {
                     next.forBackend("workshop").state(),
                     next.forBackend("workshop").allowed().size());
         gate = next;
+    }
+
+    private boolean reloadGateFile() {
+        if (gateFile == null) return false;
+        FileTime stamp;
+        try {
+            stamp = Files.getLastModifiedTime(gateFile);
+        } catch (java.io.IOException e) {
+            stamp = null;
+        }
+        if (stamp != null && stamp.equals(gateStamp)) return false;
+        gateStamp = stamp;
+        fileGate = Gate.load(gateFile);
+        return true;
     }
 
     /**
