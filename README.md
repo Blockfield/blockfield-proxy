@@ -37,10 +37,14 @@ Raknetify перепроверьте вход по RakNet (оба порта) и
 Backend Fabric не требует Raknetify: UDP завершается на Velocity, внутреннее
 соединение с game/workshop остаётся TCP.
 
-Velocity запускается с `-Draknetify.velocity.portOverride=25566
--Draknetify.velocity.workshopPort=25567` через `JVM_OPTS`.
-При настройке `JVM_OPTS` в Dokploy сохраните обе property. UDP 25565 занят Simple
-Voice Chat; его конфигурация не меняется.
+Velocity получает RakNet-порты флагами `-Draknetify.velocity.portOverride` и
+`-Draknetify.velocity.workshopPort`, которые собирает `start-proxy.sh` из env
+при старте контейнера (та же идея, что интерполяция velocity.toml у itzg):
+`BLOCKFIELD_RAKNET_GAME_PORT` (default `25566`) и
+`BLOCKFIELD_RAKNET_WORKSHOP_PORT` (default `25567`). Dockerfile больше не
+хардкодит порты, а `JVM_OPTS` из Dokploy чисто добавочный: лишние java-флаги
+уже не могут уронить порты. UDP 25565 занят Simple Voice Chat; его
+конфигурация не меняется.
 
 Dokploy `blockfield-proxy-niocmj` публикует **UDP 25566 → 25566 и UDP 25567 → 25567,
 mode host** (порты открыты в firewall), TCP 25565 (status ping) и UDP 25565
@@ -48,7 +52,11 @@ mode host** (порты открыты в firewall), TCP 25565 (status ping) и 
 launcher не видит статус сервера.
 Изменение Dokploy и Deploy proxy выполняет владелец отдельно; PR их не выполняет. `BLOCKFIELD_WORKSHOP_HOST` (имя хоста мастерской) остаётся для
 совместимости ping-выдачи; выбор профиля при входе — только по входящему
-RakNet-порту (`BLOCKFIELD_WORKSHOP_PORT`, default `25567`).
+RakNet-порту: порт `BLOCKFIELD_RAKNET_WORKSHOP_PORT` (default `25567`)
+означает мастерскую, остальные RakNet-порты — игру. Порт игры задаётся
+`BLOCKFIELD_RAKNET_GAME_PORT` (default `25566`). Оба значения видны и
+меняются в Dokploy; дефолты совпадают с продом, поэтому отдельная настройка
+не требуется.
 
 Raknetify all-in-one распространяется под **GPLv3** (включает netty-raknet);
 исходники и условия: [Raknetify](https://github.com/RelativityMC/raknetify),
@@ -100,7 +108,8 @@ DNS-имени и завершающая точка не влияют на ср�
 только входящие RakNet-порты.
 
 Прокси выбирает профиль по входящему RakNet-порту (`Player.getVirtualHost` для
-выбора больше не используется): порт `BLOCKFIELD_WORKSHOP_PORT` (default `25567`)
+выбора больше не используется): порт `BLOCKFIELD_RAKNET_WORKSHOP_PORT`
+(default `25567`)
 означает мастерскую, остальные RakNet-порты — игру. `BLOCKFIELD_WORKSHOP_HOST`
 остался только для совместимости ping-выдачи. Этот выбор не даёт прав: авторизация Drasl, ACL и `gate.json`
 проверяются дополнительно при каждом входе в backend. Игра и мастерская могут

@@ -13,7 +13,10 @@ RUN cd /src && git apply /tmp/limbo-patches/*.patch && mvn -q -B -DskipTests pac
 # Обновление — отдельным PR с новым digest тега java21.
 FROM itzg/mc-proxy:java21@sha256:e65f52bd44a223181a62c3516d5bbdff7ec185ec527bf43e98175d74290ec94f AS runtime-base
 LABEL org.opencontainers.image.source="https://github.com/Blockfield/blockfield-proxy"
-ENV TYPE=VELOCITY VELOCITY_VERSION=3.5.1 VELOCITY_BUILD_ID=615 MEMORY=256m JVM_OPTS="-Draknetify.velocity.portOverride=25566 -Draknetify.velocity.workshopPort=25567"
+ENV TYPE=VELOCITY VELOCITY_VERSION=3.5.1 VELOCITY_BUILD_ID=615 MEMORY=256m
+# No JVM_OPTS default: start-proxy.sh appends the RakNet port flags from
+# BLOCKFIELD_RAKNET_GAME_PORT/_WORKSHOP_PORT (defaults 25566/25567) at
+# container start, so extra Dokploy JVM_OPTS can never drop the ports.
 ADD --checksum=sha256:b03cebc45c1583edf8c7456fa67f0a6248eb95a856249378173cc1ea8b8d0d68 \
     https://cdn.modrinth.com/data/9eGKb6K1/versions/ES87t4lm/voicechat-velocity-2.6.18.jar /plugins/voicechat-velocity-2.6.18.jar
 # Blockfield fork (bf3): upstream 76ab30a + SYNC FrameData release fix + second RakNet
@@ -25,6 +28,7 @@ COPY proxy/velocity.toml /config/velocity.toml
 COPY proxy/lobby/ /opt/lobby/
 RUN chown -R 1000:1000 /opt/lobby
 COPY --chmod=755 proxy/start-proxy.sh /start-blockfield-proxy
+COPY --chmod=644 proxy/raknet-ports.sh /opt/proxy/raknet-ports.sh
 EXPOSE 25565/tcp 25565/udp 25566/udp 25567/udp
 CMD ["/start-blockfield-proxy"]
 
