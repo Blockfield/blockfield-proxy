@@ -43,6 +43,31 @@ class GatePollerTest {
     }
 
     @Test
+    void controlPlaneOwnsGameEntryAndKeepsTheWorkshopGate() {
+        // 2026-10-31: with CP enabled the proxy replaced gate.json, closing the Workshop for all.
+        String id = "f3e1b9a622703dee8782b7cdd8519efe";
+        Gate file =
+                Gate.parse(
+                        "{\"schema\":1,\"gate\":\"public\",\"backend\":\"game\",\"message\":\"\","
+                            + "\"allowed\":[],\"backends\":{"
+                            + "\"game\":{\"gate\":\"closed\",\"message\":\"\",\"allowed\":[]},"
+                            + "\"workshop\":{\"gate\":\"builders\",\"message\":\"\",\"allowed\":"
+                            + "[{\"draslId\":\""
+                                + id
+                                + "\",\"name\":\"NetherG\"}]}}}");
+        Gate open = file.withGame(Gate.fromCp("open", ""));
+        assertTrue(open.allows("workshop", id, "NetherG", false));
+        assertFalse(open.allows("workshop", null, "Anyone", false));
+        assertTrue(open.allows("game", null, "Anyone", false));
+        Gate maintenance = file.withGame(Gate.fromCp("maintenance", ""));
+        assertFalse(maintenance.allows("game", null, "Anyone", true));
+        assertTrue(maintenance.allows("workshop", id, "NetherG", false));
+        Gate cpDown = file.withGame(Gate.closed());
+        assertFalse(cpDown.allows("game", null, "Anyone", true));
+        assertTrue(cpDown.allows("workshop", id, "NetherG", false));
+    }
+
+    @Test
     void corruptAnswersNeverMoveTheProjection() {
         assertNull(GatePoller.parse("{"));
         assertNull(GatePoller.parse("[]"));

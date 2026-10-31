@@ -60,6 +60,17 @@ record Gate(
         };
     }
 
+    /** This file gate with the control-plane decision for game entry; Workshop rules unchanged. */
+    Gate withGame(Gate controlPlane) {
+        Gate game = controlPlane.forBackend("game");
+        return new Gate(
+                game.state,
+                "game",
+                game.message,
+                game.allowed,
+                Map.of("game", game, "workshop", forBackend("workshop")));
+    }
+
     Gate forBackend(String server) {
         if (!backends.isEmpty()) return backends.getOrDefault(server, closed());
         return server.equals(backend) ? this : closed();
