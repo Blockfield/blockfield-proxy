@@ -19,12 +19,8 @@ jobs:
   deploy:
     runs-on: blockfield-deploy
     env:
-      # Pins the proxy's digest-pinned Dokploy image and redeploys it.
-      # One-time owner setup (see README.md): DOKPLOY_API_URL (Dokploy
-      # dashboard base URL) and DOKPLOY_API_TOKEN (profile settings -> API/CLI)
-      # repository secrets. No registry credentials are stored in the app.
-      DOKPLOY_API_URL: ${{ secrets.DOKPLOY_API_URL }}
-      DOKPLOY_API_TOKEN: ${{ secrets.DOKPLOY_API_TOKEN }}
+      # Redeploys only the proxy's release-only :prod channel; no Dokploy API key in Actions.
+      DOKPLOY_PROXY_WEBHOOK: ${{ secrets.DOKPLOY_PROXY_WEBHOOK }}
     # Rollout and its rollback at the deploy-webhooks.py limits.
     timeout-minutes: 60
     steps:
