@@ -19,7 +19,6 @@ Blacksmith проверяет main и PR. Тег `v*` публикует `ghcr.i
 
 ## Транспорт клиента
 
-<<<<<<< HEAD
 Игрок входит только по RakNet (решение владельца 2026-10-18): адрес
 `raknet;play.blockfield.pro:25566`, Raknetify `0.1.0+alpha.5.1-bf2` (Velocity,
 наш патченый билд [Blockfield/raknetify@bf2](https://github.com/Blockfield/raknetify/releases/tag/bf2),
@@ -35,16 +34,6 @@ Velocity/Raknetify после обновления не совпали, proxy п
 Raknetify перепроверьте вход по RakNet и отказ TCP.
 Backend Fabric не требует Raknetify: UDP завершается на Velocity, внутреннее
 соединение с game/workshop остаётся TCP.
-=======
-По умолчанию клиент подключается к `raknet;play.blockfield.pro:25566` через
-Raknetify `0.1.0+alpha.5.1-bf2` (Velocity, наш патченый билд
-[`Blockfield/raknetify@bf2`](https://github.com/Blockfield/raknetify/releases/tag/bf2),
-SHA256 закреплён в Dockerfile). TCP `play.blockfield.pro:25565` остаётся доступен
-для ручного подключения и однократного fallback клиента до завершения login.
-Клиент запоминает TCP для этого сервера до закрытия игры; отмена подключения и
-отключение после login не вызывают retry. Backend Fabric не требует Raknetify:
-UDP завершается на Velocity, внутреннее соединение с game/workshop остаётся TCP.
->>>>>>> 29d7bec (Pin raknetify-velocity bf2 (SYNC FrameData release fix))
 
 Velocity запускается с `-Draknetify.velocity.portOverride=25566` через `JVM_OPTS`.
 При настройке `JVM_OPTS` в Dokploy сохраните эту property. UDP 25565 занят Simple
