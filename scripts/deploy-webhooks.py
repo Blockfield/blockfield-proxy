@@ -1,9 +1,11 @@
 """Deploy an exact release through the app's Dokploy webhook. Actions hold only webhook URLs, never a Dokploy API key.
 
 The Dokploy webhook redeploys only the image configured in the app and answers before pulling. So every app is
-configured once with its channel tag ghcr.io/blockfield/<app>:latest. deploy() points the channel at the validated
-digest, calls the webhook and returns only when the Dokploy log shows the pull of that digest, every running task
-of the swarm service runs it healthy and swarm has closed the update's monitor window.
+configured once with its release-only channel tag ghcr.io/blockfield/<app>:prod: main builds keep their own tags
+and only the Deploy workflow moves :prod, by digest
+(`docker buildx imagetools create --tag <image>:prod <image>@sha256:<digest>`). deploy() points the channel at
+the validated digest, calls the webhook and returns only when the Dokploy log shows the pull of that digest,
+every running task of the swarm service runs it healthy and swarm has closed the update's monitor window.
 
     deploy-webhooks.py digest <app> <vX.Y.Z>   registry digest of a release image
     deploy-webhooks.py current <app>           digest of the running image (the exact rollback target)
@@ -182,7 +184,7 @@ def call(service, note):
     # so a secret pasted into the wrong repository cannot redeploy another app.
     body = {
         "repository": {"repo_name": REGISTRY + service},
-        "push_data": {"tag": "latest", "pusher": note},
+        "push_data": {"tag": "prod", "pusher": note},
     }
     request = urllib.request.Request(
         os.environ[APPS[service][1]],
@@ -263,11 +265,11 @@ def deploy(service, digest):
             "imagetools",
             "create",
             "--tag",
-            f"{image}:latest",
+            f"{image}:prod",
             f"{image}@{digest}",
         )
         wait(
-            lambda: registry_digest(f"{image}:latest") == digest,
+            lambda: registry_digest(f"{image}:prod") == digest,
             120,
             f"{service}: registry does not serve the new channel",
         )
