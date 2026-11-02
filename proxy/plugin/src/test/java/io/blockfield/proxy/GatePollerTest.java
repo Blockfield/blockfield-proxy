@@ -134,6 +134,22 @@ class GatePollerTest {
     }
 
     @Test
+    void gateUriStripsPathQueryAndFragment() {
+        // P1-2 remainder: a path prefix made the poll path /prefix/v1/gate, CP 404s on
+        // exact-path match, entry closed from boot forever.
+        assertEquals(
+                "https://cp.invalid:8080/v1/gate",
+                GatePoller.gateUri("https://cp.invalid:8080/prefix").toString());
+        assertEquals(
+                "https://cp.invalid:8080/v1/gate",
+                GatePoller.gateUri("https://cp.invalid:8080/prefix/?next=1#frag").toString());
+        assertEquals(
+                "http://[::1]:8080/v1/gate",
+                GatePoller.gateUri("http://[::1]:8080/prefix/").toString());
+        assertThrows(IllegalArgumentException.class, () -> GatePoller.gateUri("cp.invalid:8080"));
+    }
+
+    @Test
     void malformedUrlFailsClosedInsteadOfThrowing() {
         // P0-1: битый BLOCKFIELD_CP_URL не роняет плагин: опросник закрыт с первого опроса.
         GatePoller poller =
