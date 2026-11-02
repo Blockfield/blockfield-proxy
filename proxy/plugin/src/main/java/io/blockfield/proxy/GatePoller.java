@@ -7,6 +7,7 @@ import org.slf4j.Logger;
 
 import java.io.IOException;
 import java.net.URI;
+import java.net.URISyntaxException;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
@@ -50,12 +51,33 @@ final class GatePoller {
     }
 
     /**
-     * Normalized control-plane gate URI. A trailing slash (or whitespace) must not turn the poll
-     * path into {@code //v1/gate}; throws IllegalArgumentException on malformed input.
+     * Normalized control-plane gate URI. A trailing slash must not turn the poll path into {@code
+     * //v1/gate}, and a path prefix, query or fragment must not move it elsewhere: CP matches the
+     * exact path /v1/gate, so anything else 404s every poll and closes entry from boot. Throws
+     * IllegalArgumentException on malformed input.
      */
     static URI gateUri(String raw) {
         String base = raw.strip().replaceAll("/+$", "");
-        return URI.create(base + "/v1/gate");
+        URI parsed;
+        try {
+            parsed = new URI(base);
+        } catch (URISyntaxException e) {
+            throw new IllegalArgumentException("invalid control-plane URL: " + base, e);
+        }
+        if (parsed.getScheme() == null || parsed.getHost() == null)
+            throw new IllegalArgumentException("invalid control-plane URL: " + base);
+        try {
+            return new URI(
+                    parsed.getScheme(),
+                    null,
+                    parsed.getHost(),
+                    parsed.getPort(),
+                    "/v1/gate",
+                    null,
+                    null);
+        } catch (URISyntaxException e) {
+            throw new IllegalArgumentException("invalid control-plane URL: " + base, e);
+        }
     }
 
     /**
