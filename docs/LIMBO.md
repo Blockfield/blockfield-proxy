@@ -47,6 +47,6 @@ Reader связывает selection с `limbo/head.json`, manifest выбран�
 
 Остановка и ручной Deploy прокси прерывают подключения игроков и требуют явного подтверждения владельца. Эти операции не выполняются проверкой документации или сборкой.
 
-При изменении контракта обновляйте этот документ, руководство workshop и [карту workspace](https://github.com/Blockfield/blockfield-workspace-private/blob/main/docs/ARCHITECTURE.md). Проверяйте producer, controller и proxy вместе.
+При изменении контракта обновляйте этот документ, руководство workshop и [карту workspace](https://github.com/Blockfield/blockfield-workspace/blob/main/docs/ARCHITECTURE.md). Проверяйте producer, controller и proxy вместе.
 
 Проверки: `just check`, `just build`. `LimboSelectionTest` проверяет привязку версии/config/spawn, сохранение остальных properties и отказ до замены runtime при повреждённом файле или устаревшем HEAD. Runtime приёмка экспорта и перезапуска ведётся отдельно.
