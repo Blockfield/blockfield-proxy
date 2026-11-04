@@ -60,6 +60,8 @@ final class BackendRouting {
             "Игровой сервер перезапускается. Вернём вас автоматически, как только он поднимется.";
     static final String WORKSHOP_WAKING =
             "Мастерская просыпается, это займёт 1–2 минуты. Переподключитесь позже.";
+    static final String DEPLOYING_GAME =
+            "Игровой сервер обновляется, это займёт несколько минут. Переподключитесь позже.";
     private static final long WAKE_INTERVAL_MS = TimeUnit.MINUTES.toMillis(1);
 
     private final Path gateFile =
@@ -214,6 +216,19 @@ final class BackendRouting {
             }
         }
         return host;
+    }
+
+    /**
+     * Deploy in progress reads as such instead of "server dead". An explicit operator message still
+     * wins; admission and limbo/lobby fallback are unchanged.
+     */
+    static String displayText(Gate selected, String backend, String blankText) {
+        if (backend.equals("game")
+                && selected.deploying()
+                && !selected.open()
+                && (selected.message().isBlank()
+                        || selected.message().equals(Gate.DEFAULT_MESSAGE))) return DEPLOYING_GAME;
+        return selected.message().isBlank() ? blankText : selected.message();
     }
 
     private String requestedBackend(InboundConnection connection) {
@@ -381,11 +396,12 @@ final class BackendRouting {
                 && selected.member(
                         authentication.profileId(player.getUniqueId()), player.getUsername()))
             return WORKSHOP_WAKING;
-        return selected.message().isBlank()
-                ? backend.equals("workshop")
+        return displayText(
+                selected,
+                backend,
+                backend.equals("workshop")
                         ? "Мастерская сейчас недоступна."
-                        : "Игровой сервер недоступен."
-                : selected.message();
+                        : "Игровой сервер недоступен.");
     }
 
     @Subscribe
@@ -399,9 +415,7 @@ final class BackendRouting {
                             .asBuilder()
                             .description(
                                     Component.text(
-                                            selected.message().isBlank()
-                                                    ? "Мастерская Blockfield"
-                                                    : selected.message(),
+                                            displayText(selected, backend, "Мастерская Blockfield"),
                                             NamedTextColor.GOLD))
                             .build());
         }

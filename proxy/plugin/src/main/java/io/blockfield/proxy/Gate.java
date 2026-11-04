@@ -26,7 +26,8 @@ record Gate(
         String backend,
         String message,
         Set<Member> allowed,
-        Map<String, Gate> backends) {
+        Map<String, Gate> backends,
+        boolean deploying) {
     static final String DEFAULT_MESSAGE =
             "На сервере проводятся технические работы. Обычный вход временно недоступен.";
     static final Gate OPEN = new Gate("public", "game", "", Set.of());
@@ -36,7 +37,20 @@ record Gate(
     record Member(String draslId, String name) {}
 
     Gate(String state, String backend, String message, Set<Member> allowed) {
-        this(state, backend, message, allowed, Map.of());
+        this(state, backend, message, allowed, Map.of(), false);
+    }
+
+    Gate(
+            String state,
+            String backend,
+            String message,
+            Set<Member> allowed,
+            Map<String, Gate> backends) {
+        this(state, backend, message, allowed, backends, false);
+    }
+
+    Gate(String state, String backend, String message, Set<Member> allowed, boolean deploying) {
+        this(state, backend, message, allowed, Map.of(), deploying);
     }
 
     static Gate closed() {
@@ -63,12 +77,17 @@ record Gate(
     /** This file gate with the control-plane decision for game entry; Workshop rules unchanged. */
     Gate withGame(Gate controlPlane) {
         Gate game = controlPlane.forBackend("game");
+        // A Game deploy in progress survives the control-plane merge: the CP decides entry,
+        // the gate file carries the deploy flag.
+        boolean deploying = forBackend("game").deploying;
+        Gate merged = new Gate(game.state, game.backend, game.message, game.allowed, deploying);
         return new Gate(
-                game.state,
-                "game",
-                game.message,
-                game.allowed,
-                Map.of("game", game, "workshop", forBackend("workshop")));
+                merged.state,
+                merged.backend,
+                merged.message,
+                merged.allowed,
+                Map.of("game", merged, "workshop", forBackend("workshop")),
+                deploying);
     }
 
     Gate forBackend(String server) {
@@ -132,7 +151,8 @@ record Gate(
             JsonElement schema = json.get("schema");
             if (!schema.isJsonPrimitive()
                     || !schema.getAsJsonPrimitive().isNumber()
-                    || !schema.getAsString().equals("1")) return closed();
+                    || !(schema.getAsString().equals("1") || schema.getAsString().equals("2")))
+                return closed();
             Gate legacy = parseEntry(json, string(json, "backend"));
             if (!json.has("backends")) return legacy;
             JsonObject entries = json.getAsJsonObject("backends");
@@ -145,6 +165,19 @@ record Gate(
         } catch (RuntimeException e) {
             return closed();
         }
+    }
+
+    /**
+     * Deploy-in-progress flag (schema-2 readers use it, schema-1 never has it): absent is false,
+     * any other shape fails closed with the entry.
+     */
+    private static boolean optionalDeploying(JsonObject json) {
+        if (!json.has("deploying")) return false;
+        JsonElement value = json.get("deploying");
+        if (!value.isJsonPrimitive() || !value.getAsJsonPrimitive().isBoolean()) {
+            throw new IllegalArgumentException("Invalid deploying flag");
+        }
+        return value.getAsBoolean();
     }
 
     private static Gate parseBackend(JsonObject entries, String backend) {
@@ -198,6 +231,6 @@ record Gate(
             }
             allowed.add(new Member(id, name));
         }
-        return new Gate(state, backend, message, Set.copyOf(allowed));
+        return new Gate(state, backend, message, Set.copyOf(allowed), optionalDeploying(json));
     }
 }
