@@ -394,6 +394,31 @@ class BackendRoutingTest {
                                 : null);
     }
 
+    @Test
+    void deployingGameShowsDeployInProgress() {
+        Gate deploying =
+                Gate.parse(
+                        "{\"schema\":2,\"revision\":1,\"gate\":\"closed\",\"backend\":\"game\","
+                                + "\"message\":\"\",\"allowed\":[],\"deploying\":true}");
+        assertEquals(
+                BackendRouting.DEPLOYING_GAME,
+                BackendRouting.displayText(deploying, "game", "Игровой сервер недоступен."));
+        Gate custom =
+                Gate.parse(
+                        "{\"schema\":2,\"revision\":1,\"gate\":\"closed\",\"backend\":\"game\",\"message\":\"Скоро"
+                            + " вернёмся\",\"allowed\":[],\"deploying\":true}");
+        assertEquals(
+                "Скоро вернёмся",
+                BackendRouting.displayText(custom, "game", "Игровой сервер недоступен."));
+        Gate workshop =
+                Gate.parse(
+                        "{\"schema\":1,\"gate\":\"closed\",\"backend\":\"workshop\",\"message\":\"Техработы\","
+                            + "\"allowed\":[]}");
+        assertEquals(
+                "Техработы",
+                BackendRouting.displayText(workshop, "workshop", "Мастерская сейчас недоступна."));
+    }
+
     private static final class Fixture {
         final Map<String, RegisteredServer> servers = new HashMap<>();
         final Map<String, CompletableFuture<ServerPing>> pings = new HashMap<>();

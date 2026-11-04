@@ -51,7 +51,7 @@ class GateTest {
                 new String[] {
                     "{",
                     "[]",
-                    "{\"schema\":2,\"gate\":\"public\",\"backend\":\"game\",\"message\":\"\",\"allowed\":[]}",
+                    "{\"schema\":3,\"gate\":\"public\",\"backend\":\"game\",\"message\":\"\",\"allowed\":[]}",
                     gate("staging", "game", ""),
                     gate("public", "staging", ""),
                     gate("builders", "workshop", "{\"draslId\":\"x\",\"name\":\"Nether\"}"),
@@ -222,6 +222,69 @@ class GateTest {
                 assertFalse(gate.allows("game", ID, "Nether", true), backend + ":" + state);
                 assertFalse(gate.allows("workshop", ID, "Nether", true), backend + ":" + state);
             }
+        }
+    }
+
+    @Test
+    void schemaTwoParsesLikeSchemaOne() {
+        String schema1 =
+                dual(
+                        "{\"game\":"
+                                + entry("public", "Game", "")
+                                + ",\"workshop\":"
+                                + entry("closed", "", "")
+                                + "}");
+        Gate one = Gate.parse(schema1);
+        Gate two = Gate.parse(schema1.replace("\"schema\":1", "\"schema\":2"));
+        assertTrue(two.allows("game", null, "Anyone", false));
+        assertFalse(two.allows("workshop", ID, "Nether", true));
+        assertEquals(one.state(), two.state());
+        assertEquals(one.message(), two.message());
+    }
+
+    @Test
+    void deployingFlagMarksGameDeployInProgress() {
+        String doc =
+                "{\"schema\":2,\"revision\":3,\"gate\":\"closed\",\"backend\":\"game\","
+                    + "\"message\":\"\",\"allowed\":[],\"deploying\":true,\"backends\":{\"game\":"
+                    + "{\"gate\":\"closed\",\"message\":\"\",\"allowed\":[],\"deploying\":true},"
+                    + "\"workshop\":"
+                        + entry("closed", "", "")
+                        + "}}";
+        Gate gate = Gate.parse(doc);
+        assertTrue(gate.forBackend("game").deploying());
+        assertFalse(gate.forBackend("workshop").deploying());
+        assertFalse(gate.allows("game", ID, "Nether", true));
+    }
+
+    @Test
+    void legacySchemaOneWithoutDeployingStaysFalse() {
+        Gate legacy = Gate.parse(gate("closed", "game", ""));
+        assertFalse(legacy.deploying());
+        assertFalse(legacy.forBackend("game").deploying());
+        Gate dualGate =
+                Gate.parse(
+                        dual(
+                                "{\"game\":"
+                                        + entry("closed", "", "")
+                                        + ",\"workshop\":"
+                                        + entry("closed", "", "")
+                                        + "}"));
+        assertFalse(dualGate.forBackend("game").deploying());
+    }
+
+    @Test
+    void nonBooleanDeployingOrSchemaThreeFailsClosed() {
+        for (String bad :
+                new String[] {
+                    "{\"schema\":2,\"gate\":\"public\",\"backend\":\"game\",\"message\":\"\","
+                            + "\"allowed\":[],\"deploying\":\"yes\"}",
+                    "{\"schema\":3,\"gate\":\"public\",\"backend\":\"game\",\"message\":\"\","
+                            + "\"allowed\":[]}"
+                }) {
+            Gate loaded = Gate.parse(bad);
+            assertEquals("closed", loaded.state(), bad);
+            assertFalse(loaded.deploying(), bad);
         }
     }
 }
