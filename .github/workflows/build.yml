@@ -234,7 +234,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Release text
-        uses: Blockfield/blockfield-workspace-private/.github/actions/release-text@9c2b9371f09f7ce48d31361d071bbbe00d9bffde
+        uses: Blockfield/blockfield-workspace/.github/actions/release-text@2312b5ae17d407036e07881027e1fdee36e74e91
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           RELEASE_TEXT_MODEL: ${{ vars.RELEASE_TEXT_MODEL }}
