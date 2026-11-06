@@ -137,6 +137,24 @@ if __name__ == "__main__":
     unittest.main()
 
 
+class HostDataTolerance(unittest.TestCase):
+    """Corrupt host data never crashes a deploy before or after the swap."""
+
+    def test_non_utf8_history_reads_valid_lines(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "deploy-history.jsonl"
+            path.write_bytes(b'{"surface": "proxy"}\n\xff\xfe torn\n')
+            self.assertEqual(deploy.read_history(path), [{"surface": "proxy"}])
+
+    def test_non_object_build_json_is_ignored(self):
+        for raw in ("[]", "null", "1"):
+            with (
+                self.subTest(raw=raw),
+                patch.object(deploy, "docker", return_value=raw),
+            ):
+                self.assertEqual(deploy.build_info("blockfield-server", DIGEST), {})
+
+
 class DeployHistoryTest(unittest.TestCase):
     """A finished rollout appends to the host deploy history and warms the previous digest."""
 
