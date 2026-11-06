@@ -25,6 +25,7 @@ import com.velocitypowered.api.proxy.server.ServerInfo;
 import com.velocitypowered.api.proxy.server.ServerPing;
 
 import net.kyori.adventure.text.Component;
+import net.kyori.adventure.text.format.NamedTextColor;
 
 import org.junit.jupiter.api.Test;
 import org.slf4j.LoggerFactory;
@@ -113,6 +114,39 @@ class BackendRoutingTest {
         unset.authenticate(legacy);
         unset.gate("builders", "workshop", "Builder");
         assertFalse(unset.connect(legacy, "workshop").getResult().isAllowed());
+    }
+
+    @Test
+    void workshopPackContractGatesWorkshopLegOnly() throws Exception {
+        String workshopPack = "a".repeat(64);
+        String gamePack = "b".repeat(64);
+        var fixture =
+                new Fixture("workshop.invalid", BackendRouting.DEFAULT_WORKSHOP_PORT, workshopPack);
+        Player builder = fixture.player(UUID.randomUUID(), "workshop.invalid", "Builder");
+        Player gamer = fixture.player(UUID.randomUUID(), "game.invalid", "Gamer");
+        fixture.authenticate(builder);
+        fixture.authenticate(gamer);
+        fixture.dualGate("public", "builders", "Builder");
+        // No contract reply: workshop leg denied with the pack message, game leg open.
+        assertFalse(fixture.connect(builder, "workshop").getResult().isAllowed());
+        assertTrue(fixture.connect(gamer, "game").getResult().isAllowed());
+        // Game-only pack on the workshop leg: denied, with a clear message.
+        fixture.forwarding.rememberContract(
+                builder.getUniqueId(), Authentication.utf(gamePack + ":9"));
+        fixture.forwarding.rememberContract(
+                gamer.getUniqueId(), Authentication.utf(gamePack + ":9"));
+        assertFalse(fixture.connect(builder, "workshop").getResult().isAllowed());
+        assertTrue(
+                fixture.connect(gamer, "game").getResult().isAllowed(),
+                "game leg ignores the Workshop pack gate");
+        assertEquals(
+                Component.text(BackendRouting.WORKSHOP_PACK_MESSAGE, NamedTextColor.GOLD),
+                fixture.messages.get(builder.getUniqueId()).getLast());
+        // Workshop pack on the workshop leg: admitted.
+        fixture.forwarding.rememberContract(
+                builder.getUniqueId(), Authentication.utf(workshopPack + ":9"));
+        assertTrue(fixture.connect(builder, "workshop").getResult().isAllowed());
+        assertEquals(fixture.servers.get("workshop"), fixture.choose(builder));
     }
 
     @Test
@@ -425,6 +459,8 @@ class BackendRoutingTest {
         final List<Player> players = new ArrayList<>();
         final Map<UUID, RegisteredServer> current = new HashMap<>();
         final Map<UUID, List<String>> requests = new HashMap<>();
+        final Map<UUID, List<Component>> messages = new HashMap<>();
+        final LoginForwarding forwarding;
         final Authentication authentication;
         final BackendRouting routing;
 
@@ -433,6 +469,10 @@ class BackendRoutingTest {
         }
 
         Fixture(String host, int port) {
+            this(host, port, "");
+        }
+
+        Fixture(String host, int port, String workshopContract) {
             for (String name : List.of("lobby", "game", "workshop")) {
                 pings.put(name, new CompletableFuture<>());
                 servers.put(
@@ -461,23 +501,26 @@ class BackendRoutingTest {
                                         case "getAllPlayers" -> players;
                                         default -> null;
                                     });
+            forwarding = new LoginForwarding();
             authentication =
-                    new Authentication(
-                            this, proxy, LoggerFactory.getLogger("test"), new LoginForwarding());
+                    new Authentication(this, proxy, LoggerFactory.getLogger("test"), forwarding);
             routing =
                     new BackendRouting(
                             this,
                             proxy,
                             LoggerFactory.getLogger("test"),
                             authentication,
+                            forwarding,
                             host,
                             port,
-                            null);
+                            null,
+                            workshopContract);
         }
 
         Player player(UUID id, String host, String name) {
             current.put(id, servers.get("lobby"));
             requests.put(id, new ArrayList<>());
+            messages.put(id, new ArrayList<>());
             players.removeIf(p -> p.getUniqueId().equals(id));
             ServerConnection connection =
                     fake(
@@ -502,6 +545,10 @@ class BackendRoutingTest {
                                         case "getCurrentServer" -> Optional.of(connection);
                                         case "createConnectionRequest" ->
                                                 request(id, (RegisteredServer) args[0]);
+                                        case "sendMessage" -> {
+                                            messages.get(id).add((Component) args[0]);
+                                            yield null;
+                                        }
                                         default -> null;
                                     });
             players.add(player);
