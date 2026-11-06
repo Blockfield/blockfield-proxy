@@ -8,7 +8,8 @@ import org.slf4j.Logger;
 
 import java.io.BufferedReader;
 import java.io.IOException;
-import java.io.StringReader;
+import java.io.InputStream;
+import java.io.InputStreamReader;
 import java.net.URI;
 import java.net.URLEncoder;
 import java.net.http.HttpClient;
@@ -124,7 +125,7 @@ final class ControlSubscriber {
         return sub;
     }
 
-    /** Seam for tests: builds without starting the stream thread (null sender records nothing). */
+    /** Seam for tests: builds without starting the stream thread (null sender POSTs to the CP). */
     static ControlSubscriber fromParts(
             String url,
             String token,
@@ -134,12 +135,20 @@ final class ControlSubscriber {
             Consumer<String> warn,
             AckSender sender) {
         if (consumer == null || !consumer.matches("[^\\s/]{1,128}")) return null;
-        AckSender acks = sender != null ? sender : body -> {};
         if (url == null || url.isBlank() || token == null || token.isBlank()) {
             logger.warn(
                     "control-plane v2 consumer configured without URL/token: game entry stays"
                             + " closed");
-            return new ControlSubscriber(consumer, null, null, null, "", clock, warn, acks, false);
+            return new ControlSubscriber(
+                    consumer,
+                    null,
+                    null,
+                    null,
+                    "",
+                    clock,
+                    warn,
+                    sender != null ? sender : body -> {},
+                    false);
         }
         try {
             URI base = GatePoller.gateUri(url);
@@ -147,20 +156,25 @@ final class ControlSubscriber {
             String prefix = "https://" + base.getAuthority();
             if (!base.getScheme().equals("https"))
                 prefix = base.getScheme() + "://" + base.getAuthority();
+            URI snapshotUri = URI.create(prefix + "/v2/agents/" + id + "/snapshot");
+            URI eventsUri = URI.create(prefix + "/v2/agents/" + id + "/events");
+            URI acksUri = URI.create(prefix + "/v2/agents/" + id + "/acks");
+            AckSender acks = sender != null ? sender : new HttpAckSender(acksUri, token);
             return new ControlSubscriber(
-                    consumer,
-                    URI.create(prefix + "/v2/agents/" + id + "/snapshot"),
-                    URI.create(prefix + "/v2/agents/" + id + "/events"),
-                    URI.create(prefix + "/v2/agents/" + id + "/acks"),
-                    token,
-                    clock,
-                    warn,
-                    acks,
-                    true);
+                    consumer, snapshotUri, eventsUri, acksUri, token, clock, warn, acks, true);
         } catch (IllegalArgumentException e) {
             logger.warn(
                     "control-plane v2 URL invalid, game entry stays closed: {}", e.getMessage());
-            return new ControlSubscriber(consumer, null, null, null, "", clock, warn, acks, false);
+            return new ControlSubscriber(
+                    consumer,
+                    null,
+                    null,
+                    null,
+                    "",
+                    clock,
+                    warn,
+                    sender != null ? sender : body -> {},
+                    false);
         }
     }
 
@@ -235,7 +249,11 @@ final class ControlSubscriber {
         }
         synchronized (lock) {
             if (epoch == null || !epoch.equals(envEpoch)) return Verdict.RESYNC;
-            if (sequence <= cursor) return Verdict.HELD;
+            if (sequence <= cursor) {
+                // Duplicate delivery on a live stream: the CP is reachable, so the lease holds.
+                freshAt = clock.now();
+                return Verdict.HELD;
+            }
             if (sequence > cursor + 1) return Verdict.RESYNC;
             if (!generation.equals(envGeneration)) return Verdict.RESYNC;
         }
@@ -249,21 +267,25 @@ final class ControlSubscriber {
                         : null;
         if (!executable || envelope.get("reason") != null && !envelope.get("reason").isJsonNull()) {
             advance(sequence);
+            freshAt = clock.now();
             ack(envEpoch, sequence, envGeneration, revision, payloadHash, "received", "ok");
             return Verdict.HELD;
         }
         if (payloadHash == null || !payloadHash.matches("[0-9a-f]{64}")) {
-            advance(sequence);
-            return Verdict.HELD;
+            // The change the CP sent cannot be verified or ACKed: re-snapshot instead of
+            // skipping it, or replay would never bring it back.
+            return Verdict.RESYNC;
         }
         if (expired(envelope)) {
             advance(sequence);
+            freshAt = clock.now();
             ack(envEpoch, sequence, envGeneration, revision, payloadHash, "rejected", "ok");
             return Verdict.HELD;
         }
         Gate next = gateFromPayload(envelope.get("payload"));
         if (next == null) {
             advance(sequence);
+            freshAt = clock.now();
             ack(envEpoch, sequence, envGeneration, revision, payloadHash, "rejected", "ok");
             return Verdict.HELD;
         }
@@ -334,6 +356,9 @@ final class ControlSubscriber {
         JsonObject obj = payload.getAsJsonObject();
         if (!"settings".equals(text(obj, "kind"))) return null;
         if (!"gate".equals(text(obj, "namespace"))) return null;
+        // Only the game leg follows v2: another target's gate must never drive game entry.
+        String target = text(obj, "target");
+        if (!"*".equals(target) && !"game".equals(target)) return null;
         JsonElement value = obj.get("value");
         if (value == null || !value.isJsonObject()) return null;
         return Gate.fromCp(
@@ -360,19 +385,24 @@ final class ControlSubscriber {
                 || json.get("settings") == null
                 || !json.get("settings").isJsonArray()) return null;
         Gate found = null;
+        int matches = 0;
         for (JsonElement el : json.getAsJsonArray("settings")) {
             if (!el.isJsonObject()) continue;
             JsonObject entry = el.getAsJsonObject();
             if (!"gate".equals(text(entry, "namespace"))) continue;
+            String target = text(entry, "target");
+            if (!"*".equals(target) && !"game".equals(target)) continue;
             JsonElement value = entry.get("value");
             if (value == null || !value.isJsonObject()) continue;
             found =
                     Gate.fromCp(
                             text(value.getAsJsonObject(), "mode"),
                             text(value.getAsJsonObject(), "message"));
+            matches++;
         }
+        // Ambiguous game legs pin closed instead of depending on array order.
         return new Snapshot(
-                snapEpoch, snapGeneration, snapCursor, found != null ? found : Gate.closed());
+                snapEpoch, snapGeneration, snapCursor, matches == 1 ? found : Gate.closed());
     }
 
     private static String text(JsonObject obj, String key) {
@@ -468,26 +498,36 @@ final class ControlSubscriber {
                         .header("Last-Event-ID", id + ":" + from)
                         .GET()
                         .build();
-        HttpResponse<String> response = http().send(request, HttpResponse.BodyHandlers.ofString());
+        HttpResponse<InputStream> response =
+                http().send(request, HttpResponse.BodyHandlers.ofInputStream());
         if (response.statusCode() == 409) throw new Resync();
         if (response.statusCode() != 200)
             throw new IOException("CP status " + response.statusCode());
         String event = "";
         String data = null;
-        BufferedReader reader = new BufferedReader(new StringReader(response.body()));
-        String line;
-        while ((line = reader.readLine()) != null) {
-            if (line.startsWith(":")) continue;
-            if (line.startsWith("event:")) {
-                event = line.substring(6).strip();
-            } else if (line.startsWith("data:")) {
-                data = line.substring(5).strip();
-            } else if (line.isEmpty()) {
-                if ("resync".equals(event)) throw new Resync();
-                if ("control".equals(event) && data != null && offer(data) == Verdict.RESYNC)
-                    throw new Resync();
-                event = "";
-                data = null;
+        // Stream incrementally: the CP keeps this connection open, so waiting for the
+        // whole body would delay every frame until the server drops the stream.
+        try (BufferedReader reader =
+                new BufferedReader(
+                        new InputStreamReader(response.body(), StandardCharsets.UTF_8))) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                // Keep-alive comments carry no frame but prove the CP is reachable.
+                if (line.startsWith(":")) {
+                    freshAt = clock.now();
+                    continue;
+                }
+                if (line.startsWith("event:")) {
+                    event = line.substring(6).strip();
+                } else if (line.startsWith("data:")) {
+                    data = line.substring(5).strip();
+                } else if (line.isEmpty()) {
+                    if ("resync".equals(event)) throw new Resync();
+                    if ("control".equals(event) && data != null && offer(data) == Verdict.RESYNC)
+                        throw new Resync();
+                    event = "";
+                    data = null;
+                }
             }
         }
     }
@@ -501,6 +541,35 @@ final class ControlSubscriber {
     /** Test seam: queued ACK bodies when constructed with a recording sender. */
     static List<String> recordedAcks(AckSender sender) {
         return sender instanceof Recording r ? r.bodies : List.of();
+    }
+
+    /** Production ACK sender: POSTs each receipt to {@code POST /v2/agents/{id}/acks}. */
+    private static final class HttpAckSender implements AckSender {
+        private final URI uri;
+        private final String token;
+
+        HttpAckSender(URI uri, String token) {
+            this.uri = uri;
+            this.token = token;
+        }
+
+        @Override
+        public void send(String body) throws Exception {
+            HttpRequest request =
+                    HttpRequest.newBuilder(uri)
+                            .timeout(RPC_TIMEOUT)
+                            .header("Authorization", "Bearer " + token)
+                            .header("Content-Type", "application/json")
+                            .POST(HttpRequest.BodyPublishers.ofString(body))
+                            .build();
+            HttpResponse<String> response =
+                    HttpClient.newBuilder()
+                            .connectTimeout(RPC_TIMEOUT)
+                            .build()
+                            .send(request, HttpResponse.BodyHandlers.ofString());
+            if (response.statusCode() >= 400)
+                throw new IOException("CP ack status " + response.statusCode());
+        }
     }
 
     static final class Recording implements AckSender {

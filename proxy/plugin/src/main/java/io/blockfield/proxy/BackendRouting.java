@@ -395,7 +395,9 @@ final class BackendRouting {
 
     private void reloadGate() {
         boolean fileChanged = reloadGateFile();
-        if (gatePoller == null && !fileChanged) return;
+        // A configured v2 consumer owns game entry even without a gate file: returning
+        // early here would leave the bundled default instead of the pinned-closed v2 leg.
+        if (gatePoller == null && controlPlane() == null && !fileChanged) return;
         // CP owns game entry only; the Workshop keeps the controller's gate.json rules.
         Gate next = mergeGate();
         if (!next.equals(gate))
@@ -412,7 +414,7 @@ final class BackendRouting {
      * poller. Null means v2 is off (the U1 poll/file path applies); non-null but closed means
      * half-configured, and then the game leg stays closed instead of falling back to the file.
      */
-    private ControlSubscriber controlPlane() {
+    private synchronized ControlSubscriber controlPlane() {
         if (!controlProbed) {
             controlProbed = true;
             controlPlane = ControlSubscriber.fromEnv(logger);

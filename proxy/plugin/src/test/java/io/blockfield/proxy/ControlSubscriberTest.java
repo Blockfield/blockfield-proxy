@@ -4,12 +4,22 @@ import static org.junit.jupiter.api.Assertions.*;
 
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
+import com.sun.net.httpserver.HttpServer;
 
 import org.junit.jupiter.api.Test;
 import org.slf4j.LoggerFactory;
 
+import java.io.IOException;
+import java.io.OutputStream;
+import java.net.InetSocketAddress;
+import java.nio.charset.StandardCharsets;
 import java.time.Instant;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicLong;
 
 class ControlSubscriberTest {
@@ -264,5 +274,221 @@ class ControlSubscriberTest {
 
     private static String stateOf(String ackBody) {
         return JsonParser.parseString(ackBody).getAsJsonObject().get("state").getAsString();
+    }
+
+    @Test
+    void malformedPayloadHashResyncsWithoutAdvancing() {
+        ControlSubscriber sub = subscriber();
+        assertTrue(sub.applySnapshot(snapshot("open", 5)));
+        String bad =
+                envelope(6, true, null, gatePayload("maintenance")).replace(HASH, "not-a-hash");
+        assertEquals(
+                ControlSubscriber.Verdict.RESYNC,
+                sub.offer(bad),
+                "an unverifiable change must re-snapshot, or replay never brings it back");
+        assertEquals(5, sub.cursor());
+        assertTrue(sub.current().open());
+        assertEquals(0, recording.bodies.size(), "no ACK without a verifiable payload hash");
+    }
+
+    @Test
+    void heldFrameRefreshesLease() {
+        ControlSubscriber sub = subscriber();
+        assertTrue(sub.applySnapshot(snapshot("open", 5)));
+        clock.addAndGet(ControlSubscriber.LEASE_MS - 1);
+        assertEquals(
+                ControlSubscriber.Verdict.HELD,
+                sub.offer(envelope(5, true, null, gatePayload("maintenance"))),
+                "a duplicate on a live stream proves the CP is reachable");
+        clock.addAndGet(2);
+        assertTrue(
+                sub.current().open(),
+                "a held frame refreshes the lease like a keep-alive, so a steady gate stays open");
+    }
+
+    @Test
+    void foreignTargetSnapshotStaysClosed() {
+        ControlSubscriber sub = subscriber();
+        String foreign = snapshot("open", 5).replace("\"target\":\"*\"", "\"target\":\"workshop\"");
+        assertTrue(sub.applySnapshot(foreign));
+        assertEquals(
+                "closed",
+                sub.current().state(),
+                "another target's gate must never drive game entry");
+        assertEquals(5, sub.cursor());
+    }
+
+    @Test
+    void ambiguousSnapshotPinsClosed() {
+        ControlSubscriber sub = subscriber();
+        String two =
+                "{\"schema\":2,\"audience\":\""
+                        + CONSUMER
+                        + "\",\"epoch\":\""
+                        + EPOCH
+                        + "\",\"generation\":\""
+                        + GENERATION
+                        + "\",\"cursor\":5,\"settings\":["
+                        + "{\"namespace\":\"gate\",\"target\":\"*\",\"revision\":3,"
+                        + "\"value\":{\"mode\":\"open\",\"message\":\"\"},\"value_hash\":\""
+                        + HASH
+                        + "\"},"
+                        + "{\"namespace\":\"gate\",\"target\":\"game\",\"revision\":4,"
+                        + "\"value\":{\"mode\":\"open\",\"message\":\"\"},\"value_hash\":\""
+                        + HASH
+                        + "\"}],\"hash\":\""
+                        + HASH
+                        + "\"}";
+        assertTrue(sub.applySnapshot(two));
+        assertEquals(
+                "closed",
+                sub.current().state(),
+                "two game-leg entries pin closed instead of depending on array order");
+    }
+
+    @Test
+    void foreignTargetFrameIsRejectedWithoutApplying() {
+        ControlSubscriber sub = subscriber();
+        assertTrue(sub.applySnapshot(snapshot("open", 5)));
+        String other =
+                gatePayload("maintenance").replace("\"target\":\"*\"", "\"target\":\"workshop\"");
+        assertEquals(ControlSubscriber.Verdict.HELD, sub.offer(envelope(6, true, null, other)));
+        assertTrue(sub.current().open(), "another target's gate must never drive game entry");
+        assertEquals(6, sub.cursor());
+        assertEquals("rejected", stateOf(recording.bodies.get(0)));
+    }
+
+    @Test
+    void defaultSenderPostsAcksToCp() throws Exception {
+        List<String> bodies = Collections.synchronizedList(new ArrayList<>());
+        List<String> auth = Collections.synchronizedList(new ArrayList<>());
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext(
+                "/v2/agents/" + CONSUMER + "/acks",
+                exchange -> {
+                    bodies.add(
+                            new String(
+                                    exchange.getRequestBody().readAllBytes(),
+                                    StandardCharsets.UTF_8));
+                    auth.add(exchange.getRequestHeaders().getFirst("Authorization"));
+                    byte[] ok = "{}".getBytes(StandardCharsets.UTF_8);
+                    exchange.sendResponseHeaders(200, ok.length);
+                    try (OutputStream out = exchange.getResponseBody()) {
+                        out.write(ok);
+                    }
+                });
+        server.start();
+        try {
+            ControlSubscriber sub =
+                    ControlSubscriber.fromParts(
+                            "http://127.0.0.1:" + server.getAddress().getPort(),
+                            "secret-token",
+                            CONSUMER,
+                            LoggerFactory.getLogger("test"),
+                            clock::get,
+                            message -> {},
+                            null);
+            assertNotNull(sub, "fromParts without a sender must default to POSTing ACKs");
+            assertTrue(sub.applySnapshot(snapshot("open", 5)));
+            assertEquals(
+                    ControlSubscriber.Verdict.APPLIED,
+                    sub.offer(envelope(6, true, null, gatePayload("maintenance"))));
+            assertEquals(3, bodies.size(), "production ACKs reach POST /acks");
+            for (String body : bodies) {
+                JsonObject ack = JsonParser.parseString(body).getAsJsonObject();
+                assertEquals(6, ack.get("sequence").getAsInt());
+                assertEquals(HASH, ack.get("payloadHash").getAsString());
+            }
+            assertTrue(
+                    auth.stream().allMatch("Bearer secret-token"::equals),
+                    "ACKs carry the provisioned bearer token");
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void streamAppliesFramesWhileConnectionStaysOpen() throws Exception {
+        List<String> acks = Collections.synchronizedList(new ArrayList<>());
+        String snap = snapshot("open", 5);
+        String frame = envelope(6, true, null, gatePayload("maintenance"));
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        // The CP serves the open stream and the ACK POSTs concurrently.
+        ExecutorService pool = Executors.newCachedThreadPool();
+        server.setExecutor(pool);
+        server.createContext(
+                "/v2/agents/" + CONSUMER + "/snapshot",
+                exchange -> {
+                    byte[] body = snap.getBytes(StandardCharsets.UTF_8);
+                    exchange.sendResponseHeaders(200, body.length);
+                    try (OutputStream out = exchange.getResponseBody()) {
+                        out.write(body);
+                    }
+                });
+        server.createContext(
+                "/v2/agents/" + CONSUMER + "/events",
+                exchange -> {
+                    exchange.getResponseHeaders().add("Content-Type", "text/event-stream");
+                    exchange.sendResponseHeaders(200, 0);
+                    try {
+                        OutputStream out = exchange.getResponseBody();
+                        out.write(": keep-alive\n\n".getBytes(StandardCharsets.UTF_8));
+                        out.flush();
+                        Thread.sleep(200);
+                        out.write(
+                                ("event: control\ndata: " + frame + "\n\n")
+                                        .getBytes(StandardCharsets.UTF_8));
+                        out.flush();
+                        // The CP keeps a healthy stream open; frames must apply before it
+                        // closes.
+                        Thread.sleep(15_000);
+                        out.close();
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    } catch (IOException e) {
+                        // The test stopped the server mid-stream; nothing to assert here.
+                    }
+                });
+        server.createContext(
+                "/v2/agents/" + CONSUMER + "/acks",
+                exchange -> {
+                    acks.add(
+                            new String(
+                                    exchange.getRequestBody().readAllBytes(),
+                                    StandardCharsets.UTF_8));
+                    byte[] ok = "{}".getBytes(StandardCharsets.UTF_8);
+                    exchange.sendResponseHeaders(200, ok.length);
+                    try (OutputStream out = exchange.getResponseBody()) {
+                        out.write(ok);
+                    }
+                });
+        server.start();
+        try {
+            ControlSubscriber sub =
+                    ControlSubscriber.fromParts(
+                            "http://127.0.0.1:" + server.getAddress().getPort(),
+                            "token",
+                            CONSUMER,
+                            LoggerFactory.getLogger("test"),
+                            clock::get,
+                            message -> {},
+                            null);
+            assertNotNull(sub);
+            sub.start();
+            long deadline = System.currentTimeMillis() + 10_000;
+            while (sub.cursor() != 6 && System.currentTimeMillis() < deadline) {
+                Thread.sleep(50);
+            }
+            assertEquals(6, sub.cursor(), "a frame applies while the SSE stream stays open");
+            assertEquals("closed", sub.current().state());
+            long ackDeadline = System.currentTimeMillis() + 5_000;
+            while (acks.size() < 3 && System.currentTimeMillis() < ackDeadline) {
+                Thread.sleep(50);
+            }
+            assertEquals(3, acks.size(), "streamed frames are ACKed over the same connection");
+        } finally {
+            server.stop(0);
+            pool.shutdownNow();
+        }
     }
 }
