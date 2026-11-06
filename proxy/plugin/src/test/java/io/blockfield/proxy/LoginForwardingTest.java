@@ -97,6 +97,20 @@ class LoginForwardingTest {
                 "disconnect clears cached contract response");
     }
 
+    @Test
+    void contractHashDecodesWriteUtfReply() {
+        String hash = "a".repeat(64);
+        assertEquals(
+                Optional.of(hash), LoginForwarding.contractHash(Authentication.utf(hash + ":9")));
+        assertEquals(Optional.empty(), LoginForwarding.contractHash(null));
+        assertEquals(Optional.empty(), LoginForwarding.contractHash(new byte[0]));
+        assertEquals(Optional.empty(), LoginForwarding.contractHash(new byte[] {1, 2, 3}));
+        assertEquals(
+                Optional.empty(),
+                LoginForwarding.contractHash(Authentication.utf("nocolon")),
+                "reply without protocol separator is not a contract");
+    }
+
     private static ServerConnection on(String name) {
         RegisteredServer server =
                 fake(
