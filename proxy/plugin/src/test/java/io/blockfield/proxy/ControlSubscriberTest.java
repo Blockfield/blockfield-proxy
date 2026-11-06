@@ -20,6 +20,7 @@ import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
 class ControlSubscriberTest {
@@ -30,6 +31,7 @@ class ControlSubscriberTest {
             "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
 
     private final AtomicLong clock = new AtomicLong(1_000_000);
+    private final AtomicLong nanos = new AtomicLong(0);
     private final ControlSubscriber.Recording recording = new ControlSubscriber.Recording();
 
     private ControlSubscriber subscriber() {
@@ -40,7 +42,8 @@ class ControlSubscriberTest {
                 LoggerFactory.getLogger("test"),
                 clock::get,
                 message -> {},
-                recording);
+                recording,
+                nanos::get);
     }
 
     private static String snapshot(String mode, long cursor) {
@@ -109,7 +112,8 @@ class ControlSubscriberTest {
                         LoggerFactory.getLogger("test"),
                         clock::get,
                         message -> {},
-                        recording);
+                        recording,
+                        nanos::get);
         assertNotNull(missingUrl, "half-configured v2 must exist and pin the game leg closed");
         assertEquals("closed", missingUrl.current().state());
         assertNull(
@@ -237,9 +241,9 @@ class ControlSubscriberTest {
     void partitionHoldsLastGateThenClosesPastTheLease() {
         ControlSubscriber sub = subscriber();
         assertTrue(sub.applySnapshot(snapshot("open", 5)));
-        clock.addAndGet(ControlSubscriber.LEASE_MS - 1);
+        nanos.addAndGet(ControlSubscriber.LEASE_NS - 1);
         assertTrue(sub.current().open(), "partition inside the lease keeps the last snapshot");
-        clock.addAndGet(2);
+        nanos.addAndGet(2);
         Gate closed = sub.current();
         assertEquals("closed", closed.state(), "partition past the lease closes entry");
         assertFalse(closed.allows("game", null, "Anyone", true));
@@ -264,7 +268,7 @@ class ControlSubscriberTest {
         assertTrue(merged.allows("workshop", id, "NetherG", false));
         assertFalse(merged.allows("workshop", null, "Anyone", false));
 
-        clock.addAndGet(ControlSubscriber.LEASE_MS + 1);
+        nanos.addAndGet(ControlSubscriber.LEASE_NS + 1);
         Gate expired = file.withGame(sub.current());
         assertFalse(expired.allows("game", null, "Anyone", true));
         assertTrue(
@@ -295,12 +299,12 @@ class ControlSubscriberTest {
     void heldFrameRefreshesLease() {
         ControlSubscriber sub = subscriber();
         assertTrue(sub.applySnapshot(snapshot("open", 5)));
-        clock.addAndGet(ControlSubscriber.LEASE_MS - 1);
+        nanos.addAndGet(ControlSubscriber.LEASE_NS - 1);
         assertEquals(
                 ControlSubscriber.Verdict.HELD,
                 sub.offer(envelope(5, true, null, gatePayload("maintenance"))),
                 "a duplicate on a live stream proves the CP is reachable");
-        clock.addAndGet(2);
+        nanos.addAndGet(2);
         assertTrue(
                 sub.current().open(),
                 "a held frame refreshes the lease like a keep-alive, so a steady gate stays open");
@@ -387,7 +391,8 @@ class ControlSubscriberTest {
                             LoggerFactory.getLogger("test"),
                             clock::get,
                             message -> {},
-                            null);
+                            null,
+                            nanos::get);
             assertNotNull(sub, "fromParts without a sender must default to POSTing ACKs");
             assertTrue(sub.applySnapshot(snapshot("open", 5)));
             assertEquals(
@@ -472,7 +477,8 @@ class ControlSubscriberTest {
                             LoggerFactory.getLogger("test"),
                             clock::get,
                             message -> {},
-                            null);
+                            null,
+                            nanos::get);
             assertNotNull(sub);
             sub.start();
             long deadline = System.currentTimeMillis() + 10_000;
@@ -489,6 +495,290 @@ class ControlSubscriberTest {
         } finally {
             server.stop(0);
             pool.shutdownNow();
+        }
+    }
+
+    @Test
+    void malformedConsumerIdPinsClosed() {
+        ControlSubscriber space =
+                ControlSubscriber.fromParts(
+                        "https://cp.invalid",
+                        "token",
+                        "proxy 1",
+                        LoggerFactory.getLogger("test"),
+                        clock::get,
+                        message -> {},
+                        recording,
+                        nanos::get);
+        assertNotNull(space, "a set consumer id is a consumer even when malformed");
+        assertEquals("closed", space.current().state());
+        ControlSubscriber slash =
+                ControlSubscriber.fromParts(
+                        "https://cp.invalid",
+                        "token",
+                        "proxy/1",
+                        LoggerFactory.getLogger("test"),
+                        clock::get,
+                        message -> {},
+                        recording,
+                        nanos::get);
+        assertNotNull(slash);
+        assertEquals("closed", slash.current().state());
+        assertNull(
+                ControlSubscriber.fromParts(
+                        "https://cp.invalid",
+                        "token",
+                        "   ",
+                        LoggerFactory.getLogger("test"),
+                        clock::get,
+                        message -> {},
+                        recording,
+                        nanos::get),
+                "a blank id means v2 is not configured");
+    }
+
+    @Test
+    void leaseUsesMonotonicClock() {
+        ControlSubscriber sub = subscriber();
+        assertTrue(sub.applySnapshot(snapshot("open", 5)));
+        clock.addAndGet(ControlSubscriber.LEASE_MS - 1);
+        nanos.addAndGet(ControlSubscriber.LEASE_NS - 1);
+        assertTrue(sub.current().open());
+        clock.addAndGet(-30_000);
+        clock.addAndGet(2);
+        nanos.addAndGet(2);
+        assertEquals(
+                "closed",
+                sub.current().state(),
+                "a backward wall step must not extend the lease past a partition");
+    }
+
+    @Test
+    void unparseableControlDataResyncs() {
+        ControlSubscriber sub = subscriber();
+        assertTrue(sub.applySnapshot(snapshot("open", 5)));
+        assertEquals(
+                ControlSubscriber.Verdict.RESYNC,
+                sub.offer("truncated {\"schema\":2"),
+                "a change the proxy cannot parse must re-snapshot, not sit as current");
+        assertEquals(5, sub.cursor());
+        assertTrue(sub.current().open(), "the last good gate stands until the re-snapshot lands");
+        assertEquals(0, recording.bodies.size());
+    }
+
+    @Test
+    void multiLineDataJoinsWithNewline() throws Exception {
+        String full = envelope(6, true, null, gatePayload("maintenance"));
+        // Split between members, where a newline is insignificant whitespace.
+        int cut = full.indexOf("\"generation\"");
+        String first = full.substring(0, cut);
+        String second = full.substring(cut);
+        String snap = snapshot("open", 5);
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext(
+                "/v2/agents/" + CONSUMER + "/snapshot",
+                exchange -> {
+                    byte[] body = snap.getBytes(StandardCharsets.UTF_8);
+                    exchange.sendResponseHeaders(200, body.length);
+                    try (OutputStream out = exchange.getResponseBody()) {
+                        out.write(body);
+                    }
+                });
+        server.createContext(
+                "/v2/agents/" + CONSUMER + "/events",
+                exchange -> {
+                    exchange.getResponseHeaders().add("Content-Type", "text/event-stream");
+                    exchange.sendResponseHeaders(200, 0);
+                    try {
+                        OutputStream out = exchange.getResponseBody();
+                        out.write(
+                                ("event: control\ndata: " + first + "\ndata: " + second + "\n\n")
+                                        .getBytes(StandardCharsets.UTF_8));
+                        out.flush();
+                        // The frame must already have applied; the stream only stays open
+                        // to prove nothing waits for the server to close it.
+                        Thread.sleep(12_000);
+                        out.close();
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    } catch (IOException e) {
+                        // The test stopped the server mid-stream; nothing to assert here.
+                    }
+                });
+        server.start();
+        try {
+            ControlSubscriber sub =
+                    ControlSubscriber.fromParts(
+                            "http://127.0.0.1:" + server.getAddress().getPort(),
+                            "token",
+                            CONSUMER,
+                            LoggerFactory.getLogger("test"),
+                            clock::get,
+                            message -> {},
+                            recording,
+                            nanos::get);
+            assertNotNull(sub);
+            sub.start();
+            long deadline = System.currentTimeMillis() + 10_000;
+            while (sub.cursor() != 6 && System.currentTimeMillis() < deadline) {
+                Thread.sleep(50);
+            }
+            assertEquals(6, sub.cursor(), "a multi-line control event applies as one envelope");
+            assertEquals("closed", sub.current().state());
+            sub.stop();
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void idleStreamReconnectsAfterThreeMissedBeats() throws Exception {
+        AtomicInteger events = new AtomicInteger();
+        List<String> acks = Collections.synchronizedList(new ArrayList<>());
+        String snap = snapshot("open", 5);
+        String frame = envelope(6, true, null, gatePayload("maintenance"));
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        ExecutorService pool = Executors.newCachedThreadPool();
+        server.setExecutor(pool);
+        server.createContext(
+                "/v2/agents/" + CONSUMER + "/snapshot",
+                exchange -> {
+                    byte[] body = snap.getBytes(StandardCharsets.UTF_8);
+                    exchange.sendResponseHeaders(200, body.length);
+                    try (OutputStream out = exchange.getResponseBody()) {
+                        out.write(body);
+                    }
+                });
+        server.createContext(
+                "/v2/agents/" + CONSUMER + "/events",
+                exchange -> {
+                    int n = events.incrementAndGet();
+                    exchange.getResponseHeaders().add("Content-Type", "text/event-stream");
+                    exchange.sendResponseHeaders(200, 0);
+                    try {
+                        OutputStream out = exchange.getResponseBody();
+                        if (n == 1) {
+                            // Silent half-open connection: no frame, no keep-alive.
+                            Thread.sleep(25_000);
+                            out.close();
+                            return;
+                        }
+                        out.write(": keep-alive\n\n".getBytes(StandardCharsets.UTF_8));
+                        out.flush();
+                        out.write(
+                                ("event: control\ndata: " + frame + "\n\n")
+                                        .getBytes(StandardCharsets.UTF_8));
+                        out.flush();
+                        Thread.sleep(12_000);
+                        out.close();
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    } catch (IOException e) {
+                        // The test stopped the server mid-stream; nothing to assert here.
+                    }
+                });
+        server.createContext(
+                "/v2/agents/" + CONSUMER + "/acks",
+                exchange -> {
+                    acks.add(
+                            new String(
+                                    exchange.getRequestBody().readAllBytes(),
+                                    StandardCharsets.UTF_8));
+                    byte[] ok = "{}".getBytes(StandardCharsets.UTF_8);
+                    exchange.sendResponseHeaders(200, ok.length);
+                    try (OutputStream out = exchange.getResponseBody()) {
+                        out.write(ok);
+                    }
+                });
+        server.start();
+        try {
+            ControlSubscriber sub =
+                    ControlSubscriber.fromParts(
+                            "http://127.0.0.1:" + server.getAddress().getPort(),
+                            "token",
+                            CONSUMER,
+                            LoggerFactory.getLogger("test"),
+                            clock::get,
+                            message -> {},
+                            null,
+                            nanos::get);
+            assertNotNull(sub);
+            sub.start();
+            Thread.sleep(1_500);
+            nanos.addAndGet(2 * ControlSubscriber.IDLE_NS);
+            long deadline = System.currentTimeMillis() + 15_000;
+            while (sub.cursor() != 6 && System.currentTimeMillis() < deadline) {
+                Thread.sleep(50);
+            }
+            assertEquals(6, sub.cursor(), "an idle stream is aborted and reconnected");
+            assertTrue(events.get() >= 2, "the reconnect opens a fresh stream");
+            assertEquals(3, acks.size(), "the replayed frame is ACKed after reconnect");
+            sub.stop();
+        } finally {
+            server.stop(0);
+            pool.shutdownNow();
+        }
+    }
+
+    @Test
+    void stopInterruptsAnIdleStreamPromptly() throws Exception {
+        String snap = snapshot("open", 5);
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext(
+                "/v2/agents/" + CONSUMER + "/snapshot",
+                exchange -> {
+                    byte[] body = snap.getBytes(StandardCharsets.UTF_8);
+                    exchange.sendResponseHeaders(200, body.length);
+                    try (OutputStream out = exchange.getResponseBody()) {
+                        out.write(body);
+                    }
+                });
+        server.createContext(
+                "/v2/agents/" + CONSUMER + "/events",
+                exchange -> {
+                    exchange.getResponseHeaders().add("Content-Type", "text/event-stream");
+                    exchange.sendResponseHeaders(200, 0);
+                    try {
+                        // Silent stream: stop() must wake the reader anyway.
+                        Thread.sleep(25_000);
+                        exchange.getResponseBody().close();
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    } catch (IOException e) {
+                        // The test stopped the server mid-stream; nothing to assert here.
+                    }
+                });
+        server.start();
+        try {
+            // Point a recording subscriber at the stub so no ACK server is needed.
+            ControlSubscriber live =
+                    ControlSubscriber.fromParts(
+                            "http://127.0.0.1:" + server.getAddress().getPort(),
+                            "token",
+                            CONSUMER,
+                            LoggerFactory.getLogger("test"),
+                            clock::get,
+                            message -> {},
+                            recording,
+                            nanos::get);
+            assertNotNull(live);
+            live.start();
+            long deadline = System.currentTimeMillis() + 5_000;
+            while (live.cursor() != 5 && System.currentTimeMillis() < deadline) {
+                Thread.sleep(50);
+            }
+            assertEquals(5, live.cursor(), "the snapshot lands before the stream goes quiet");
+            var stop = ControlSubscriber.class.getDeclaredMethod("stop");
+            stop.setAccessible(true);
+            var field = ControlSubscriber.class.getDeclaredField("streamThread");
+            field.setAccessible(true);
+            stop.invoke(live);
+            Thread thread = (Thread) field.get(live);
+            assertNotNull(thread);
+            thread.join(3_000);
+            assertFalse(thread.isAlive(), "stop() wakes a stream blocked with no keep-alives");
+        } finally {
+            server.stop(0);
         }
     }
 }

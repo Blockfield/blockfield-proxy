@@ -21,7 +21,9 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
+import java.util.function.LongSupplier;
 
 /**
  * Control-plane v2 push consumer for the game gate leg (plan CP-S5).
@@ -33,11 +35,13 @@ import java.util.function.Consumer;
  * alternative API.
  *
  * <p>Safety properties: fail closed before the first snapshot and past the lease (same 60 s lease
- * as the U1 poller); stale/forged/gapped frames never move the gate (they request a re-snapshot
- * instead); non-executable and non-gate frames advance the cursor without changing admission; ACKs
- * are best-effort — a lost ACK replays on reconnect and the cursor/epoch guards make the replay
- * idempotent (a cursor that ran ahead of the server's durable cursor self-heals through a {@code
- * 409 snapshot_required} re-snapshot).
+ * as the U1 poller, on a monotonic clock so wall steps cannot extend it); a stream with no frame or
+ * keep-alive for three keep-alive intervals is aborted and reconnected; stale/forged/gapped or
+ * unparseable frames never move the gate (they request a re-snapshot instead); non-executable and
+ * non-gate frames advance the cursor without changing admission; ACKs are best-effort — a lost ACK
+ * replays on reconnect and the cursor/epoch guards make the replay idempotent (a cursor that ran
+ * ahead of the server's durable cursor self-heals through a {@code 409 snapshot_required}
+ * re-snapshot).
  */
 final class ControlSubscriber {
     /** Frames past this age without a fresh snapshot/apply close entry, like the U1 lease. */
@@ -47,6 +51,15 @@ final class ControlSubscriber {
     private static final Duration STREAM_TIMEOUT = Duration.ofSeconds(75);
     private static final long RECONNECT_MS = 5_000;
     private static final long WARN_MS = 60_000;
+
+    /** The CP heartbeats a healthy stream every 10 s; three missed beats mean a dead stream. */
+    static final long IDLE_MS = 30_000;
+
+    /** The admission lease, on the monotonic clock so wall steps cannot extend it. */
+    static final long LEASE_NS = TimeUnit.MILLISECONDS.toNanos(LEASE_MS);
+
+    static final long IDLE_NS = TimeUnit.MILLISECONDS.toNanos(IDLE_MS);
+    private static final long POLL_MS = 250;
 
     /** What {@link #offer} did with one stream envelope. */
     enum Verdict {
@@ -73,6 +86,7 @@ final class ControlSubscriber {
     private final URI acksUri;
     private final String token;
     private final Clock clock;
+    private final LongSupplier monotonic;
     private final Consumer<String> warn;
     private final AckSender acks;
 
@@ -81,9 +95,11 @@ final class ControlSubscriber {
     private String generation;
     private long cursor = -1;
     private Gate gate = Gate.closed();
-    private volatile long freshAt = -LEASE_MS - 1;
+    private volatile long freshAt = -LEASE_NS - 1;
     private volatile long lastWarnMs = -WARN_MS;
     private final boolean live;
+    private volatile boolean stopped;
+    private volatile Thread streamThread;
 
     ControlSubscriber(
             String consumer,
@@ -94,6 +110,7 @@ final class ControlSubscriber {
             Clock clock,
             Consumer<String> warn,
             AckSender acks,
+            LongSupplier monotonic,
             boolean live) {
         this.consumer = consumer;
         this.snapshotUri = snapshotUri;
@@ -103,6 +120,7 @@ final class ControlSubscriber {
         this.clock = clock;
         this.warn = warn;
         this.acks = acks;
+        this.monotonic = monotonic;
         this.live = live;
     }
 
@@ -134,21 +152,33 @@ final class ControlSubscriber {
             Clock clock,
             Consumer<String> warn,
             AckSender sender) {
-        if (consumer == null || !consumer.matches("[^\\s/]{1,128}")) return null;
+        return fromParts(url, token, consumer, logger, clock, warn, sender, System::nanoTime);
+    }
+
+    static ControlSubscriber fromParts(
+            String url,
+            String token,
+            String consumer,
+            Logger logger,
+            Clock clock,
+            Consumer<String> warn,
+            AckSender sender,
+            LongSupplier monotonic) {
+        if (consumer == null || consumer.isBlank()) return null;
+        AckSender unconfigured = sender != null ? sender : body -> {};
+        if (!consumer.matches("[^\\s/]{1,128}")) {
+            // A set but malformed id is a configuration error, not "v2 not configured":
+            // pin game entry closed instead of falling back to the file.
+            logger.warn("control-plane v2 consumer id invalid, game entry stays closed");
+            return new ControlSubscriber(
+                    consumer, null, null, null, "", clock, warn, unconfigured, monotonic, false);
+        }
         if (url == null || url.isBlank() || token == null || token.isBlank()) {
             logger.warn(
                     "control-plane v2 consumer configured without URL/token: game entry stays"
                             + " closed");
             return new ControlSubscriber(
-                    consumer,
-                    null,
-                    null,
-                    null,
-                    "",
-                    clock,
-                    warn,
-                    sender != null ? sender : body -> {},
-                    false);
+                    consumer, null, null, null, "", clock, warn, unconfigured, monotonic, false);
         }
         try {
             URI base = GatePoller.gateUri(url);
@@ -161,7 +191,16 @@ final class ControlSubscriber {
             URI acksUri = URI.create(prefix + "/v2/agents/" + id + "/acks");
             AckSender acks = sender != null ? sender : new HttpAckSender(acksUri, token);
             return new ControlSubscriber(
-                    consumer, snapshotUri, eventsUri, acksUri, token, clock, warn, acks, true);
+                    consumer,
+                    snapshotUri,
+                    eventsUri,
+                    acksUri,
+                    token,
+                    clock,
+                    warn,
+                    acks,
+                    monotonic,
+                    true);
         } catch (IllegalArgumentException e) {
             logger.warn(
                     "control-plane v2 URL invalid, game entry stays closed: {}", e.getMessage());
@@ -174,6 +213,7 @@ final class ControlSubscriber {
                     clock,
                     warn,
                     sender != null ? sender : body -> {},
+                    monotonic,
                     false);
         }
     }
@@ -182,12 +222,20 @@ final class ControlSubscriber {
         if (!live) return;
         Thread thread = new Thread(this::loop, "cp-v2-stream");
         thread.setDaemon(true);
+        streamThread = thread;
         thread.start();
+    }
+
+    /** Stops the stream thread; a blocked or idle read wakes within one poll. */
+    void stop() {
+        stopped = true;
+        Thread thread = streamThread;
+        if (thread != null) thread.interrupt();
     }
 
     /** Current game-leg gate: last verified snapshot, closed past the lease or before it. */
     Gate current() {
-        if (clock.now() - freshAt > LEASE_MS) return Gate.closed();
+        if (monotonic.getAsLong() - freshAt > LEASE_NS) return Gate.closed();
         synchronized (lock) {
             return gate;
         }
@@ -217,17 +265,20 @@ final class ControlSubscriber {
             cursor = parsed.cursor;
             gate = parsed.gate;
         }
-        freshAt = clock.now();
+        freshAt = monotonic.getAsLong();
         return true;
     }
 
-    /** Offers one {@code event: control} data envelope. Never throws; malformed input is HELD. */
+    /**
+     * Offers one {@code event: control} data envelope. Never throws; unparseable input requests a
+     * re-snapshot, since the proxy was handed a change it cannot apply.
+     */
     Verdict offer(String dataJson) {
         JsonObject envelope;
         try {
             envelope = JsonParser.parseString(dataJson).getAsJsonObject();
         } catch (RuntimeException e) {
-            return Verdict.HELD;
+            return Verdict.RESYNC;
         }
         String envEpoch = text(envelope, "epoch");
         String audience = text(envelope, "audience");
@@ -251,7 +302,7 @@ final class ControlSubscriber {
             if (epoch == null || !epoch.equals(envEpoch)) return Verdict.RESYNC;
             if (sequence <= cursor) {
                 // Duplicate delivery on a live stream: the CP is reachable, so the lease holds.
-                freshAt = clock.now();
+                freshAt = monotonic.getAsLong();
                 return Verdict.HELD;
             }
             if (sequence > cursor + 1) return Verdict.RESYNC;
@@ -267,7 +318,7 @@ final class ControlSubscriber {
                         : null;
         if (!executable || envelope.get("reason") != null && !envelope.get("reason").isJsonNull()) {
             advance(sequence);
-            freshAt = clock.now();
+            freshAt = monotonic.getAsLong();
             ack(envEpoch, sequence, envGeneration, revision, payloadHash, "received", "ok");
             return Verdict.HELD;
         }
@@ -278,14 +329,14 @@ final class ControlSubscriber {
         }
         if (expired(envelope)) {
             advance(sequence);
-            freshAt = clock.now();
+            freshAt = monotonic.getAsLong();
             ack(envEpoch, sequence, envGeneration, revision, payloadHash, "rejected", "ok");
             return Verdict.HELD;
         }
         Gate next = gateFromPayload(envelope.get("payload"));
         if (next == null) {
             advance(sequence);
-            freshAt = clock.now();
+            freshAt = monotonic.getAsLong();
             ack(envEpoch, sequence, envGeneration, revision, payloadHash, "rejected", "ok");
             return Verdict.HELD;
         }
@@ -293,7 +344,7 @@ final class ControlSubscriber {
         synchronized (lock) {
             gate = next;
         }
-        freshAt = clock.now();
+        freshAt = monotonic.getAsLong();
         ack(envEpoch, sequence, envGeneration, revision, payloadHash, "received", "ok");
         ack(envEpoch, sequence, envGeneration, revision, payloadHash, "validated", "ok");
         ack(envEpoch, sequence, envGeneration, revision, payloadHash, "applied", "ok");
@@ -449,7 +500,7 @@ final class ControlSubscriber {
     }
 
     private void loop() {
-        while (!Thread.currentThread().isInterrupted()) {
+        while (!stopped && !Thread.currentThread().isInterrupted()) {
             try {
                 if (cursor() < 0) snapshot();
                 stream();
@@ -457,9 +508,12 @@ final class ControlSubscriber {
                 synchronized (lock) {
                     cursor = -1;
                 }
+            } catch (InterruptedException e) {
+                return;
             } catch (Exception e) {
                 warnOnce("control-plane v2 stream failed, keeping last gate: " + e);
             }
+            if (stopped) return;
             try {
                 Thread.sleep(RECONNECT_MS);
             } catch (InterruptedException e) {
@@ -504,29 +558,45 @@ final class ControlSubscriber {
         if (response.statusCode() != 200)
             throw new IOException("CP status " + response.statusCode());
         String event = "";
-        String data = null;
+        StringBuilder data = new StringBuilder();
         // Stream incrementally: the CP keeps this connection open, so waiting for the
-        // whole body would delay every frame until the server drops the stream.
+        // whole body would delay every frame until the server drops the stream. Bound
+        // each read too: a half-open connection with no frame or keep-alive for three
+        // keep-alive intervals is dead, so abort it and let loop() reconnect.
+        long lastLineAt = monotonic.getAsLong();
         try (BufferedReader reader =
                 new BufferedReader(
                         new InputStreamReader(response.body(), StandardCharsets.UTF_8))) {
-            String line;
-            while ((line = reader.readLine()) != null) {
+            while (true) {
+                if (!reader.ready()) {
+                    if (monotonic.getAsLong() - lastLineAt > IDLE_NS) {
+                        response.body().close();
+                        throw new IOException("control-plane v2 stream idle, reconnecting");
+                    }
+                    Thread.sleep(POLL_MS);
+                    continue;
+                }
+                String line = reader.readLine();
+                if (line == null) return;
+                lastLineAt = monotonic.getAsLong();
                 // Keep-alive comments carry no frame but prove the CP is reachable.
                 if (line.startsWith(":")) {
-                    freshAt = clock.now();
+                    freshAt = monotonic.getAsLong();
                     continue;
                 }
                 if (line.startsWith("event:")) {
                     event = line.substring(6).strip();
                 } else if (line.startsWith("data:")) {
-                    data = line.substring(5).strip();
+                    // Multi-line events join with a newline per the SSE spec.
+                    if (data.length() > 0) data.append('\n');
+                    data.append(line.substring(5).strip());
                 } else if (line.isEmpty()) {
                     if ("resync".equals(event)) throw new Resync();
-                    if ("control".equals(event) && data != null && offer(data) == Verdict.RESYNC)
-                        throw new Resync();
+                    if ("control".equals(event)
+                            && data.length() > 0
+                            && offer(data.toString()) == Verdict.RESYNC) throw new Resync();
                     event = "";
-                    data = null;
+                    data.setLength(0);
                 }
             }
         }
