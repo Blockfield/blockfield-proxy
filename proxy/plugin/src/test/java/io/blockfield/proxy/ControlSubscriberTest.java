@@ -1,0 +1,268 @@
+package io.blockfield.proxy;
+
+import static org.junit.jupiter.api.Assertions.*;
+
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
+
+import org.junit.jupiter.api.Test;
+import org.slf4j.LoggerFactory;
+
+import java.time.Instant;
+import java.util.UUID;
+import java.util.concurrent.atomic.AtomicLong;
+
+class ControlSubscriberTest {
+    private static final String CONSUMER = "proxy-1";
+    private static final String EPOCH = "11111111-1111-1111-1111-111111111111";
+    private static final String GENERATION = "22222222-2222-2222-2222-222222222222";
+    private static final String HASH =
+            "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
+
+    private final AtomicLong clock = new AtomicLong(1_000_000);
+    private final ControlSubscriber.Recording recording = new ControlSubscriber.Recording();
+
+    private ControlSubscriber subscriber() {
+        return ControlSubscriber.fromParts(
+                "https://cp.invalid",
+                "token",
+                CONSUMER,
+                LoggerFactory.getLogger("test"),
+                clock::get,
+                message -> {},
+                recording);
+    }
+
+    private static String snapshot(String mode, long cursor) {
+        return "{\"schema\":2,\"audience\":\""
+                + CONSUMER
+                + "\",\"epoch\":\""
+                + EPOCH
+                + "\",\"generation\":\""
+                + GENERATION
+                + "\",\"cursor\":"
+                + cursor
+                + ",\"settings\":[{\"namespace\":\"gate\",\"target\":\"*\",\"revision\":3,"
+                + "\"value\":{\"mode\":\""
+                + mode
+                + "\",\"message\":\"\"},\"value_hash\":\""
+                + HASH
+                + "\"}],\"hash\":\""
+                + HASH
+                + "\"}";
+    }
+
+    private String envelope(long sequence, boolean executable, String reason, String payload) {
+        return "{\"schema\":2,\"epoch\":\""
+                + EPOCH
+                + "\",\"sequence\":"
+                + sequence
+                + ",\"operationId\":\""
+                + UUID.randomUUID()
+                + "\",\"audience\":\""
+                + CONSUMER
+                + "\",\"generation\":\""
+                + GENERATION
+                + "\",\"revision\":4,\"payloadHash\":\""
+                + HASH
+                + "\",\"authorizationEpoch\":\""
+                + EPOCH
+                + "\",\"expiresAt\":\""
+                + Instant.ofEpochMilli(clock.get() + 60_000)
+                + "\",\"executable\":"
+                + executable
+                + ",\"reason\":"
+                + (reason == null ? "null" : "\"" + reason + "\"")
+                + (payload == null ? ",\"payload\":null" : ",\"payload\":" + payload)
+                + "}";
+    }
+
+    private static String gatePayload(String mode) {
+        return "{\"kind\":\"settings\",\"namespace\":\"gate\",\"target\":\"*\","
+                + "\"value\":{\"mode\":\""
+                + mode
+                + "\",\"message\":\"\"},\"timing\":\"live\"}";
+    }
+
+    @Test
+    void firstBootWithoutSnapshotStaysClosed() {
+        assertEquals("closed", subscriber().current().state());
+    }
+
+    @Test
+    void halfConfiguredConsumerNeverFallsBackToFile() {
+        ControlSubscriber missingUrl =
+                ControlSubscriber.fromParts(
+                        "",
+                        "",
+                        CONSUMER,
+                        LoggerFactory.getLogger("test"),
+                        clock::get,
+                        message -> {},
+                        recording);
+        assertNotNull(missingUrl, "half-configured v2 must exist and pin the game leg closed");
+        assertEquals("closed", missingUrl.current().state());
+        assertNull(
+                ControlSubscriber.fromParts(
+                        "https://cp.invalid",
+                        "token",
+                        "",
+                        LoggerFactory.getLogger("test"),
+                        clock::get,
+                        message -> {},
+                        recording),
+                "without a consumer id the U1 poll/file path stays in charge");
+    }
+
+    @Test
+    void snapshotAppliesScopedGate() {
+        ControlSubscriber sub = subscriber();
+        assertTrue(sub.applySnapshot(snapshot("open", 5)));
+        assertTrue(sub.current().open());
+        assertEquals(5, sub.cursor());
+    }
+
+    @Test
+    void snapshotRejectsForeignAudienceAndBadSchema() {
+        ControlSubscriber sub = subscriber();
+        assertTrue(sub.applySnapshot(snapshot("open", 5)));
+        assertFalse(sub.applySnapshot(snapshot("open", 5).replace(CONSUMER, "proxy-2")));
+        assertFalse(sub.applySnapshot(snapshot("open", 5).replace("\"schema\":2", "\"schema\":1")));
+        assertFalse(sub.applySnapshot(snapshot("open", 5).replace(EPOCH, "not-a-uuid")));
+        assertTrue(sub.current().open(), "rejected snapshots never move the gate");
+        assertEquals(5, sub.cursor());
+    }
+
+    @Test
+    void gapAndReplayAskResyncOrHold() {
+        ControlSubscriber sub = subscriber();
+        assertTrue(sub.applySnapshot(snapshot("open", 5)));
+        assertEquals(
+                ControlSubscriber.Verdict.RESYNC,
+                sub.offer(envelope(7, true, null, gatePayload("maintenance"))),
+                "reordered/gapped frame must re-snapshot, never apply");
+        assertTrue(sub.current().open());
+        assertEquals(
+                ControlSubscriber.Verdict.HELD,
+                sub.offer(envelope(5, true, null, gatePayload("maintenance"))),
+                "replayed frame is a duplicate, not a state change");
+        assertTrue(sub.current().open());
+        assertEquals(5, sub.cursor());
+    }
+
+    @Test
+    void executableGateFrameAppliesAndAcksInOrder() {
+        ControlSubscriber sub = subscriber();
+        assertTrue(sub.applySnapshot(snapshot("open", 5)));
+        assertEquals(
+                ControlSubscriber.Verdict.APPLIED,
+                sub.offer(envelope(6, true, null, gatePayload("maintenance"))));
+        assertEquals("closed", sub.current().state());
+        assertEquals(6, sub.cursor());
+        assertEquals(3, recording.bodies.size());
+        String[] states =
+                recording.bodies.stream()
+                        .map(ControlSubscriberTest::stateOf)
+                        .toArray(String[]::new);
+        assertArrayEquals(new String[] {"received", "validated", "applied"}, states);
+        for (String body : recording.bodies) {
+            JsonObject ack = JsonParser.parseString(body).getAsJsonObject();
+            assertEquals(6, ack.get("sequence").getAsInt());
+            assertEquals(HASH, ack.get("payloadHash").getAsString());
+            assertNotNull(ack.get("actualAt").getAsString());
+        }
+    }
+
+    @Test
+    void expiredFrameAdvancesCursorWithoutApplying() {
+        ControlSubscriber sub = subscriber();
+        assertTrue(sub.applySnapshot(snapshot("open", 5)));
+        String expired =
+                envelope(6, false, "expired", null)
+                        .replace(
+                                Instant.ofEpochMilli(clock.get() + 60_000).toString(),
+                                Instant.ofEpochMilli(clock.get() - 1_000).toString());
+        assertEquals(ControlSubscriber.Verdict.HELD, sub.offer(expired));
+        assertTrue(sub.current().open(), "expired frame must not close or open entry");
+        assertEquals(6, sub.cursor());
+        assertEquals(1, recording.bodies.size());
+        assertEquals("received", stateOf(recording.bodies.get(0)));
+    }
+
+    @Test
+    void staleGenerationResyncs() {
+        ControlSubscriber sub = subscriber();
+        assertTrue(sub.applySnapshot(snapshot("open", 5)));
+        String otherGen =
+                envelope(6, true, null, gatePayload("maintenance")).replace(GENERATION, EPOCH);
+        assertEquals(ControlSubscriber.Verdict.RESYNC, sub.offer(otherGen));
+        assertTrue(sub.current().open());
+        assertEquals(5, sub.cursor());
+    }
+
+    @Test
+    void forgedAudienceResyncs() {
+        ControlSubscriber sub = subscriber();
+        assertTrue(sub.applySnapshot(snapshot("open", 5)));
+        String forged =
+                envelope(6, true, null, gatePayload("maintenance")).replace(CONSUMER, "proxy-9");
+        assertEquals(ControlSubscriber.Verdict.RESYNC, sub.offer(forged));
+        assertTrue(sub.current().open());
+    }
+
+    @Test
+    void nonGatePayloadIsRejectedWithoutApplying() {
+        ControlSubscriber sub = subscriber();
+        assertTrue(sub.applySnapshot(snapshot("open", 5)));
+        String action =
+                "{\"kind\":\"action\",\"namespace\":\"moderation\",\"target\":\"game\","
+                        + "\"value\":{\"command\":\"kick\"}}";
+        assertEquals(ControlSubscriber.Verdict.HELD, sub.offer(envelope(6, true, null, action)));
+        assertTrue(sub.current().open());
+        assertEquals(6, sub.cursor());
+        assertEquals("rejected", stateOf(recording.bodies.get(0)));
+    }
+
+    @Test
+    void partitionHoldsLastGateThenClosesPastTheLease() {
+        ControlSubscriber sub = subscriber();
+        assertTrue(sub.applySnapshot(snapshot("open", 5)));
+        clock.addAndGet(ControlSubscriber.LEASE_MS - 1);
+        assertTrue(sub.current().open(), "partition inside the lease keeps the last snapshot");
+        clock.addAndGet(2);
+        Gate closed = sub.current();
+        assertEquals("closed", closed.state(), "partition past the lease closes entry");
+        assertFalse(closed.allows("game", null, "Anyone", true));
+    }
+
+    @Test
+    void v2GameLegNeverOpensOrClosesTheWorkshopFileLeg() {
+        String id = "f3e1b9a622703dee8782b7cdd8519efe";
+        Gate file =
+                Gate.parse(
+                        "{\"schema\":1,\"gate\":\"public\",\"backend\":\"game\",\"message\":\"\","
+                            + "\"allowed\":[],\"backends\":{"
+                            + "\"game\":{\"gate\":\"closed\",\"message\":\"\",\"allowed\":[]},"
+                            + "\"workshop\":{\"gate\":\"builders\",\"message\":\"\",\"allowed\":"
+                            + "[{\"draslId\":\""
+                                + id
+                                + "\",\"name\":\"NetherG\"}]}}}");
+        ControlSubscriber sub = subscriber();
+        assertTrue(sub.applySnapshot(snapshot("open", 5)));
+        Gate merged = file.withGame(sub.current());
+        assertTrue(merged.allows("game", null, "Anyone", false));
+        assertTrue(merged.allows("workshop", id, "NetherG", false));
+        assertFalse(merged.allows("workshop", null, "Anyone", false));
+
+        clock.addAndGet(ControlSubscriber.LEASE_MS + 1);
+        Gate expired = file.withGame(sub.current());
+        assertFalse(expired.allows("game", null, "Anyone", true));
+        assertTrue(
+                expired.allows("workshop", id, "NetherG", false),
+                "a closed/expired game leg must not evict workshop members");
+    }
+
+    private static String stateOf(String ackBody) {
+        return JsonParser.parseString(ackBody).getAsJsonObject().get("state").getAsString();
+    }
+}
