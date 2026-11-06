@@ -5,6 +5,7 @@ import static io.blockfield.proxy.GateEvictionTest.fake;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -31,6 +32,7 @@ import org.junit.jupiter.api.Test;
 import org.slf4j.LoggerFactory;
 
 import java.lang.reflect.Field;
+import java.lang.reflect.Modifier;
 import java.net.InetSocketAddress;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -417,6 +419,47 @@ class BackendRoutingTest {
                 Component.text(
                         "Workshop gate", net.kyori.adventure.text.format.NamedTextColor.GOLD),
                 workshopPing.getPing().getDescriptionComponent());
+    }
+
+    @Test
+    void controlPlaneProbeIsSynchronized() throws Exception {
+        assertTrue(
+                Modifier.isSynchronized(
+                        BackendRouting.class.getDeclaredMethod("controlPlane").getModifiers()),
+                "the lazy v2 probe is a check-then-act shared by ping and admit threads");
+    }
+
+    @Test
+    void halfConfiguredV2PinsGameClosedWithoutGateFile() throws Exception {
+        var fixture = new Fixture("workshop.invalid");
+        ControlSubscriber v2 =
+                ControlSubscriber.fromParts(
+                        "",
+                        "",
+                        "proxy-1",
+                        LoggerFactory.getLogger("test"),
+                        System::currentTimeMillis,
+                        message -> {},
+                        null);
+        assertNotNull(v2, "a consumer without URL/token pins the game leg closed");
+        Field poller = BackendRouting.class.getDeclaredField("gatePoller");
+        poller.setAccessible(true);
+        poller.set(fixture.routing, null);
+        Field probed = BackendRouting.class.getDeclaredField("controlProbed");
+        probed.setAccessible(true);
+        probed.set(fixture.routing, true);
+        Field plane = BackendRouting.class.getDeclaredField("controlPlane");
+        plane.setAccessible(true);
+        plane.set(fixture.routing, v2);
+        var reload = BackendRouting.class.getDeclaredMethod("reloadGate");
+        reload.setAccessible(true);
+        reload.invoke(fixture.routing);
+        Field gate = BackendRouting.class.getDeclaredField("gate");
+        gate.setAccessible(true);
+        assertEquals(
+                "closed",
+                ((Gate) gate.get(fixture.routing)).forBackend("game").state(),
+                "a configured v2 consumer owns game entry even without a gate file");
     }
 
     private static InboundConnection connection(String host) {

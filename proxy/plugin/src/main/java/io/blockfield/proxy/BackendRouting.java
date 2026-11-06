@@ -82,6 +82,8 @@ final class BackendRouting {
     // Никогда не null из-за битого окружения: fromEnv не бросает, а битый хост мастерской
     // лишь отключает мастерскую (как пустой), а не роняет весь плагин.
     private GatePoller gatePoller;
+    private volatile ControlSubscriber controlPlane;
+    private volatile boolean controlProbed;
 
     /**
      * Gate whose evictions tick() last applied. A ping or connect may reload the file first; tick
@@ -393,9 +395,11 @@ final class BackendRouting {
 
     private void reloadGate() {
         boolean fileChanged = reloadGateFile();
-        if (gatePoller == null && !fileChanged) return;
+        // A configured v2 consumer owns game entry even without a gate file: returning
+        // early here would leave the bundled default instead of the pinned-closed v2 leg.
+        if (gatePoller == null && controlPlane() == null && !fileChanged) return;
         // CP owns game entry only; the Workshop keeps the controller's gate.json rules.
-        Gate next = gatePoller == null ? fileGate : fileGate.withGame(gatePoller.current());
+        Gate next = mergeGate();
         if (!next.equals(gate))
             logger.info(
                     "Gate game={} workshop={} ({} workshop members)",
@@ -403,6 +407,26 @@ final class BackendRouting {
                     next.forBackend("workshop").state(),
                     next.forBackend("workshop").allowed().size());
         gate = next;
+    }
+
+    /**
+     * v2 push consumer (CP-S5). Lazy so the constructor chain stays untouched; separate from the U1
+     * poller. Null means v2 is off (the U1 poll/file path applies); non-null but closed means
+     * half-configured, and then the game leg stays closed instead of falling back to the file.
+     */
+    private synchronized ControlSubscriber controlPlane() {
+        if (!controlProbed) {
+            controlProbed = true;
+            controlPlane = ControlSubscriber.fromEnv(logger);
+        }
+        return controlPlane;
+    }
+
+    /** Game leg source: v2 push wins when configured, otherwise the U1 poll/file path. */
+    private Gate mergeGate() {
+        ControlSubscriber v2 = controlPlane();
+        if (v2 != null) return fileGate.withGame(v2.current());
+        return gatePoller == null ? fileGate : fileGate.withGame(gatePoller.current());
     }
 
     private boolean reloadGateFile() {
