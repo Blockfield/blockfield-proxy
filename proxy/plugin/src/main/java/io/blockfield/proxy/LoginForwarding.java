@@ -8,7 +8,9 @@ import com.velocitypowered.api.proxy.Player;
 import com.velocitypowered.api.proxy.messages.MinecraftChannelIdentifier;
 import com.velocitypowered.api.proxy.server.RegisteredServer;
 
+import java.nio.charset.StandardCharsets;
 import java.util.Map;
+import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -36,6 +38,37 @@ final class LoginForwarding {
 
     void rememberContract(UUID player, byte[] reply) {
         contractReplies.put(player, reply);
+    }
+
+    byte[] contractReply(UUID player) {
+        return contractReplies.get(player);
+    }
+
+    /**
+     * Contract hash from a cached pack_contract reply (FriendlyByteBuf writeUtf
+     * "&lt;contract&gt;:&lt;protocol&gt;"). Empty when the client never answered or the bytes are
+     * malformed; the backend still decides compatibility, the proxy only gates the Workshop leg.
+     */
+    static Optional<String> contractHash(byte[] reply) {
+        if (reply == null || reply.length == 0) return Optional.empty();
+        int length = 0;
+        int shift = 0;
+        int pos = 0;
+        boolean done = false;
+        while (pos < reply.length && pos < 5) {
+            int b = reply[pos++] & 0xff;
+            length |= (b & 0x7f) << shift;
+            if ((b & 0x80) == 0) {
+                done = true;
+                break;
+            }
+            shift += 7;
+        }
+        if (!done || length <= 0 || pos + length != reply.length) return Optional.empty();
+        String text = new String(reply, pos, length, StandardCharsets.UTF_8);
+        int sep = text.indexOf(':');
+        if (sep <= 0) return Optional.empty();
+        return Optional.of(text.substring(0, sep));
     }
 
     @Subscribe

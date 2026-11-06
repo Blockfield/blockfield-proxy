@@ -27,7 +27,7 @@ public final class BlockfieldProxy {
         try {
             forwarding = new LoginForwarding();
             authentication = new Authentication(this, proxy, logger, forwarding);
-            routing = new BackendRouting(this, proxy, logger, authentication);
+            routing = new BackendRouting(this, proxy, logger, authentication, forwarding);
         } catch (RuntimeException e) {
             // Fail closed: a half-built plugin leaves Velocity serving with no auth
             // gate, so stop the proxy instead of running open.

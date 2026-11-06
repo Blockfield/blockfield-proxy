@@ -44,7 +44,11 @@ final class BackendRouting {
     private final ProxyServer proxy;
     private final Logger logger;
     private final Authentication authentication;
+    private final LoginForwarding forwarding;
     private final String workshopHost;
+
+    /** Expected Workshop pack contract hash (BLOCKFIELD_WORKSHOP_PACK_CONTRACT); "" disables. */
+    private final String workshopContract;
 
     /** Inbound RakNet UDP port of the Workshop profile; -1 disables port routing. */
     private final int workshopPort;
@@ -60,6 +64,8 @@ final class BackendRouting {
             "Игровой сервер перезапускается. Вернём вас автоматически, как только он поднимется.";
     static final String WORKSHOP_WAKING =
             "Мастерская просыпается, это займёт 1–2 минуты. Переподключитесь позже.";
+    static final String WORKSHOP_PACK_MESSAGE =
+            "Нужен пак мастерской: обновите Workshop-профиль в лаунчере.";
     static final String DEPLOYING_GAME =
             "Игровой сервер обновляется, это займёт несколько минут. Переподключитесь позже.";
     private static final long WAKE_INTERVAL_MS = TimeUnit.MINUTES.toMillis(1);
@@ -122,10 +128,100 @@ final class BackendRouting {
             String workshopHost,
             int workshopPort,
             Path inboxDir) {
+        this(
+                plugin,
+                proxy,
+                logger,
+                authentication,
+                null,
+                workshopHost,
+                workshopPort,
+                inboxDir,
+                workshopContractFromEnv());
+    }
+
+    BackendRouting(
+            Object plugin,
+            ProxyServer proxy,
+            Logger logger,
+            Authentication authentication,
+            LoginForwarding forwarding) {
+        this(
+                plugin,
+                proxy,
+                logger,
+                authentication,
+                forwarding,
+                System.getenv("BLOCKFIELD_WORKSHOP_HOST"));
+    }
+
+    BackendRouting(
+            Object plugin,
+            ProxyServer proxy,
+            Logger logger,
+            Authentication authentication,
+            LoginForwarding forwarding,
+            String workshopHost) {
+        this(plugin, proxy, logger, authentication, forwarding, workshopHost, inboxDirFromEnv());
+    }
+
+    BackendRouting(
+            Object plugin,
+            ProxyServer proxy,
+            Logger logger,
+            Authentication authentication,
+            LoginForwarding forwarding,
+            String workshopHost,
+            Path inboxDir) {
+        this(
+                plugin,
+                proxy,
+                logger,
+                authentication,
+                forwarding,
+                workshopHost,
+                workshopPortFromEnv(),
+                inboxDir,
+                workshopContractFromEnv());
+    }
+
+    BackendRouting(
+            Object plugin,
+            ProxyServer proxy,
+            Logger logger,
+            Authentication authentication,
+            LoginForwarding forwarding,
+            String workshopHost,
+            int workshopPort,
+            Path inboxDir) {
+        this(
+                plugin,
+                proxy,
+                logger,
+                authentication,
+                forwarding,
+                workshopHost,
+                workshopPort,
+                inboxDir,
+                workshopContractFromEnv());
+    }
+
+    BackendRouting(
+            Object plugin,
+            ProxyServer proxy,
+            Logger logger,
+            Authentication authentication,
+            LoginForwarding forwarding,
+            String workshopHost,
+            int workshopPort,
+            Path inboxDir,
+            String workshopContract) {
         this.plugin = plugin;
         this.proxy = proxy;
         this.logger = logger;
         this.authentication = authentication;
+        this.forwarding = forwarding;
+        this.workshopContract = workshopContract == null ? "" : workshopContract.strip();
         String host = workshopHost == null ? "" : workshopHost.strip();
         if (!host.isEmpty() && !validWorkshopHost(host)) {
             // Fail closed, never throw: опечатка не должна ронять плагин (и вместе с ним
@@ -203,6 +299,28 @@ final class BackendRouting {
         } catch (NumberFormatException ignored) {
             return -1;
         }
+    }
+
+    static String workshopContractFromEnv() {
+        String raw = System.getenv("BLOCKFIELD_WORKSHOP_PACK_CONTRACT");
+        return raw == null ? "" : raw.strip();
+    }
+
+    /**
+     * Workshop leg pack gate. An empty expected hash disables the gate (unconfigured proxies and
+     * the game leg behave as before); otherwise only the Workshop pack contract enters, anything
+     * else (game pack, vanilla, outdated) is rejected with WORKSHOP_PACK_MESSAGE. No hashes are
+     * hard-coded: the expected value comes from BLOCKFIELD_WORKSHOP_PACK_CONTRACT.
+     */
+    static boolean workshopPackAllows(String expected, byte[] reply) {
+        if (expected == null || expected.isEmpty()) return true;
+        return LoginForwarding.contractHash(reply).map(expected::equals).orElse(false);
+    }
+
+    private boolean workshopPackRejected(Player player) {
+        if (workshopContract.isEmpty()) return false;
+        byte[] reply = forwarding == null ? null : forwarding.contractReply(player.getUniqueId());
+        return !workshopPackAllows(workshopContract, reply);
     }
 
     static String normalizeHost(String value) {
@@ -398,7 +516,9 @@ final class BackendRouting {
                         server.getServerInfo().getName(),
                         authentication.profileId(id),
                         player.getUsername(),
-                        member);
+                        member)
+                && !(server.getServerInfo().getName().equals("workshop")
+                        && workshopPackRejected(player));
     }
 
     /** The address selects a profile; gate and account roles still control admission. */
@@ -408,6 +528,8 @@ final class BackendRouting {
 
     private String waitingText(Player player) {
         String backend = requestedBackend(player);
+        if (backend.equals("workshop") && workshopPackRejected(player))
+            return WORKSHOP_PACK_MESSAGE;
         if (target(player).isPresent())
             return backend.equals("workshop")
                     ? "Мастерская запускается. Вернём вас автоматически, когда она поднимется."
