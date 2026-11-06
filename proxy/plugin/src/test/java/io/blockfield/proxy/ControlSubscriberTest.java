@@ -10,6 +10,7 @@ import org.junit.jupiter.api.Test;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
@@ -717,6 +718,203 @@ class ControlSubscriberTest {
         } finally {
             server.stop(0);
             pool.shutdownNow();
+        }
+    }
+
+    @Test
+    void outOfRangeRevisionLabeledSafely() {
+        ControlSubscriber sub = subscriber();
+        assertTrue(sub.applySnapshot(snapshot("open", 5)));
+        String huge =
+                envelope(6, true, null, gatePayload("maintenance"))
+                        .replace("\"revision\":4", "\"revision\":5000000000");
+        assertEquals(
+                ControlSubscriber.Verdict.APPLIED,
+                sub.offer(huge),
+                "an out-of-int revision labels the ACK instead of corrupting it");
+        assertEquals(6, sub.cursor());
+        ControlSubscriber again = subscriber();
+        assertTrue(again.applySnapshot(snapshot("open", 5)));
+        String frac =
+                envelope(6, true, null, gatePayload("maintenance"))
+                        .replace("\"revision\":4", "\"revision\":1.5");
+        assertEquals(ControlSubscriber.Verdict.APPLIED, again.offer(frac));
+        assertEquals(6, again.cursor());
+        assertTrue(
+                recording.bodies.stream().anyMatch(b -> b.contains("\"revision\":5000000000")),
+                "a long revision is reported exactly, not truncated to int");
+        assertTrue(
+                recording.bodies.getLast().contains("\"revision\":null"),
+                "a fractional revision degrades to null in the ACK");
+    }
+
+    @Test
+    void partialLineStallReconnectsWithinIdle() throws Exception {
+        AtomicInteger events = new AtomicInteger();
+        String snap = snapshot("open", 5);
+        String frame = envelope(6, true, null, gatePayload("maintenance"));
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        ExecutorService pool = Executors.newCachedThreadPool();
+        server.setExecutor(pool);
+        server.createContext(
+                "/v2/agents/" + CONSUMER + "/snapshot",
+                exchange -> {
+                    byte[] body = snap.getBytes(StandardCharsets.UTF_8);
+                    exchange.sendResponseHeaders(200, body.length);
+                    try (OutputStream out = exchange.getResponseBody()) {
+                        out.write(body);
+                    }
+                });
+        server.createContext(
+                "/v2/agents/" + CONSUMER + "/events",
+                exchange -> {
+                    int n = events.incrementAndGet();
+                    exchange.getResponseHeaders().add("Content-Type", "text/event-stream");
+                    exchange.sendResponseHeaders(200, 0);
+                    try {
+                        OutputStream out = exchange.getResponseBody();
+                        if (n == 1) {
+                            // Bytes without a newline, then silence: readLine alone waits
+                            // forever, so only a bounded read reconnects.
+                            out.write("event: con".getBytes(StandardCharsets.UTF_8));
+                            out.flush();
+                            Thread.sleep(25_000);
+                            out.close();
+                            return;
+                        }
+                        out.write(": keep-alive\n\n".getBytes(StandardCharsets.UTF_8));
+                        out.flush();
+                        out.write(
+                                ("event: control\ndata: " + frame + "\n\n")
+                                        .getBytes(StandardCharsets.UTF_8));
+                        out.flush();
+                        Thread.sleep(12_000);
+                        out.close();
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    } catch (IOException e) {
+                        // The test stopped the server mid-stream; nothing to assert here.
+                    }
+                });
+        server.createContext(
+                "/v2/agents/" + CONSUMER + "/acks",
+                exchange -> {
+                    byte[] ok = "{}".getBytes(StandardCharsets.UTF_8);
+                    exchange.sendResponseHeaders(200, ok.length);
+                    try (OutputStream out = exchange.getResponseBody()) {
+                        out.write(ok);
+                    }
+                });
+        server.start();
+        try {
+            ControlSubscriber sub =
+                    ControlSubscriber.fromParts(
+                            "http://127.0.0.1:" + server.getAddress().getPort(),
+                            "token",
+                            CONSUMER,
+                            LoggerFactory.getLogger("test"),
+                            clock::get,
+                            message -> {},
+                            null,
+                            nanos::get);
+            assertNotNull(sub);
+            sub.start();
+            Thread.sleep(1_000);
+            nanos.addAndGet(2 * ControlSubscriber.IDLE_NS);
+            long deadline = System.currentTimeMillis() + 20_000;
+            while (sub.cursor() != 6 && System.currentTimeMillis() < deadline) {
+                Thread.sleep(50);
+            }
+            assertEquals(6, sub.cursor(), "a stalled partial line is aborted and replayed");
+            assertTrue(events.get() >= 2, "the reconnect opens a fresh stream");
+            sub.stop();
+        } finally {
+            server.stop(0);
+            pool.shutdownNow();
+        }
+    }
+
+    @Test
+    void stopClosesTheLiveBodyPromptly() throws Exception {
+        String snap = snapshot("open", 5);
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext(
+                "/v2/agents/" + CONSUMER + "/snapshot",
+                exchange -> {
+                    byte[] body = snap.getBytes(StandardCharsets.UTF_8);
+                    exchange.sendResponseHeaders(200, body.length);
+                    try (OutputStream out = exchange.getResponseBody()) {
+                        out.write(body);
+                    }
+                });
+        server.createContext(
+                "/v2/agents/" + CONSUMER + "/events",
+                exchange -> {
+                    exchange.getResponseHeaders().add("Content-Type", "text/event-stream");
+                    exchange.sendResponseHeaders(200, 0);
+                    try {
+                        // Partial line with no newline: interrupt() alone cannot wake the
+                        // read, only closing the body can.
+                        OutputStream out = exchange.getResponseBody();
+                        out.write("event: con".getBytes(StandardCharsets.UTF_8));
+                        out.flush();
+                        Thread.sleep(25_000);
+                        out.close();
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    } catch (IOException e) {
+                        // The test stopped the server mid-stream; nothing to assert here.
+                    }
+                });
+        server.start();
+        try {
+            ControlSubscriber sub =
+                    ControlSubscriber.fromParts(
+                            "http://127.0.0.1:" + server.getAddress().getPort(),
+                            "token",
+                            CONSUMER,
+                            LoggerFactory.getLogger("test"),
+                            clock::get,
+                            message -> {},
+                            recording,
+                            nanos::get);
+            assertNotNull(sub);
+            sub.start();
+            long deadline = System.currentTimeMillis() + 5_000;
+            while (sub.cursor() != 5 && System.currentTimeMillis() < deadline) {
+                Thread.sleep(50);
+            }
+            assertEquals(5, sub.cursor(), "the snapshot lands before the stream stalls");
+            // Let the reader block on the partial line, then grab the body while the
+            // stream still holds it: after stop() the reader may already have exited.
+            Thread.sleep(1_500);
+            var bodyField = ControlSubscriber.class.getDeclaredField("liveBody");
+            bodyField.setAccessible(true);
+            InputStream body = null;
+            long bodyDeadline = System.currentTimeMillis() + 5_000;
+            while (body == null && System.currentTimeMillis() < bodyDeadline) {
+                body = (InputStream) bodyField.get(sub);
+                if (body == null) Thread.sleep(50);
+            }
+            assertNotNull(body, "the stream holds its body while reading");
+            long started = System.currentTimeMillis();
+            sub.stop();
+            try {
+                assertEquals(-1, body.read(), "stop() closes the body, unblocking the read");
+            } catch (IOException e) {
+                // A closed body may throw instead of returning -1; either way the read
+                // is unblocked instead of stalling on the partial line.
+            }
+            assertTrue(
+                    System.currentTimeMillis() - started < 3_000,
+                    "stop() returns promptly instead of outliving the stall");
+            var threadField = ControlSubscriber.class.getDeclaredField("streamThread");
+            threadField.setAccessible(true);
+            Thread thread = (Thread) threadField.get(sub);
+            thread.join(3_000);
+            assertFalse(thread.isAlive(), "the stream thread exits after the body is closed");
+        } finally {
+            server.stop(0);
         }
     }
 

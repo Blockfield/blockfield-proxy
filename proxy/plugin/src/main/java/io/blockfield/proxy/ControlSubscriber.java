@@ -59,7 +59,6 @@ final class ControlSubscriber {
     static final long LEASE_NS = TimeUnit.MILLISECONDS.toNanos(LEASE_MS);
 
     static final long IDLE_NS = TimeUnit.MILLISECONDS.toNanos(IDLE_MS);
-    private static final long POLL_MS = 250;
 
     /** What {@link #offer} did with one stream envelope. */
     enum Verdict {
@@ -100,6 +99,8 @@ final class ControlSubscriber {
     private final boolean live;
     private volatile boolean stopped;
     private volatile Thread streamThread;
+    private volatile InputStream liveBody;
+    private volatile long lastLineAt;
 
     ControlSubscriber(
             String consumer,
@@ -226,11 +227,23 @@ final class ControlSubscriber {
         thread.start();
     }
 
-    /** Stops the stream thread; a blocked or idle read wakes within one poll. */
+    /** Stops the stream thread; closing the body unblocks a read immediately. */
     void stop() {
         stopped = true;
         Thread thread = streamThread;
         if (thread != null) thread.interrupt();
+        closeBody(liveBody);
+    }
+
+    /** Closing the body aborts a blocked read; a stale close is a no-op. */
+    private static void closeBody(InputStream body) {
+        if (body != null) {
+            try {
+                body.close();
+            } catch (IOException ignored) {
+                // The stream is going away anyway; loop() exits on the closed read.
+            }
+        }
     }
 
     /** Current game-leg gate: last verified snapshot, closed past the lease or before it. */
@@ -309,13 +322,8 @@ final class ControlSubscriber {
             if (!generation.equals(envGeneration)) return Verdict.RESYNC;
         }
         String payloadHash = text(envelope, "payloadHash");
-        JsonElement revisionEl = envelope.get("revision");
-        Integer revision =
-                revisionEl != null
-                                && revisionEl.isJsonPrimitive()
-                                && revisionEl.getAsJsonPrimitive().isNumber()
-                        ? revisionEl.getAsInt()
-                        : null;
+        // Revision only labels the ACK: a missing, fractional, or out-of-long one is null.
+        Long revision = integral(envelope, "revision");
         if (!executable || envelope.get("reason") != null && !envelope.get("reason").isJsonNull()) {
             advance(sequence);
             freshAt = monotonic.getAsLong();
@@ -361,7 +369,7 @@ final class ControlSubscriber {
             String envEpoch,
             long sequence,
             String envGeneration,
-            Integer revision,
+            Long revision,
             String payloadHash,
             String state,
             String result) {
@@ -474,6 +482,22 @@ final class ControlSubscriber {
         }
     }
 
+    /**
+     * Integral JSON numbers only. Gson coerces fractional numbers to long without throwing, so
+     * match the raw form first: anything but plain digits degrades to null instead of a silently
+     * wrong ACK receipt.
+     */
+    private static Long integral(JsonObject obj, String key) {
+        JsonElement el = obj.get(key);
+        if (el == null || !el.isJsonPrimitive() || !el.getAsJsonPrimitive().isNumber()) return null;
+        if (!el.getAsString().matches("-?\\d+")) return null;
+        try {
+            return Long.parseLong(el.getAsString());
+        } catch (NumberFormatException e) {
+            return null;
+        }
+    }
+
     private static Boolean bool(JsonObject obj, String key) {
         JsonElement el = obj.get(key);
         return el != null && el.isJsonPrimitive() && el.getAsJsonPrimitive().isBoolean()
@@ -560,24 +584,20 @@ final class ControlSubscriber {
         String event = "";
         StringBuilder data = new StringBuilder();
         // Stream incrementally: the CP keeps this connection open, so waiting for the
-        // whole body would delay every frame until the server drops the stream. Bound
-        // each read too: a half-open connection with no frame or keep-alive for three
-        // keep-alive intervals is dead, so abort it and let loop() reconnect.
-        long lastLineAt = monotonic.getAsLong();
+        // whole body would delay every frame until the server drops the stream. A
+        // watchdog bounds the blocking read itself: with no line for three keep-alive
+        // intervals it closes the body, which unblocks readLine, and loop() reconnects.
+        // stop() closes the body the same way, so no read outlives IDLE or stop.
+        liveBody = response.body();
+        lastLineAt = monotonic.getAsLong();
+        Thread watcher = new Thread(() -> watchIdle(response.body()), "cp-v2-idle-watch");
+        watcher.setDaemon(true);
+        watcher.start();
         try (BufferedReader reader =
                 new BufferedReader(
                         new InputStreamReader(response.body(), StandardCharsets.UTF_8))) {
-            while (true) {
-                if (!reader.ready()) {
-                    if (monotonic.getAsLong() - lastLineAt > IDLE_NS) {
-                        response.body().close();
-                        throw new IOException("control-plane v2 stream idle, reconnecting");
-                    }
-                    Thread.sleep(POLL_MS);
-                    continue;
-                }
-                String line = reader.readLine();
-                if (line == null) return;
+            String line;
+            while ((line = reader.readLine()) != null) {
                 lastLineAt = monotonic.getAsLong();
                 // Keep-alive comments carry no frame but prove the CP is reachable.
                 if (line.startsWith(":")) {
@@ -599,6 +619,34 @@ final class ControlSubscriber {
                     data.setLength(0);
                 }
             }
+        } finally {
+            liveBody = null;
+            watcher.interrupt();
+            try {
+                watcher.join(5_000);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
+    }
+
+    /**
+     * Closes a stream that went quiet past the idle bound, unblocking its read. One daemon thread
+     * per stream; the owner joins it before returning, so it never outlives or closes another
+     * stream's body.
+     */
+    private void watchIdle(InputStream body) {
+        try {
+            while (!Thread.currentThread().isInterrupted()) {
+                long remainingNs = lastLineAt + IDLE_NS - monotonic.getAsLong();
+                if (remainingNs <= 0) {
+                    if (body == liveBody) closeBody(body);
+                    return;
+                }
+                Thread.sleep(Math.min(TimeUnit.NANOSECONDS.toMillis(remainingNs) + 1, 1_000));
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
         }
     }
 
