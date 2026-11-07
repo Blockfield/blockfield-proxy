@@ -57,6 +57,19 @@ class AuthenticationIdentityTest {
     }
 
     @Test
+    void tcpLoginPassesTheSameDraslGate() throws Exception {
+        try (Fixture fixture = new Fixture()) {
+            fixture.tcp = true;
+            var login = fixture.login(challenge -> new byte[] {1});
+            assertEquals(ACCOUNT, login.profile().getGameProfile().getUndashedId());
+            assertTrue(fixture.authentication.authenticated(login.player()));
+            var denied = fixture.login(challenge -> new byte[] {0});
+            assertEquals(GameProfile.forOfflinePlayer(NAME).getId(), denied.player().getUniqueId());
+            assertFalse(fixture.authentication.authenticated(denied.player()));
+        }
+    }
+
+    @Test
     void unverifiedOrInvalidIdentityNeverChangesOfflineUuidOrAuthenticates() throws Exception {
         try (Fixture fixture = new Fixture()) {
             for (Function<String, byte[]> response :
@@ -414,6 +427,7 @@ class AuthenticationIdentityTest {
         final java.util.concurrent.atomic.AtomicInteger admissions =
                 new java.util.concurrent.atomic.AtomicInteger();
         final AtomicReference<Runnable> disconnect = new AtomicReference<>();
+        boolean tcp;
 
         Fixture() throws Exception {
             server.createContext(
@@ -509,7 +523,7 @@ class AuthenticationIdentityTest {
 
         GameProfileRequestEvent begin(Function<String, byte[]> response) {
             LoginPhaseConnection connection =
-                    RaknetOnlyTest.overRaknet(
+                    RaknetOnlyTest.overTransport(
                             LoginPhaseConnection.class,
                             fake(
                                     LoginPhaseConnection.class,
@@ -533,7 +547,9 @@ class AuthenticationIdentityTest {
                                                     .onMessageResponse(reply);
                                         }
                                         return null;
-                                    }));
+                                    }),
+                            !tcp,
+                            new InetSocketAddress("127.0.0.1", tcp ? 25565 : 25566));
             authentication.onPreLogin(new PreLoginEvent(connection, NAME));
             return new GameProfileRequestEvent(
                     connection, GameProfile.forOfflinePlayer(NAME), false);

@@ -6,7 +6,6 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
-import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.velocitypowered.api.event.connection.DisconnectEvent;
@@ -197,7 +196,7 @@ class BackendRoutingTest {
     }
 
     @Test
-    void preLoginRecordsInboundPortAndKeepsTcpRefused() {
+    void preLoginRecordsInboundPortForRaknetAndTcp() throws Exception {
         var fixture = new Fixture("workshop.invalid");
         var raknetEvent =
                 new PreLoginEvent(
@@ -207,14 +206,22 @@ class BackendRoutingTest {
         fixture.authentication.onPreLogin(raknetEvent);
         assertTrue(raknetEvent.getResult().isAllowed());
         assertEquals(Integer.valueOf(25567), fixture.authentication.inboundPort("PortNick"));
-        // TCP still refused at PreLogin: nothing is recorded for it.
+        // TCP logs in too; its listener port is never the Workshop port, so it routes to Game.
         var tcpEvent =
                 new PreLoginEvent(
-                        RaknetOnlyTest.overTcp(LoginPhaseConnection.class, remote("5.6.7.8")),
+                        RaknetOnlyTest.overTransport(
+                                LoginPhaseConnection.class,
+                                remote("5.6.7.8"),
+                                false,
+                                new InetSocketAddress("127.0.0.1", 25565)),
                         "TcpNick");
         fixture.authentication.onPreLogin(tcpEvent);
-        assertFalse(tcpEvent.getResult().isAllowed());
-        assertNull(fixture.authentication.inboundPort("TcpNick"));
+        assertTrue(tcpEvent.getResult().isAllowed());
+        assertEquals(Integer.valueOf(25565), fixture.authentication.inboundPort("TcpNick"));
+        Player tcp = fixture.player(UUID.randomUUID(), "workshop.invalid", "TcpNick");
+        fixture.authenticate(tcp);
+        fixture.dualGate("public", "builders", "TcpNick");
+        assertEquals(fixture.servers.get("game"), fixture.choose(tcp));
         // Internals mismatch still fails closed.
         var badEvent =
                 new PreLoginEvent(

@@ -81,9 +81,8 @@ final class Authentication {
     private final Map<InetAddress, long[]> ipFailures = new ConcurrentHashMap<>();
 
     /** Rejected logins by reason, scraped from the log; no endpoint, no behavior change. */
-    static final String REJECT_TCP = "non_raknet";
-
     static final String REJECT_MISMATCH = "internals_mismatch";
+
     static final String REJECT_NICK = "bad_nick";
     static final String REJECT_SESSION = "unconfirmed_session";
     static final String REJECT_RATE_LIMIT = "ip_rate_limit";
@@ -169,9 +168,16 @@ final class Authentication {
 
     // shortcut: log-scraped counter, upgrade to a /metrics endpoint when Dokploy monitoring needs
     // it.
-    private void reject(String reason) {
-        rejections.merge(reason, 1, Integer::sum);
-        logger.info("login-rejections {}", rejections);
+    /**
+     * Counts every rejection but logs only the first of each reason, so a password flood or a
+     * mismatch that refuses every login cannot flood the log.
+     *
+     * @return true for the first rejection of this reason since start
+     */
+    private boolean reject(String reason) {
+        if (rejections.merge(reason, 1, Integer::sum) != 1) return false;
+        logger.warn("login-rejections first {} (later ones only counted): {}", reason, rejections);
+        return true;
     }
 
     @Subscribe
@@ -193,17 +199,15 @@ final class Authentication {
                 RaknetOnly.denial(
                         event.getConnection(),
                         error -> {
-                            reject(REJECT_MISMATCH);
-                            logger.error(
-                                    "Velocity/Raknetify internals mismatch: cannot detect the"
-                                            + " login transport, refusing {}, rejections={}",
-                                    event.getUsername(),
-                                    rejections(),
-                                    error);
+                            if (reject(REJECT_MISMATCH))
+                                logger.error(
+                                        "Velocity/Raknetify internals mismatch: cannot detect the"
+                                                + " login transport, refusing every login"
+                                                + " (first: {})",
+                                        event.getUsername(),
+                                        error);
                         });
         if (denial != null) {
-            // internals_mismatch is already counted above; this branch is a plain TCP login.
-            if (denial == RaknetOnly.DENIED) reject(REJECT_TCP);
             event.setResult(PreLoginEvent.PreLoginComponentResult.denied(denial));
             return;
         }
@@ -215,14 +219,14 @@ final class Authentication {
             return;
         }
         if (!(event.getConnection() instanceof LoginPhaseConnection connection)) return;
-        // Inbound RakNet port selects the profile (BackendRouting): the 1.21.1 handshake
-        // carries rDNS/IP instead of the typed hostname, so only the port distinguishes
-        // Game (25566) from Workshop. Best effort: mismatch already fails closed above.
+        // Inbound port selects the profile (BackendRouting): the 1.21.1 handshake carries
+        // rDNS/IP instead of the typed hostname, so only the port distinguishes Workshop from
+        // Game (RakNet 25566 or TCP 25565). Best effort: mismatch already fails closed above.
         try {
             noteInboundPort(event.getUsername(), RaknetOnly.inboundPort(event.getConnection()));
         } catch (ReflectiveOperationException | RuntimeException error) {
             logger.warn(
-                    "cannot detect the inbound RakNet port of {}, falling back to vhost routing",
+                    "cannot detect the inbound port of {}, falling back to vhost routing",
                     event.getUsername());
         }
         var auth = new CompletableFuture<String>();
