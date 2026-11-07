@@ -6,6 +6,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.velocitypowered.api.event.connection.DisconnectEvent;
@@ -196,7 +197,7 @@ class BackendRoutingTest {
     }
 
     @Test
-    void preLoginRecordsInboundPortForRaknetAndTcp() throws Exception {
+    void preLoginPublishesNoRoutingStateBeforeTheDraslGate() throws Exception {
         var fixture = new Fixture("workshop.invalid");
         var raknetEvent =
                 new PreLoginEvent(
@@ -205,8 +206,11 @@ class BackendRoutingTest {
                         "PortNick");
         fixture.authentication.onPreLogin(raknetEvent);
         assertTrue(raknetEvent.getResult().isAllowed());
-        assertEquals(Integer.valueOf(25567), fixture.authentication.inboundPort("PortNick"));
-        // TCP logs in too; its listener port is never the Workshop port, so it routes to Game.
+        assertNull(
+                fixture.authentication.inboundPort("PortNick"),
+                "PreLogin must not publish nickname-keyed routing state");
+        // TCP logs in too; its listener port is never the Workshop port, so it routes to Game
+        // once the Drasl gate publishes it at LoginEvent (simulated here by noteInboundPort).
         var tcpEvent =
                 new PreLoginEvent(
                         RaknetOnlyTest.overTransport(
@@ -217,7 +221,10 @@ class BackendRoutingTest {
                         "TcpNick");
         fixture.authentication.onPreLogin(tcpEvent);
         assertTrue(tcpEvent.getResult().isAllowed());
-        assertEquals(Integer.valueOf(25565), fixture.authentication.inboundPort("TcpNick"));
+        assertNull(
+                fixture.authentication.inboundPort("TcpNick"),
+                "PreLogin must not publish nickname-keyed routing state");
+        fixture.authentication.noteInboundPort("TcpNick", 25565);
         Player tcp = fixture.player(UUID.randomUUID(), "workshop.invalid", "TcpNick");
         fixture.authenticate(tcp);
         fixture.dualGate("public", "builders", "TcpNick");

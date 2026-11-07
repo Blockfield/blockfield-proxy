@@ -68,7 +68,8 @@ final class Authentication {
             long createdAt,
             CompletableFuture<String> auth,
             CompletableFuture<byte[]> pack,
-            CompletableFuture<byte[]> contract) {}
+            CompletableFuture<byte[]> contract,
+            Integer inboundPort) {}
 
     private final Map<String, Pending> pending = new ConcurrentHashMap<>();
     private final Set<UUID> authed = ConcurrentHashMap.newKeySet();
@@ -90,7 +91,7 @@ final class Authentication {
 
     private final Map<String, Integer> rejections = new ConcurrentHashMap<>();
 
-    /** Inbound RakNet port by lowercase nickname, recorded at PreLogin for profile routing. */
+    /** Inbound port by lowercase nickname, published at LoginEvent after the Drasl gate passed. */
     private final Map<String, Integer> portByUser = new ConcurrentHashMap<>();
 
     /** Inbound RakNet port of the login; null when no PreLogin was seen. */
@@ -222,8 +223,12 @@ final class Authentication {
         // Inbound port selects the profile (BackendRouting): the 1.21.1 handshake carries
         // rDNS/IP instead of the typed hostname, so only the port distinguishes Workshop from
         // Game (RakNet 25566 or TCP 25565). Best effort: mismatch already fails closed above.
+        // The port stays on the per-connection entry: nickname-keyed routing state is published
+        // only from onLogin after the Drasl gate passed, so abandoned PreLogins leave nothing
+        // behind and a second connection cannot overwrite the first one's port.
+        Integer inboundPort = null;
         try {
-            noteInboundPort(event.getUsername(), RaknetOnly.inboundPort(event.getConnection()));
+            inboundPort = RaknetOnly.inboundPort(event.getConnection());
         } catch (ReflectiveOperationException | RuntimeException error) {
             logger.warn(
                     "cannot detect the inbound port of {}, falling back to vhost routing",
@@ -234,7 +239,7 @@ final class Authentication {
         var contract = new CompletableFuture<byte[]>();
         pending.put(
                 key(event.getConnection().getRemoteAddress(), event.getUsername()),
-                new Pending(System.currentTimeMillis(), auth, pack, contract));
+                new Pending(System.currentTimeMillis(), auth, pack, contract, inboundPort));
         connection.sendLoginPluginMessage(LoginForwarding.PACK, new byte[0], pack::complete);
         connection.sendLoginPluginMessage(
                 LoginForwarding.CONTRACT, new byte[0], contract::complete);
@@ -310,6 +315,8 @@ final class Authentication {
                     && id.toString().replace("-", "").equals(account)) {
                 draslIds.put(id, account);
                 authed.add(id);
+                if (entry.inboundPort() != null)
+                    noteInboundPort(player.getUsername(), entry.inboundPort());
             }
         }
         return EventTask.resumeWhenComplete(
