@@ -10,6 +10,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import quality
 
+HQ_MOD = quality
 HQ_ROOT = quality.ROOT  # noqa: E402
 
 
@@ -137,6 +138,18 @@ class PreCommitHook(unittest.TestCase):
                 ).returncode,
                 0,
             )
+
+    def test_wire_hooks_reports_already_wired_as_success(self):
+        with tempfile.TemporaryDirectory(prefix="bf hooks ") as tmp:
+            root = Path(tmp)
+            subprocess.run(["git", "init", "--quiet", tmp], check=True)
+            (root / ".githooks").mkdir()
+            subprocess.run(
+                ["git", "config", "core.hooksPath", ".githooks"],
+                cwd=root,
+                check=True,
+            )
+            self.assertTrue(HQ_MOD.wire_hooks(root))
 
     def test_commit_leaves_partially_staged_files_alone(self):
         # Fail-before: the old hook formatted the worktree copy and staged it
