@@ -80,6 +80,17 @@ final class Authentication {
     private final Map<UUID, Integer> failures = new ConcurrentHashMap<>();
     private final Map<InetAddress, long[]> ipFailures = new ConcurrentHashMap<>();
 
+    /** Rejected logins by reason, scraped from the log; no endpoint, no behavior change. */
+    static final String REJECT_TCP = "non_raknet";
+
+    static final String REJECT_MISMATCH = "internals_mismatch";
+    static final String REJECT_NICK = "bad_nick";
+    static final String REJECT_SESSION = "unconfirmed_session";
+    static final String REJECT_RATE_LIMIT = "ip_rate_limit";
+    static final String REJECT_AUTH = "auth_failed";
+
+    private final Map<String, Integer> rejections = new ConcurrentHashMap<>();
+
     /** Inbound RakNet port by lowercase nickname, recorded at PreLogin for profile routing. */
     private final Map<String, Integer> portByUser = new ConcurrentHashMap<>();
 
@@ -151,6 +162,18 @@ final class Authentication {
         ipFailures.values().removeIf(w -> now - w[1] > IP_WINDOW_MS);
     }
 
+    /** Snapshot of rejected logins by reason, for tests and log lines. */
+    Map<String, Integer> rejections() {
+        return Map.copyOf(rejections);
+    }
+
+    // shortcut: log-scraped counter, upgrade to a /metrics endpoint when Dokploy monitoring needs
+    // it.
+    private void reject(String reason) {
+        rejections.merge(reason, 1, Integer::sum);
+        logger.info("login-rejections {}", rejections);
+    }
+
     @Subscribe
     public void onDisconnect(DisconnectEvent event) {
         Player player = event.getPlayer();
@@ -169,17 +192,23 @@ final class Authentication {
         Component denial =
                 RaknetOnly.denial(
                         event.getConnection(),
-                        error ->
-                                logger.error(
-                                        "Velocity/Raknetify internals mismatch: cannot detect the"
-                                                + " login transport, refusing {}",
-                                        event.getUsername(),
-                                        error));
+                        error -> {
+                            reject(REJECT_MISMATCH);
+                            logger.error(
+                                    "Velocity/Raknetify internals mismatch: cannot detect the"
+                                            + " login transport, refusing {}, rejections={}",
+                                    event.getUsername(),
+                                    rejections(),
+                                    error);
+                        });
         if (denial != null) {
+            // internals_mismatch is already counted above; this branch is a plain TCP login.
+            if (denial == RaknetOnly.DENIED) reject(REJECT_TCP);
             event.setResult(PreLoginEvent.PreLoginComponentResult.denied(denial));
             return;
         }
         if (!NAME.matcher(event.getUsername()).matches()) {
+            reject(REJECT_NICK);
             event.setResult(
                     PreLoginEvent.PreLoginComponentResult.denied(
                             Component.text("Ник: 3–16 символов, латиница, цифры и _")));
@@ -230,12 +259,14 @@ final class Authentication {
                             resolveDrasl(event.getUsername())
                                     .thenAccept(
                                             current -> {
-                                                if (!expected.equals(current))
+                                                if (!expected.equals(current)) {
+                                                    reject(REJECT_SESSION);
                                                     logger.warn(
                                                             "Remembered session for {} not"
                                                                     + " confirmed by Drasl,"
                                                                     + " parking in lobby",
                                                             event.getUsername());
+                                                }
                                                 auth.complete(confirmSession(expected, current));
                                             });
                         }
@@ -345,6 +376,7 @@ final class Authentication {
             InetAddress ip = player.getRemoteAddress().getAddress();
             long[] window = ipFailures.get(ip);
             if (window != null && window[0] >= IP_MAX_FAILURES) {
+                reject(REJECT_RATE_LIMIT);
                 player.disconnect(
                         Component.text("Слишком много неудачных попыток. Попробуйте позже."));
                 return;
@@ -412,6 +444,7 @@ final class Authentication {
     }
 
     private void fail(Player player, InetAddress ip, String message) {
+        reject(REJECT_AUTH);
         ipFailures.compute(
                 ip,
                 (k, w) ->
