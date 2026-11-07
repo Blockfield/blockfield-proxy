@@ -325,9 +325,9 @@ final class ControlSubscriber {
         // Revision only labels the ACK: a missing, fractional, or out-of-long one is null.
         Long revision = integral(envelope, "revision");
         if (!executable || envelope.get("reason") != null && !envelope.get("reason").isJsonNull()) {
+            ack(envEpoch, sequence, envGeneration, revision, payloadHash, "received", "ok");
             advance(sequence);
             freshAt = monotonic.getAsLong();
-            ack(envEpoch, sequence, envGeneration, revision, payloadHash, "received", "ok");
             return Verdict.HELD;
         }
         if (payloadHash == null || !payloadHash.matches("[0-9a-f]{64}")) {
@@ -336,29 +336,32 @@ final class ControlSubscriber {
             return Verdict.RESYNC;
         }
         if (expired(envelope)) {
+            ack(envEpoch, sequence, envGeneration, revision, payloadHash, "rejected", "ok");
             advance(sequence);
             freshAt = monotonic.getAsLong();
-            ack(envEpoch, sequence, envGeneration, revision, payloadHash, "rejected", "ok");
             return Verdict.HELD;
         }
         Gate next = gateFromPayload(envelope.get("payload"));
         if (next == null) {
+            ack(envEpoch, sequence, envGeneration, revision, payloadHash, "rejected", "ok");
             advance(sequence);
             freshAt = monotonic.getAsLong();
-            ack(envEpoch, sequence, envGeneration, revision, payloadHash, "rejected", "ok");
             return Verdict.HELD;
         }
+        ack(envEpoch, sequence, envGeneration, revision, payloadHash, "received", "ok");
+        ack(envEpoch, sequence, envGeneration, revision, payloadHash, "validated", "ok");
+        ack(envEpoch, sequence, envGeneration, revision, payloadHash, "applied", "ok");
         advance(sequence);
         synchronized (lock) {
             gate = next;
         }
         freshAt = monotonic.getAsLong();
-        ack(envEpoch, sequence, envGeneration, revision, payloadHash, "received", "ok");
-        ack(envEpoch, sequence, envGeneration, revision, payloadHash, "validated", "ok");
-        ack(envEpoch, sequence, envGeneration, revision, payloadHash, "applied", "ok");
         return Verdict.APPLIED;
     }
 
+    // Callers dispatch the frame's ACKs before advancing: a visible cursor N must
+    // imply the receipts for N were already sent (otherwise cross-thread ACK
+    // assertions race the POSTs still in flight). ack() never throws.
     private void advance(long sequence) {
         synchronized (lock) {
             cursor = sequence;
