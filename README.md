@@ -18,6 +18,8 @@ staged-файлы теми же закреплёнными форматтера�
 и пере-stage'ит их, поэтому коммит всегда отформатирован. Хуки включаются
 автоматически при любом `just`-вызове: свежий клон получает хуки на первом `just`
 (обход только через `--no-verify`).
+Если git уже берёт хуки из другого места (`core.hooksPath` в любом конфиге или
+активные хуки в `.git/hooks`), `just` их не трогает и только предупреждает.
 
 Blacksmith проверяет main и PR. Тег `v*` публикует `ghcr.io/blockfield/blockfield-proxy:<tag>` и GitHub Release с описанием. Описание (`release-notes.md`) и анонс для Discord (`announcement.json`) генерирует CI action `release-text` из слитых PR промежутка; при сбое остаётся текст из фактов, тег не падает. Deploy proxy запускается вручную: обновление прокси прерывает подключения игроков. Клиентские и серверные релизы его не перезапускают. Деплой идёт через webhook Dokploy (секрет `DOKPLOY_PROXY_WEBHOOK`, API-ключа Dokploy в Actions нет): релизный канал `ghcr.io/blockfield/blockfield-proxy:prod` (им же настроен Dokploy; main-сборки его не трогают — `build.yml` пушит только теги версий) переставляется на digest тега, при ошибке — обратно на работавший digest (откат — повторный Deploy proxy с прежним тегом). Схема — [server/docs/DEPLOY.md](https://github.com/Blockfield/blockfield-server/blob/main/docs/DEPLOY.md).
 
