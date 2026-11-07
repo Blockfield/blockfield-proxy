@@ -19,9 +19,11 @@ jobs:
   deploy:
     runs-on: blockfield-deploy
     env:
-      # Redeploys only the proxy's release-only :prod channel; no Dokploy API key in Actions.
+      # The rollout below runs the pinned canonical deploy action; no Dokploy API key in Actions.
       DOKPLOY_PROXY_WEBHOOK: ${{ secrets.DOKPLOY_PROXY_WEBHOOK }}
-    # Rollout and its rollback at the deploy-webhooks.py limits.
+      # The canonical script reads the Dokploy app name from the environment.
+      DOKPLOY_PROXY_APP: blockfield-proxy-niocmj
+    # Rollout and its rollback at the canonical deploy limits.
     timeout-minutes: 60
     steps:
       - run: echo "DOCKER_CONFIG=$RUNNER_TEMP/docker" >> "$GITHUB_ENV"
@@ -35,36 +37,88 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ github.token }}
-      - name: Deploy the exact release, roll back to the running digest on failure
+      - name: Resolve the release digest
+        id: release
         env:
           TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if ! printf '%s' "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::Expected a release tag vX.Y.Z, got '$TAG'" >&2
+            exit 1
+          fi
+          digest="$(docker buildx imagetools inspect "ghcr.io/blockfield/blockfield-proxy:$TAG" \
+            --format '{{json .Manifest}}' \
+            | just python -c 'import json,sys; print(json.load(sys.stdin)["digest"])')"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+      - name: Read the running digest for rollback
+        id: previous
+        env:
           WITHOUT_ROLLBACK: ${{ inputs.without_rollback }}
+        # ponytail: swarm read of the canonical current(); the rollout itself lives in the pinned action.
         run: |
           just python - <<'PYCODE'
-          import os, subprocess, sys
-          sys.path.insert(0, 'scripts')
-          hooks = __import__('deploy-webhooks')
-          entry = [sys.executable, 'scripts/entry_liveness.py',
-                   '--gate-file', '/srv/minecraft/workshop/gate/gate.json']
-          digest = hooks.release_digest('blockfield-proxy', os.environ['TAG'])
-          try:
-              previous = hooks.current('blockfield-proxy')
-          except ValueError as error:
-              if os.environ['WITHOUT_ROLLBACK'] != 'true':
-                  raise SystemExit(f'{error}: rerun with without_rollback to deploy anyway')
-              previous = None
-          try:
-              hooks.deploy('blockfield-proxy', digest)
-              # Synthetic post-deploy gate: a player must get in (proxy#48
-              # closed Workshop for ~16 h with no gate catching it).
-              probe = subprocess.run(entry, capture_output=True, text=True, timeout=300)
-              if probe.returncode != 0:
-                  raise SystemExit('entry dead after proxy deploy:\n' + probe.stdout + probe.stderr)
-          except BaseException:
-              if previous:
-                  hooks.deploy('blockfield-proxy', previous)
-                  recheck = subprocess.run(entry, capture_output=True, text=True, timeout=300)
-                  if recheck.returncode != 0:
-                      raise SystemExit('entry still dead after proxy rollback:\n' + recheck.stdout + recheck.stderr)
-              raise
+          import json, os, subprocess, sys
+          service = os.environ.get("DOKPLOY_PROXY_APP", "blockfield-proxy-niocmj")
+          repository = "ghcr.io/blockfield/blockfield-proxy"
+          def docker(*args):
+              try:
+                  return subprocess.run(["docker", *args], text=True, capture_output=True,
+                                        check=True, timeout=300).stdout.strip()
+              except subprocess.CalledProcessError as error:
+                  print(f"docker {' '.join(args[:4])}: {error.stderr.strip()[-400:]}",
+                        file=sys.stderr, flush=True)
+                  raise
+          ids = docker("ps", "--no-trunc", "--filter",
+                       "label=com.docker.swarm.service.name=" + service,
+                       "--format", "{{.ID}}").split()
+          tasks = []
+          for cid in ids:
+              container = json.loads(docker("inspect", cid))[0]
+              imaged = json.loads(docker("image", "inspect", container["Image"]))[0]
+              own = {d.split("@", 1)[1] for d in imaged.get("RepoDigests") or []
+                     if d.startswith(repository + "@")}
+              tasks.append(own)
+          previous, error = None, None
+          if len(tasks) != 1 or not tasks[0]:
+              error = ("blockfield-proxy: the running image is not one "
+                       "ghcr.io/blockfield digest; no automatic rollback")
+          else:
+              for digest in sorted(tasks[0]):
+                  try:
+                      manifest = json.loads(docker("buildx", "imagetools", "inspect",
+                                                   f"{repository}@{digest}",
+                                                   "--format", "{{json .Manifest}}"))
+                  except subprocess.CalledProcessError:
+                      continue
+                  if manifest["digest"] == digest:
+                      previous = digest
+                      break
+              if previous is None:
+                  error = ("blockfield-proxy: the running image is gone "
+                           "from the registry; no automatic rollback")
+          if error is not None and os.environ["WITHOUT_ROLLBACK"] != "true":
+              raise SystemExit(f"{error}: rerun with without_rollback to deploy anyway")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"previous={previous or ''}\n")
           PYCODE
+      - name: Deploy the exact release
+        uses: Blockfield/blockfield-server/.github/actions/deploy-app@6cc2f1f4ac1091cefeb96371c3b76824eb5c194c
+        with:
+          app: proxy
+          digest: ${{ steps.release.outputs.digest }}
+          webhook_url: ${{ secrets.DOKPLOY_PROXY_WEBHOOK }}
+      - name: Check entry after deploy
+        # Synthetic post-deploy gate: a player must get in (proxy#48
+        # closed Workshop for ~16 h with no gate catching it).
+        run: timeout 300 just python scripts/entry_liveness.py --gate-file /srv/minecraft/workshop/gate/gate.json
+      - name: Roll back to the running digest
+        if: (failure() || cancelled()) && steps.previous.outputs.previous != ''
+        uses: Blockfield/blockfield-server/.github/actions/deploy-app@6cc2f1f4ac1091cefeb96371c3b76824eb5c194c
+        with:
+          app: proxy
+          digest: ${{ steps.previous.outputs.previous }}
+          webhook_url: ${{ secrets.DOKPLOY_PROXY_WEBHOOK }}
+      - name: Check entry after rollback
+        if: (failure() || cancelled()) && steps.previous.outputs.previous != ''
+        run: timeout 300 just python scripts/entry_liveness.py --gate-file /srv/minecraft/workshop/gate/gate.json
