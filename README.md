@@ -164,6 +164,13 @@ CP-C2 cutover: прокси больше не читает этот файл —
 control-plane push/ACK (`ControlSubscriber`); хостовый файл остаётся для
 deploy-проверки и будет удалён отдельным юнитом.
 
+При обрыве control-plane прокси продолжает пускать по последнему проверенному
+снимку (fail-static), а не закрывает вход через 60 с: переход пишется в лог
+разово со счётчиком (`control-plane v2 fail-static ... (transition N)`),
+следующий проверенный снимок или кадр возвращает обычный режим. Снимок старше
+`BLOCKFIELD_CP_FAIL_STATIC_MAX_AGE_MS` (по умолчанию 24 ч) закрывает вход
+снова; снимок или кадр, не прошедший проверку, не обслуживается никогда.
+
 `BLOCKFIELD_WORKSHOP_PACK_CONTRACT` задаёт ожидаемый хэш Workshop-пака (contract-часть
 ответа `blockfield:pack_contract`, тот же формат, что `compatibility` в build.json):
 на Workshop-леге входит только Workshop-пак, игровой или ванильный клиент видит

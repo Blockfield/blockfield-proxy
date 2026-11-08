@@ -38,13 +38,16 @@ import java.util.function.LongSupplier;
  * Wire contract is frozen at control-plane origin/main {@code 6df1f95 + cf660e4}; this class
  * consumes it and never invents an alternative API.
  *
- * <p>Safety properties: fail closed before the first snapshot and past the lease (60 s, on a
- * monotonic clock so wall steps cannot extend it); a stream with no frame or keep-alive for three
- * keep-alive intervals is aborted and reconnected; stale/forged/gapped or unparseable frames never
- * move the gate (they request a re-snapshot instead); non-executable and non-gate frames advance
- * the cursor without changing admission; ACKs are best-effort — a lost ACK replays on reconnect and
- * the cursor/epoch guards make the replay idempotent (a cursor that ran ahead of the server's
- * durable cursor self-heals through a {@code 409 snapshot_required} re-snapshot).
+ * <p>Safety properties: fail closed before the first snapshot; past the lease the proxy keeps
+ * serving the last verified snapshot (fail-static, cp#5) instead of closing, until a hard max age
+ * (default 24 h, {@code BLOCKFIELD_CP_FAIL_STATIC_MAX_AGE_MS}) after which it closes again; a
+ * stream with no frame or keep-alive for three keep-alive intervals is aborted and reconnected;
+ * stale/forged/gapped or unparseable frames never move the gate (they request a re-snapshot
+ * instead); non-executable and non-gate frames advance the cursor without changing admission; ACKs
+ * are best-effort — a lost ACK replays on reconnect and the cursor/epoch guards make the replay
+ * idempotent (a cursor that ran ahead of the server's durable cursor self-heals through a {@code
+ * 409 snapshot_required} re-snapshot). A snapshot or frame that fails verification never moves the
+ * gate and never extends service.
  */
 final class ControlSubscriber {
     /** Admission lease: 60 s without a fresh snapshot/apply closes entry (fail closed). */
@@ -58,10 +61,30 @@ final class ControlSubscriber {
     /** The CP heartbeats a healthy stream every 10 s; three missed beats mean a dead stream. */
     static final long IDLE_MS = 30_000;
 
+    /**
+     * Fail-static bound: past this age a verified snapshot closes entry again. Default 24 h covers
+     * a day-long CP outage or maintenance window while bounding stale admission (a revoked gate
+     * stops serving at most a day after the CP went dark); daily operation already re-verifies far
+     * more often. Tunable via {@code BLOCKFIELD_CP_FAIL_STATIC_MAX_AGE_MS}.
+     */
+    static final long FAIL_STATIC_MAX_AGE_MS = TimeUnit.HOURS.toMillis(24);
+
     /** The admission lease, on the monotonic clock so wall steps cannot extend it. */
     static final long LEASE_NS = TimeUnit.MILLISECONDS.toNanos(LEASE_MS);
 
     static final long IDLE_NS = TimeUnit.MILLISECONDS.toNanos(IDLE_MS);
+
+    /** The fail-static bound, on the monotonic clock like the lease. */
+    static final long FAIL_STATIC_MAX_AGE_NS =
+            TimeUnit.MILLISECONDS.toNanos(FAIL_STATIC_MAX_AGE_MS);
+
+    /** Serving mode for the last {@link #current()} call; transitions log once with a counter. */
+    private enum Mode {
+        BOOT,
+        NORMAL,
+        STATIC,
+        EXPIRED
+    }
 
     /** What {@link #offer} did with one stream envelope. */
     enum Verdict {
@@ -116,6 +139,19 @@ final class ControlSubscriber {
 
     private Gate gate = Gate.closed();
     private volatile long freshAt = -LEASE_NS - 1;
+
+    /**
+     * Monotonic time of the last verified gate state (verified snapshot or applied frame);
+     * keep-alives and held frames prove the CP is reachable but re-verify nothing, so they refresh
+     * only the lease. Until the first verified snapshot entry stays closed.
+     */
+    private long verifiedAt = Long.MIN_VALUE;
+
+    /** Hard bound on serving a stale verified snapshot past the lease. */
+    private final long maxAgeNs;
+
+    private Mode lastMode = Mode.BOOT;
+    private long failStaticTransitions;
     private volatile long lastWarnMs = -WARN_MS;
     private final boolean live;
     private volatile boolean stopped;
@@ -138,7 +174,8 @@ final class ControlSubscriber {
             Consumer<String> warn,
             AckSender acks,
             LongSupplier monotonic,
-            boolean live) {
+            boolean live,
+            long maxAgeNs) {
         this.consumer = consumer;
         this.snapshotUri = snapshotUri;
         this.eventsUri = eventsUri;
@@ -149,6 +186,7 @@ final class ControlSubscriber {
         this.acks = acks;
         this.monotonic = monotonic;
         this.live = live;
+        this.maxAgeNs = maxAgeNs;
         // Started last: the worker only touches final fields, the queue and the lock.
         Thread ackWorker = new Thread(this::drainAcks, "cp-v2-acks");
         ackWorker.setDaemon(true);
@@ -200,9 +238,28 @@ final class ControlSubscriber {
                         logger,
                         System::currentTimeMillis,
                         logger::warn,
-                        null);
+                        null,
+                        System::nanoTime,
+                        failStaticMaxAgeMs(
+                                System.getenv("BLOCKFIELD_CP_FAIL_STATIC_MAX_AGE_MS"), logger));
         if (sub != null) sub.start();
         return sub;
+    }
+
+    /** Fail-safe bound parse: blank or invalid values fall back to the default, never unbounded. */
+    static long failStaticMaxAgeMs(String raw, Logger logger) {
+        if (raw == null || raw.isBlank()) return FAIL_STATIC_MAX_AGE_MS;
+        try {
+            long ms = Long.parseLong(raw.strip());
+            if (ms <= 0) throw new NumberFormatException("non-positive max age");
+            return ms;
+        } catch (NumberFormatException e) {
+            logger.warn(
+                    "BLOCKFIELD_CP_FAIL_STATIC_MAX_AGE_MS invalid ({}), using default {} ms",
+                    raw,
+                    FAIL_STATIC_MAX_AGE_MS);
+            return FAIL_STATIC_MAX_AGE_MS;
+        }
     }
 
     /** Seam for tests: builds without starting the stream thread (null sender POSTs to the CP). */
@@ -226,6 +283,29 @@ final class ControlSubscriber {
             Consumer<String> warn,
             AckSender sender,
             LongSupplier monotonic) {
+        return fromParts(
+                url,
+                token,
+                consumer,
+                logger,
+                clock,
+                warn,
+                sender,
+                monotonic,
+                FAIL_STATIC_MAX_AGE_MS);
+    }
+
+    /** Seam for tests: explicit fail-static bound in milliseconds. */
+    static ControlSubscriber fromParts(
+            String url,
+            String token,
+            String consumer,
+            Logger logger,
+            Clock clock,
+            Consumer<String> warn,
+            AckSender sender,
+            LongSupplier monotonic,
+            long maxAgeMs) {
         if (consumer == null || consumer.isBlank()) return null;
         AckSender unconfigured = sender != null ? sender : body -> {};
         if (!consumer.matches("[^\\s/]{1,128}")) {
@@ -233,14 +313,34 @@ final class ControlSubscriber {
             // pin game entry closed instead of falling back to the file.
             logger.warn("control-plane v2 consumer id invalid, game entry stays closed");
             return new ControlSubscriber(
-                    consumer, null, null, null, "", clock, warn, unconfigured, monotonic, false);
+                    consumer,
+                    null,
+                    null,
+                    null,
+                    "",
+                    clock,
+                    warn,
+                    unconfigured,
+                    monotonic,
+                    false,
+                    TimeUnit.MILLISECONDS.toNanos(maxAgeMs));
         }
         if (url == null || url.isBlank() || token == null || token.isBlank()) {
             logger.warn(
                     "control-plane v2 consumer configured without URL/token: game entry stays"
                             + " closed");
             return new ControlSubscriber(
-                    consumer, null, null, null, "", clock, warn, unconfigured, monotonic, false);
+                    consumer,
+                    null,
+                    null,
+                    null,
+                    "",
+                    clock,
+                    warn,
+                    unconfigured,
+                    monotonic,
+                    false,
+                    TimeUnit.MILLISECONDS.toNanos(maxAgeMs));
         }
         try {
             URI base = gateUri(url);
@@ -262,7 +362,8 @@ final class ControlSubscriber {
                     warn,
                     acks,
                     monotonic,
-                    true);
+                    true,
+                    TimeUnit.MILLISECONDS.toNanos(maxAgeMs));
         } catch (IllegalArgumentException e) {
             logger.warn(
                     "control-plane v2 URL invalid, game entry stays closed: {}", e.getMessage());
@@ -276,7 +377,8 @@ final class ControlSubscriber {
                     warn,
                     sender != null ? sender : body -> {},
                     monotonic,
-                    false);
+                    false,
+                    TimeUnit.MILLISECONDS.toNanos(maxAgeMs));
         }
     }
 
@@ -309,16 +411,66 @@ final class ControlSubscriber {
     }
 
     /**
-     * Current gate: last verified snapshot, closed past the lease or before it.
+     * Current gate: the last verified snapshot within the lease, the same snapshot past the lease
+     * while it is younger than the fail-static max age, closed before the first snapshot or past
+     * the max age. Never an unverified or partial gate.
      *
-     * <p>cp#5 (fail-static, later unit): the last verified snapshot lives here ({@code gate} +
-     * {@code freshAt}); that unit keeps serving it past the lease instead of closing, once CP
-     * defines staleness bounds. This cutover keeps fail-closed.
+     * <p>Fail-static transitions (entering, recovery, expiry) log once with a counter; steady
+     * service, including steady fail-static, never logs again.
      */
     Gate current() {
-        if (monotonic.getAsLong() - freshAt > LEASE_NS) return Gate.closed();
+        long now = monotonic.getAsLong();
         synchronized (lock) {
-            return gate;
+            Mode mode;
+            if (now - freshAt <= LEASE_NS) mode = Mode.NORMAL;
+            else if (verifiedAt != Long.MIN_VALUE && now - verifiedAt <= maxAgeNs)
+                mode = Mode.STATIC;
+            else mode = verifiedAt == Long.MIN_VALUE ? Mode.BOOT : Mode.EXPIRED;
+            if (mode != lastMode) {
+                reportTransition(lastMode, mode);
+                lastMode = mode;
+            }
+            return mode == Mode.NORMAL || mode == Mode.STATIC ? gate : Gate.closed();
+        }
+    }
+
+    /**
+     * Log-scraped fail-static counter: how many times service entered, recovered from, or aged out
+     * of fail-static (house pattern, cf. login-rejection counters in Authentication).
+     */
+    long failStaticTransitions() {
+        synchronized (lock) {
+            return failStaticTransitions;
+        }
+    }
+
+    /** True while serving the last verified snapshot past the lease. */
+    boolean failStaticActive() {
+        synchronized (lock) {
+            return lastMode == Mode.STATIC;
+        }
+    }
+
+    /** One warn line per mode change into, out of, or past fail-static; boot stays silent. */
+    private void reportTransition(Mode from, Mode to) {
+        if (to == Mode.STATIC) {
+            failStaticTransitions++;
+            warn.accept(
+                    "control-plane v2 fail-static active, serving last verified gate (transition "
+                            + failStaticTransitions
+                            + ")");
+        } else if (from == Mode.STATIC && to == Mode.NORMAL) {
+            failStaticTransitions++;
+            warn.accept(
+                    "control-plane v2 recovered on verified gate (transition "
+                            + failStaticTransitions
+                            + ")");
+        } else if ((from == Mode.STATIC || from == Mode.NORMAL) && to == Mode.EXPIRED) {
+            failStaticTransitions++;
+            warn.accept(
+                    "control-plane v2 fail-static expired, entry closed (transition "
+                            + failStaticTransitions
+                            + ")");
         }
     }
 
@@ -348,6 +500,7 @@ final class ControlSubscriber {
             return false;
         }
         if (parsed == null) return false;
+        long now = monotonic.getAsLong();
         synchronized (lock) {
             epoch = parsed.epoch;
             generation = parsed.generation;
@@ -356,8 +509,10 @@ final class ControlSubscriber {
             gate = parsed.gate;
             needSnapshot = false;
             resetEpoch++;
+            // Verified here: schema, audience, epoch/generation, cursor and gate all checked.
+            verifiedAt = now;
         }
-        freshAt = monotonic.getAsLong();
+        freshAt = now;
         return true;
     }
 
@@ -461,11 +616,14 @@ final class ControlSubscriber {
         }
         // State first, on this thread: a stalled ACK endpoint must never delay the gate
         // or the next frame. Receipts and the visible cursor follow on the worker.
+        long now = monotonic.getAsLong();
         synchronized (lock) {
             gate = gate.withLeg(update.target(), update.leg());
             applied = sequence;
+            // Verified here: epoch, sequence continuity, generation, payload hash and gate.
+            verifiedAt = now;
         }
-        freshAt = monotonic.getAsLong();
+        freshAt = now;
         enqueueAcks(
                 new AckJob(
                         envEpoch,
