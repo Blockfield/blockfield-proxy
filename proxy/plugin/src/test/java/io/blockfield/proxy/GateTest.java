@@ -79,6 +79,48 @@ class GateTest {
     }
 
     @Test
+    void fromWorkshopParsesStatesAndMembers() {
+        for (String state : new String[] {"builders", "testers"}) {
+            Gate leg = Gate.fromWorkshop(workshopValue(state, ID, "Nether"));
+            assertTrue(leg.allows("workshop", ID, "Nether", false));
+            assertFalse(leg.allows("workshop", ID, "Impostor", false));
+            assertFalse(leg.allows("game", null, "Anyone", false));
+        }
+        Gate sleeping = Gate.fromWorkshop(workshopValue("sleeping", ID, "Builder"));
+        assertTrue(sleeping.sleeping());
+        assertTrue(sleeping.waking());
+        assertFalse(sleeping.allows("workshop", ID, "Builder", false));
+        Gate starting = Gate.fromWorkshop(workshopValue("STARTING", ID, "Builder"));
+        assertTrue(starting.waking());
+        assertFalse(starting.allows("workshop", ID, "Builder", false));
+    }
+
+    @Test
+    void fromWorkshopFailsClosed() {
+        assertEquals("closed", Gate.fromWorkshop(workshopValue("staging", ID, "Nether")).state());
+        assertEquals(
+                "closed",
+                Gate.fromWorkshop(workshopValue("builders", "not-hex", "Nether")).state());
+        assertEquals(
+                "closed", Gate.fromWorkshop(workshopValue("builders", ID, "Bad Name!")).state());
+        assertEquals("closed", Gate.fromWorkshop(null).state());
+    }
+
+    private static com.google.gson.JsonObject workshopValue(
+            String state, String memberId, String memberName) {
+        com.google.gson.JsonObject member = new com.google.gson.JsonObject();
+        member.addProperty("draslId", memberId);
+        member.addProperty("name", memberName);
+        com.google.gson.JsonArray allowed = new com.google.gson.JsonArray();
+        allowed.add(member);
+        com.google.gson.JsonObject value = new com.google.gson.JsonObject();
+        value.addProperty("state", state);
+        value.addProperty("message", "night build");
+        value.add("allowed", allowed);
+        return value;
+    }
+
+    @Test
     void unknownBackendNeverAdmits() {
         Gate gate = dual("public", "builders", ID, "Nether");
         Gate selected = gate.forBackend("lobby");

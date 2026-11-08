@@ -363,8 +363,7 @@ final class BackendRouting {
 
     private void reloadGate() {
         // No CP consumer: entry stays closed (fail closed); tests inject gates directly.
-        // The CP push consumer owns the whole gate; workshop admission therefore also reads
-        // closed until CP serves workshop state.
+        // The CP push consumer owns the whole gate, both legs on the same lease.
         if (controlPlane == null) return;
         Gate next = controlPlane.current();
         if (!next.equals(gate))

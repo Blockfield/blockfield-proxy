@@ -101,6 +101,54 @@ class ControlSubscriberTest {
                 + "\",\"message\":\"\"},\"timing\":\"live\"}";
     }
 
+    private static String workshopPayload(String state, String memberId, String memberName) {
+        String allowed =
+                memberId == null
+                        ? "[]"
+                        : "[{\"draslId\":\"" + memberId + "\",\"name\":\"" + memberName + "\"}]";
+        return "{\"kind\":\"settings\",\"namespace\":\"gate\",\"target\":\"workshop\","
+                + "\"value\":{\"state\":\""
+                + state
+                + "\",\"message\":\"night build\",\"allowed\":"
+                + allowed
+                + "},\"timing\":\"live\"}";
+    }
+
+    private static String snapshotDual(
+            String gameMode,
+            String workshopState,
+            String memberId,
+            String memberName,
+            long cursor) {
+        String allowed =
+                memberId == null
+                        ? "[]"
+                        : "[{\"draslId\":\"" + memberId + "\",\"name\":\"" + memberName + "\"}]";
+        return "{\"schema\":2,\"audience\":\""
+                + CONSUMER
+                + "\",\"epoch\":\""
+                + EPOCH
+                + "\",\"generation\":\""
+                + GENERATION
+                + "\",\"cursor\":"
+                + cursor
+                + ",\"settings\":[{\"namespace\":\"gate\",\"target\":\"*\",\"revision\":3,"
+                + "\"value\":{\"mode\":\""
+                + gameMode
+                + "\",\"message\":\"\"},\"value_hash\":\""
+                + HASH
+                + "\"},{\"namespace\":\"gate\",\"target\":\"workshop\",\"revision\":4,"
+                + "\"value\":{\"state\":\""
+                + workshopState
+                + "\",\"message\":\"night build\",\"allowed\":"
+                + allowed
+                + "},\"value_hash\":\""
+                + HASH
+                + "\"}],\"hash\":\""
+                + HASH
+                + "\"}";
+    }
+
     @Test
     void firstBootWithoutSnapshotStaysClosed() {
         assertEquals("closed", subscriber().current().state());
@@ -261,8 +309,8 @@ class ControlSubscriberTest {
 
     @Test
     void v2GameLegNeverAdmitsWorkshop() {
-        // CP-C2 cutover: the file gate is gone, so the workshop leg has no CP source and reads
-        // closed. Workshop members are never evicted by a game-leg change — they never enter.
+        // A snapshot without the workshop leg leaves it closed; workshop members are never
+        // evicted by a game-leg change — they never enter.
         ControlSubscriber sub = subscriber();
         assertTrue(sub.applySnapshot(snapshot("open", 5)));
         Gate current = sub.current();
@@ -325,14 +373,18 @@ class ControlSubscriberTest {
     }
 
     @Test
-    void foreignTargetSnapshotStaysClosed() {
+    void workshopTargetNeverDrivesGameEntry() {
         ControlSubscriber sub = subscriber();
-        String foreign = snapshot("open", 5).replace("\"target\":\"*\"", "\"target\":\"workshop\"");
-        assertTrue(sub.applySnapshot(foreign));
-        assertEquals(
-                "closed",
-                sub.current().state(),
-                "another target's gate must never drive game entry");
+        // A game-shaped value at the workshop target is an invalid workshop leg: it fails
+        // that leg closed and leaves the game leg exactly as it was.
+        String mixed =
+                snapshotDual("open", "builders", GateTest.ID, "Nether", 5)
+                        .replace("\"state\":\"builders\"", "\"mode\":\"open\"");
+        assertTrue(sub.applySnapshot(mixed));
+        assertTrue(
+                sub.current().allows("game", null, "Anyone", false),
+                "a workshop entry must never drive game entry");
+        assertEquals("closed", sub.current().forBackend("workshop").state());
         assertEquals(5, sub.cursor());
     }
 
@@ -365,17 +417,66 @@ class ControlSubscriberTest {
     }
 
     @Test
-    void foreignTargetFrameIsRejectedWithoutApplying() throws Exception {
+    void workshopLegInSnapshotAdmitsWorkshop() {
+        ControlSubscriber sub = subscriber();
+        assertTrue(sub.applySnapshot(snapshotDual("open", "builders", GateTest.ID, "Nether", 5)));
+        Gate current = sub.current();
+        assertTrue(current.allows("game", null, "Anyone", false));
+        assertTrue(current.allows("workshop", GateTest.ID, "Nether", false));
+        assertFalse(current.allows("workshop", GateTest.ID, "Impostor", false));
+        assertEquals(5, sub.cursor());
+    }
+
+    @Test
+    void workshopFrameAppliesWithoutTouchingGameLeg() throws Exception {
+        ControlSubscriber sub = subscriber();
+        assertTrue(sub.applySnapshot(snapshot("open", 5)));
+        assertEquals(
+                ControlSubscriber.Verdict.APPLIED,
+                sub.offer(
+                        envelope(
+                                6,
+                                true,
+                                null,
+                                workshopPayload("builders", GateTest.ID, "Nether"))));
+        assertTrue(sub.current().allows("game", null, "Anyone", false));
+        assertTrue(sub.current().allows("workshop", GateTest.ID, "Nether", false));
+        awaitCursor(sub, 6);
+        assertEquals(
+                ControlSubscriber.Verdict.APPLIED,
+                sub.offer(envelope(7, true, null, gatePayload("maintenance"))));
+        assertFalse(sub.current().allows("game", null, "Anyone", true));
+        assertTrue(
+                sub.current().allows("workshop", GateTest.ID, "Nether", false),
+                "a game-leg frame must not close the workshop leg");
+    }
+
+    @Test
+    void staleLeaseClosesBothLegs() {
+        ControlSubscriber sub = subscriber();
+        assertTrue(sub.applySnapshot(snapshotDual("open", "builders", GateTest.ID, "Nether", 5)));
+        nanos.addAndGet(ControlSubscriber.LEASE_NS + 1);
+        Gate expired = sub.current();
+        assertFalse(expired.allows("game", null, "Anyone", true));
+        assertFalse(expired.allows("workshop", GateTest.ID, "Nether", false));
+    }
+
+    @Test
+    void workshopFrameLeavesGameLegUntouched() throws Exception {
         ControlSubscriber sub = subscriber();
         assertTrue(sub.applySnapshot(snapshot("open", 5)));
         String other =
                 gatePayload("maintenance").replace("\"target\":\"*\"", "\"target\":\"workshop\"");
-        assertEquals(ControlSubscriber.Verdict.HELD, sub.offer(envelope(6, true, null, other)));
-        assertTrue(sub.current().open(), "another target's gate must never drive game entry");
+        assertEquals(ControlSubscriber.Verdict.APPLIED, sub.offer(envelope(6, true, null, other)));
+        assertTrue(sub.current().open(), "a workshop entry must never drive game entry");
+        assertEquals(
+                "closed",
+                sub.current().forBackend("workshop").state(),
+                "a game-shaped workshop value is an invalid workshop leg, fails closed");
         awaitCursor(sub, 6);
-        awaitBodies(recording.bodies, 1);
+        awaitBodies(recording.bodies, 3);
         assertEquals(6, sub.cursor());
-        assertEquals("rejected", stateOf(recording.bodies.get(0)));
+        assertEquals("applied", stateOf(recording.bodies.get(2)));
     }
 
     @Test

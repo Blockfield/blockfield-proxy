@@ -1,13 +1,19 @@
 package io.blockfield.proxy;
 
+import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
+
+import java.util.HashSet;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.regex.Pattern;
 
 /**
  * Admission state for one backend. The only runtime source is the control-plane push/ACK consumer
- * ({@link ControlSubscriber}): {@link Gate#fromCp} maps the CP gate value, anything unknown or
- * stale fails closed. (CP-C2 cutover removed the {@code gate.json} file gate and its parser.)
+ * ({@link ControlSubscriber}): {@link Gate#fromCp} maps the CP game value, {@link
+ * Gate#fromWorkshop} the CP workshop leg, anything unknown or stale fails closed. (CP-C2 cutover
+ * removed the {@code gate.json} file gate and its parser.)
  */
 record Gate(
         String state,
@@ -19,6 +25,8 @@ record Gate(
     static final String DEFAULT_MESSAGE =
             "На сервере проводятся технические работы. Обычный вход временно недоступен.";
     static final Gate OPEN = new Gate("public", "game", "", Set.of());
+
+    private static final Pattern DRASL_ID = Pattern.compile("[0-9a-f]{32}");
 
     record Member(String draslId, String name) {}
 
@@ -62,6 +70,66 @@ record Gate(
     Gate forBackend(String server) {
         if (!backends.isEmpty()) return backends.getOrDefault(server, closed());
         return server.equals(backend) ? this : closed();
+    }
+
+    /**
+     * Dual-leg composite from single legs; the top level carries the game leg. Missing or corrupt
+     * legs read closed, so a half-known CP answer never opens entry.
+     */
+    static Gate dual(Gate game, Gate workshop) {
+        Gate g = single(game, "game");
+        Gate w = single(workshop, "workshop");
+        return new Gate(g.state, g.backend, g.message, g.allowed, Map.of("game", g, "workshop", w));
+    }
+
+    /** Applies one CP leg, keeping the other leg untouched (frames carry one target). */
+    Gate withLeg(String target, Gate leg) {
+        if ("workshop".equals(target)) return dual(forBackend("game"), leg);
+        return dual(leg, forBackend("workshop"));
+    }
+
+    private static Gate single(Gate leg, String backend) {
+        Gate s = leg == null ? closed() : leg.forBackend(backend);
+        return new Gate(s.state, backend, s.message, s.allowed);
+    }
+
+    /**
+     * Control-plane projection of the workshop leg (CP serves the controller states the file gate
+     * carried). Unknown states, missing shapes and invalid members fail the leg closed; STARTING
+     * keeps its phase name, like the file gate did.
+     */
+    static Gate fromWorkshop(JsonObject value) {
+        try {
+            if (value == null) throw new IllegalArgumentException("Missing workshop value");
+            String state = string(value, "state");
+            if (!Set.of("builders", "testers", "closed", "sleeping", "starting", "STARTING")
+                    .contains(state)) throw new IllegalArgumentException("Unknown workshop state");
+            String message = string(value, "message").strip();
+            if (message.length() > 500) message = message.substring(0, 500);
+            if (message.isEmpty()) message = DEFAULT_MESSAGE;
+            JsonElement allowed = value.get("allowed");
+            if (allowed == null || !allowed.isJsonArray())
+                throw new IllegalArgumentException("Missing allowed list");
+            Set<Member> members = new HashSet<>();
+            for (JsonElement element : allowed.getAsJsonArray()) {
+                JsonObject member = element.getAsJsonObject();
+                String id = normalizeId(string(member, "draslId"));
+                String name = string(member, "name");
+                if (!DRASL_ID.matcher(id).matches() || !Authentication.NAME.matcher(name).matches())
+                    throw new IllegalArgumentException("Invalid workshop member");
+                members.add(new Member(id, name));
+            }
+            return new Gate(state, "workshop", message, Set.copyOf(members));
+        } catch (RuntimeException e) {
+            return new Gate("closed", "workshop", DEFAULT_MESSAGE, Set.of());
+        }
+    }
+
+    private static String string(JsonObject json, String key) {
+        JsonElement value = json.get(key);
+        if (value == null || !value.isJsonPrimitive() || !value.getAsJsonPrimitive().isString())
+            throw new IllegalArgumentException("Expected a string: " + key);
+        return value.getAsString();
     }
 
     boolean open() {

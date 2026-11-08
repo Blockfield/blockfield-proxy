@@ -309,7 +309,7 @@ final class ControlSubscriber {
     }
 
     /**
-     * Current game-leg gate: last verified snapshot, closed past the lease or before it.
+     * Current gate: last verified snapshot, closed past the lease or before it.
      *
      * <p>cp#5 (fail-static, later unit): the last verified snapshot lives here ({@code gate} +
      * {@code freshAt}); that unit keeps serving it past the lease instead of closing, once CP
@@ -438,8 +438,8 @@ final class ControlSubscriber {
                             era));
             return Verdict.HELD;
         }
-        Gate next = gateFromPayload(envelope.get("payload"));
-        if (next == null) {
+        TargetedGate update = gateFromPayload(envelope.get("payload"));
+        if (update == null) {
             freshAt = monotonic.getAsLong();
             markApplied(sequence);
             enqueueAcks(
@@ -456,7 +456,7 @@ final class ControlSubscriber {
         // State first, on this thread: a stalled ACK endpoint must never delay the gate
         // or the next frame. Receipts and the visible cursor follow on the worker.
         synchronized (lock) {
-            gate = next;
+            gate = gate.withLeg(update.target(), update.leg());
             applied = sequence;
         }
         freshAt = monotonic.getAsLong();
@@ -588,19 +588,25 @@ final class ControlSubscriber {
         }
     }
 
-    /** Gate payload only; anything else (actions, other namespaces) is not ours to apply. */
-    private static Gate gateFromPayload(JsonElement payload) {
+    /** One gate leg with the target it applies to; frames carry a single target. */
+    private record TargetedGate(String target, Gate leg) {}
+
+    /** Gate legs only; anything else (actions, other namespaces, other targets) is not ours. */
+    private static TargetedGate gateFromPayload(JsonElement payload) {
         if (payload == null || !payload.isJsonObject()) return null;
         JsonObject obj = payload.getAsJsonObject();
         if (!"settings".equals(text(obj, "kind"))) return null;
         if (!"gate".equals(text(obj, "namespace"))) return null;
-        // Only the game leg follows v2: another target's gate must never drive game entry.
         String target = text(obj, "target");
-        if (!"*".equals(target) && !"game".equals(target)) return null;
         JsonElement value = obj.get("value");
         if (value == null || !value.isJsonObject()) return null;
-        return Gate.fromCp(
-                text(value.getAsJsonObject(), "mode"), text(value.getAsJsonObject(), "message"));
+        JsonObject v = value.getAsJsonObject();
+        // The game leg follows v2; a workshop leg must never drive game entry, and vice versa.
+        if ("*".equals(target) || "game".equals(target))
+            return new TargetedGate("game", Gate.fromCp(text(v, "mode"), text(v, "message")));
+        // The workshop leg drives workshop entry on the same lease as the game leg.
+        if ("workshop".equals(target)) return new TargetedGate("workshop", Gate.fromWorkshop(v));
+        return null;
     }
 
     private record Snapshot(String epoch, String generation, long cursor, Gate gate) {}
@@ -622,25 +628,36 @@ final class ControlSubscriber {
                 || snapCursor < 0
                 || json.get("settings") == null
                 || !json.get("settings").isJsonArray()) return null;
-        Gate found = null;
-        int matches = 0;
+        Gate game = null;
+        int gameMatches = 0;
+        Gate workshop = null;
+        int workshopMatches = 0;
         for (JsonElement el : json.getAsJsonArray("settings")) {
             if (!el.isJsonObject()) continue;
             JsonObject entry = el.getAsJsonObject();
             if (!"gate".equals(text(entry, "namespace"))) continue;
-            String target = text(entry, "target");
-            if (!"*".equals(target) && !"game".equals(target)) continue;
             JsonElement value = entry.get("value");
             if (value == null || !value.isJsonObject()) continue;
-            found =
-                    Gate.fromCp(
-                            text(value.getAsJsonObject(), "mode"),
-                            text(value.getAsJsonObject(), "message"));
-            matches++;
+            JsonObject v = value.getAsJsonObject();
+            String target = text(entry, "target");
+            if ("*".equals(target) || "game".equals(target)) {
+                game = Gate.fromCp(text(v, "mode"), text(v, "message"));
+                gameMatches++;
+            } else if ("workshop".equals(target)) {
+                workshop = Gate.fromWorkshop(v);
+                workshopMatches++;
+            }
         }
-        // Ambiguous game legs pin closed instead of depending on array order.
+        // Ambiguous game legs pin the whole gate closed instead of depending on array order.
+        // A missing workshop leg reads closed; several of them fail only that leg closed, so a
+        // duplicated workshop row can never close game entry.
         return new Snapshot(
-                snapEpoch, snapGeneration, snapCursor, matches == 1 ? found : Gate.closed());
+                snapEpoch,
+                snapGeneration,
+                snapCursor,
+                Gate.dual(
+                        gameMatches == 1 ? game : Gate.closed(),
+                        workshopMatches <= 1 ? workshop : Gate.closed()));
     }
 
     private static String text(JsonObject obj, String key) {
