@@ -45,6 +45,7 @@ class GateTest {
         assertEquals("Техработы", maintenance.message());
         assertFalse(maintenance.allows("game", null, "Anyone", true));
         assertEquals("closed", Gate.fromCp("staging", "").state());
+        assertEquals("closed", Gate.fromCp(null, "").state());
         assertEquals(Gate.DEFAULT_MESSAGE, Gate.fromCp("maintenance", "").message());
     }
 

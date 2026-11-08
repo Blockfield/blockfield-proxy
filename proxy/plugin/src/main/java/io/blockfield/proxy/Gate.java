@@ -58,6 +58,8 @@ record Gate(
     static Gate fromCp(String mode, String message) {
         String msg = message == null ? "" : message.strip();
         if (msg.length() > 500) msg = msg.substring(0, 500);
+        // A missing mode never opens entry: switch would NPE on null out of offer().
+        if (mode == null) return closed();
         return switch (mode) {
             case "open" -> OPEN;
             case "draining" -> new Gate("draining", "game", msg, Set.of());

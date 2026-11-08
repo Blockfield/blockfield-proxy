@@ -438,7 +438,13 @@ final class ControlSubscriber {
                             era));
             return Verdict.HELD;
         }
-        TargetedGate update = gateFromPayload(envelope.get("payload"));
+        TargetedGate update;
+        try {
+            update = gateFromPayload(envelope.get("payload"));
+        } catch (RuntimeException e) {
+            // offer() never throws: a frame the proxy cannot parse re-snapshots.
+            return Verdict.RESYNC;
+        }
         if (update == null) {
             freshAt = monotonic.getAsLong();
             markApplied(sequence);

@@ -358,6 +358,29 @@ class ControlSubscriberTest {
     }
 
     @Test
+    void gateFrameWithoutStringModeFailsClosedWithoutThrowing() throws Exception {
+        for (String payload :
+                new String[] {
+                    gatePayload("maintenance").replace("\"mode\":\"maintenance\",", ""),
+                    gatePayload("maintenance").replace("\"mode\":\"maintenance\"", "\"mode\":42")
+                }) {
+            ControlSubscriber sub = subscriber();
+            assertTrue(sub.applySnapshot(snapshot("open", 5)));
+            assertEquals(
+                    ControlSubscriber.Verdict.APPLIED,
+                    sub.offer(envelope(6, true, null, payload)),
+                    "a mode-less gate frame must fail closed, never throw out of offer()");
+            assertEquals("closed", sub.current().state());
+            awaitCursor(sub, 6);
+            assertEquals(
+                    ControlSubscriber.Verdict.APPLIED,
+                    sub.offer(envelope(7, true, null, gatePayload("open"))),
+                    "the stream keeps moving after a corrupt frame");
+            assertTrue(sub.current().open());
+        }
+    }
+
+    @Test
     void heldFrameRefreshesLease() {
         ControlSubscriber sub = subscriber();
         assertTrue(sub.applySnapshot(snapshot("open", 5)));
