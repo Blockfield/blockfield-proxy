@@ -888,6 +888,9 @@ final class ControlSubscriber {
             try {
                 if (needSnapshot()) snapshot();
                 stream();
+                // A clean close re-verifies too: the gate may have changed while
+                // the stream was down, and fail-static must not hide that.
+                setNeedSnapshot();
             } catch (Resync e) {
                 synchronized (lock) {
                     cursor = -1;
@@ -898,6 +901,10 @@ final class ControlSubscriber {
             } catch (InterruptedException e) {
                 return;
             } catch (Exception e) {
+                // Transport failure: re-verify via snapshot first, so a reachable
+                // snapshot sees the change; fail-static applies only when the
+                // snapshot is unreachable too.
+                setNeedSnapshot();
                 warnOnce("control-plane v2 stream failed, keeping last gate: " + e);
             }
             if (stopped) return;
@@ -912,6 +919,12 @@ final class ControlSubscriber {
     private boolean needSnapshot() {
         synchronized (lock) {
             return needSnapshot;
+        }
+    }
+
+    private void setNeedSnapshot() {
+        synchronized (lock) {
+            needSnapshot = true;
         }
     }
 

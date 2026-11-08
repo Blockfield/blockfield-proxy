@@ -951,6 +951,67 @@ class ControlSubscriberTest {
     }
 
     @Test
+    void transportFailureReverifiesViaSnapshot() throws Exception {
+        AtomicInteger snapshots = new AtomicInteger();
+        String openSnap = snapshot("open", 5);
+        String closedSnap = snapshot("closed", 5);
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        ExecutorService pool = Executors.newCachedThreadPool();
+        server.setExecutor(pool);
+        server.createContext(
+                "/v2/agents/" + CONSUMER + "/snapshot",
+                exchange -> {
+                    String body = snapshots.incrementAndGet() == 1 ? openSnap : closedSnap;
+                    byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
+                    exchange.sendResponseHeaders(200, bytes.length);
+                    try (OutputStream out = exchange.getResponseBody()) {
+                        out.write(bytes);
+                    }
+                });
+        server.createContext(
+                "/v2/agents/" + CONSUMER + "/events",
+                exchange -> {
+                    // The events leg is down while snapshots stay reachable.
+                    exchange.sendResponseHeaders(500, -1);
+                    exchange.close();
+                });
+        server.start();
+        try {
+            ControlSubscriber sub =
+                    ControlSubscriber.fromParts(
+                            "http://127.0.0.1:" + server.getAddress().getPort(),
+                            "token",
+                            CONSUMER,
+                            LoggerFactory.getLogger("test"),
+                            clock::get,
+                            message -> {},
+                            recording,
+                            nanos::get);
+            assertNotNull(sub);
+            sub.start();
+            long openDeadline = System.currentTimeMillis() + 10_000;
+            while (!sub.current().open() && System.currentTimeMillis() < openDeadline) {
+                Thread.sleep(50);
+            }
+            assertTrue(sub.current().open(), "the opening snapshot applies before the stream dies");
+            long deadline = System.currentTimeMillis() + 25_000;
+            while (!"closed".equals(sub.current().state())
+                    && System.currentTimeMillis() < deadline) {
+                Thread.sleep(50);
+            }
+            assertEquals(
+                    "closed",
+                    sub.current().state(),
+                    "a dead stream must re-verify via snapshot, not serve the stale open gate");
+            assertTrue(snapshots.get() >= 2, "the retry snapshots before re-streaming");
+            sub.stop();
+        } finally {
+            server.stop(0);
+            pool.shutdownNow();
+        }
+    }
+
+    @Test
     void outOfRangeRevisionLabeledSafely() throws Exception {
         ControlSubscriber sub = subscriber();
         assertTrue(sub.applySnapshot(snapshot("open", 5)));
