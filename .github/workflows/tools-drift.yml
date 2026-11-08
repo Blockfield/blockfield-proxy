@@ -1,0 +1,25 @@
+name: Tools drift
+on:
+  schedule:
+    # Weekly drift signal, not a required check: the vendored toolchain core
+    # must track workspace origin/main, but a workspace-side change must not
+    # turn every open PR red.
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  drift:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12.10"
+      - name: Drift check against workspace origin/main
+        env:
+          BF_DRIFT_CHECK: "1"
+        run: python -m unittest tests.test_toolchain.VendoredCore.test_vendored_files_equal_workspace_origin_main -v

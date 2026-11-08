@@ -128,7 +128,7 @@ jobs:
           # Unknown comparisons and tags always validate; PRs skip the image steps.
           if [ "$EVENT_NAME" != push ] || [ "$REF_TYPE" = tag ] || ! git cat-file -e "$BASE_SHA^{commit}" 2>/dev/null; then
             image=true
-          elif git diff --quiet "$BASE_SHA" HEAD -- proxy/ distribution/ scripts/quality.py scripts/toolchain.py .github/workflows/build.yml justfile .dockerignore; then
+          elif git diff --quiet "$BASE_SHA" HEAD -- proxy/ distribution/ scripts/quality.py scripts/toolchain.py scripts/tools.lock.json .github/workflows/build.yml justfile .dockerignore; then
             image=false
           else
             image=true
@@ -150,7 +150,7 @@ jobs:
           path: |
             .cache/quality
             .dev/jdk
-          key: quality-tools-v1-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('scripts/toolchain.py', 'scripts/quality.py', 'dev/quality.py') }}
+          key: quality-tools-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/tools.lock.json', 'scripts/toolchain.py', 'scripts/toolchain_local.py', 'scripts/quality.py') }}
       - run: python -I -X utf8 scripts/toolchain.py --ci
       - uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a # v4
       - name: Lint Python, shell, workflows and Java
