@@ -50,6 +50,23 @@ class ControlSubscriberTest {
                 nanos::get);
     }
 
+    private ControlSubscriber subscriber(List<String> warnings) {
+        return subscriber(warnings, ControlSubscriber.FAIL_STATIC_MAX_AGE_MS);
+    }
+
+    private ControlSubscriber subscriber(List<String> warnings, long maxAgeMs) {
+        return ControlSubscriber.fromParts(
+                "https://cp.invalid",
+                "token",
+                CONSUMER,
+                LoggerFactory.getLogger("test"),
+                clock::get,
+                warnings::add,
+                recording,
+                nanos::get,
+                maxAgeMs);
+    }
+
     private static String snapshot(String mode, long cursor) {
         return "{\"schema\":2,\"audience\":\""
                 + CONSUMER
@@ -296,15 +313,70 @@ class ControlSubscriberTest {
     }
 
     @Test
-    void partitionHoldsLastGateThenClosesPastTheLease() {
-        ControlSubscriber sub = subscriber();
+    void partitionServesLastVerifiedSnapshotPastTheLease() {
+        List<String> warnings = new ArrayList<>();
+        ControlSubscriber sub = subscriber(warnings);
         assertTrue(sub.applySnapshot(snapshot("open", 5)));
         nanos.addAndGet(ControlSubscriber.LEASE_NS - 1);
         assertTrue(sub.current().open(), "partition inside the lease keeps the last snapshot");
+        assertFalse(sub.failStaticActive(), "a fresh lease is normal service, not fail-static");
         nanos.addAndGet(2);
-        Gate closed = sub.current();
-        assertEquals("closed", closed.state(), "partition past the lease closes entry");
-        assertFalse(closed.allows("game", null, "Anyone", true));
+        assertTrue(
+                sub.current().open(),
+                "partition past the lease still serves the last verified snapshot");
+        assertTrue(sub.failStaticActive());
+        assertEquals(1, sub.failStaticTransitions());
+        assertEquals(1, warnings.size(), "one log line per transition into fail-static");
+        assertTrue(warnings.get(0).contains("fail-static active"));
+        assertTrue(sub.current().open());
+        assertEquals(1, warnings.size(), "steady fail-static does not log again");
+        assertTrue(sub.current().allows("game", null, "Anyone", true));
+    }
+
+    @Test
+    void rejectedSnapshotNeverVerifiesNorServes() {
+        List<String> warnings = new ArrayList<>();
+        ControlSubscriber sub = subscriber(warnings);
+        assertFalse(
+                sub.applySnapshot(snapshot("open", 5).replace(CONSUMER, "proxy-9")),
+                "a foreign snapshot fails verification");
+        assertFalse(
+                sub.applySnapshot(snapshot("open", 5).replace("\"schema\":2", "\"schema\":1")),
+                "a bad-schema snapshot fails verification");
+        nanos.addAndGet(ControlSubscriber.LEASE_NS + 1);
+        assertEquals(
+                "closed",
+                sub.current().state(),
+                "a snapshot that fails verification never serves, even past the lease");
+        assertFalse(sub.failStaticActive());
+        assertEquals(0, sub.failStaticTransitions());
+        assertTrue(warnings.isEmpty(), "no verified snapshot means no fail-static transition");
+    }
+
+    @Test
+    void verifiedSnapshotPastMaxAgeClosesAgainAndRecovers() {
+        List<String> warnings = new ArrayList<>();
+        long maxAgeMs = ControlSubscriber.LEASE_MS * 4;
+        long maxAgeNs = TimeUnit.MILLISECONDS.toNanos(maxAgeMs);
+        ControlSubscriber sub = subscriber(warnings, maxAgeMs);
+        assertTrue(sub.applySnapshot(snapshot("open", 5)));
+        nanos.addAndGet(ControlSubscriber.LEASE_NS + 1);
+        assertTrue(sub.current().open(), "inside max age the last verified snapshot still serves");
+        nanos.addAndGet(maxAgeNs - ControlSubscriber.LEASE_NS);
+        assertEquals(
+                "closed",
+                sub.current().state(),
+                "past max age entry closes again, even with a verified snapshot");
+        assertFalse(sub.failStaticActive());
+        assertEquals(2, sub.failStaticTransitions(), "enter fail-static, then expire");
+        assertEquals(2, warnings.size(), "one log line per transition");
+        assertTrue(warnings.get(1).contains("expired"));
+        assertTrue(sub.applySnapshot(snapshot("maintenance", 6)));
+        assertEquals(
+                "closed", sub.current().state(), "resume normal on the next verified snapshot");
+        assertFalse(sub.failStaticActive());
+        assertEquals(3, sub.failStaticTransitions(), "recovery is a transition too");
+        assertTrue(warnings.get(2).contains("recovered"));
     }
 
     @Test
@@ -319,9 +391,13 @@ class ControlSubscriberTest {
         assertFalse(current.allows("workshop", EPOCH.replace("-", ""), "NetherG", false));
 
         nanos.addAndGet(ControlSubscriber.LEASE_NS + 1);
-        Gate expired = sub.current();
-        assertFalse(expired.allows("game", null, "Anyone", true));
-        assertFalse(expired.allows("workshop", EPOCH.replace("-", ""), "NetherG", false));
+        Gate failStatic = sub.current();
+        assertTrue(
+                failStatic.allows("game", null, "Anyone", false),
+                "past the lease the last verified snapshot still admits game entry");
+        assertFalse(
+                failStatic.allows("workshop", EPOCH.replace("-", ""), "NetherG", false),
+                "a missing workshop leg stays closed under fail-static");
     }
 
     private static String stateOf(String ackBody) {
@@ -475,10 +551,16 @@ class ControlSubscriberTest {
     }
 
     @Test
-    void staleLeaseClosesBothLegs() {
-        ControlSubscriber sub = subscriber();
+    void staleLeasePastMaxAgeClosesBothLegs() {
+        List<String> warnings = new ArrayList<>();
+        long maxAgeMs = ControlSubscriber.LEASE_MS * 4;
+        ControlSubscriber sub = subscriber(warnings, maxAgeMs);
         assertTrue(sub.applySnapshot(snapshotDual("open", "builders", GateTest.ID, "Nether", 5)));
         nanos.addAndGet(ControlSubscriber.LEASE_NS + 1);
+        Gate failStatic = sub.current();
+        assertTrue(failStatic.allows("game", null, "Anyone", true));
+        assertTrue(failStatic.allows("workshop", GateTest.ID, "Nether", false));
+        nanos.addAndGet(TimeUnit.MILLISECONDS.toNanos(maxAgeMs) - ControlSubscriber.LEASE_NS);
         Gate expired = sub.current();
         assertFalse(expired.allows("game", null, "Anyone", true));
         assertFalse(expired.allows("workshop", GateTest.ID, "Nether", false));
@@ -688,10 +770,17 @@ class ControlSubscriberTest {
         clock.addAndGet(-30_000);
         clock.addAndGet(2);
         nanos.addAndGet(2);
+        assertTrue(
+                sub.current().open(),
+                "a backward wall step must not close the fail-static window past a partition");
+        nanos.addAndGet(
+                TimeUnit.MILLISECONDS.toNanos(ControlSubscriber.FAIL_STATIC_MAX_AGE_MS)
+                        - ControlSubscriber.LEASE_NS
+                        + 1);
         assertEquals(
                 "closed",
                 sub.current().state(),
-                "a backward wall step must not extend the lease past a partition");
+                "the max age is monotonic too: wall steps never extend it");
     }
 
     @Test
