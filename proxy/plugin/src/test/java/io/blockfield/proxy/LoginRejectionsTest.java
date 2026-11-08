@@ -14,12 +14,13 @@ import com.velocitypowered.api.proxy.Player;
 import com.velocitypowered.api.proxy.ProxyServer;
 
 import org.junit.jupiter.api.Test;
-import org.slf4j.LoggerFactory;
+import org.slf4j.Logger;
 
 import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.security.SecureRandom;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HexFormat;
 import java.util.Map;
@@ -28,7 +29,7 @@ import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 
-/** proxy#74 U4: every rejected login is counted by reason, without changing any deny path. */
+/** proxy#74: every rejected login is counted by reason; only the first of each reason is logged. */
 class LoginRejectionsTest {
     private static final String NAME = "RigPeer";
     private static final String EXPECTED = "74b2f4aeceb14b2dabbfc5f41d0a8846";
@@ -59,11 +60,20 @@ class LoginRejectionsTest {
         server.start();
         try {
             var commands = new HashMap<String, SimpleCommand>();
+            var logged = new ArrayList<String>();
+            Logger logger =
+                    fake(
+                            Logger.class,
+                            (method, args) -> {
+                                if (method.equals("warn") || method.equals("error"))
+                                    logged.add(method + " " + args[0]);
+                                return null;
+                            });
             Authentication authentication =
                     new Authentication(
                             this,
                             proxy(commands),
-                            LoggerFactory.getLogger("test"),
+                            logger,
                             new LoginForwarding(),
                             "http://127.0.0.1:" + server.getAddress().getPort(),
                             secret);
@@ -71,9 +81,11 @@ class LoginRejectionsTest {
             assertTrue(authentication.rejections().isEmpty());
 
             var mismatch = fake(LoginPhaseConnection.class, (method, args) -> null);
-            var mismatchEvent = new PreLoginEvent(mismatch, NAME);
-            authentication.onPreLogin(mismatchEvent);
-            assertFalse(mismatchEvent.getResult().isAllowed());
+            for (int i = 0; i < 2; i++) {
+                var mismatchEvent = new PreLoginEvent(mismatch, NAME);
+                authentication.onPreLogin(mismatchEvent);
+                assertFalse(mismatchEvent.getResult().isAllowed());
+            }
 
             var tcp =
                     RaknetOnlyTest.overTcp(
@@ -84,7 +96,7 @@ class LoginRejectionsTest {
                                             method.equals("getRemoteAddress") ? REMOTE : null));
             var tcpEvent = new PreLoginEvent(tcp, NAME);
             authentication.onPreLogin(tcpEvent);
-            assertFalse(tcpEvent.getResult().isAllowed());
+            assertTrue(tcpEvent.getResult().isAllowed(), "TCP logins are not rejected");
 
             var raknet =
                     RaknetOnlyTest.overRaknetOnPort(
@@ -177,13 +189,25 @@ class LoginRejectionsTest {
 
             assertEquals(
                     Map.of(
-                            Authentication.REJECT_MISMATCH, 1,
-                            Authentication.REJECT_TCP, 1,
+                            Authentication.REJECT_MISMATCH, 2,
                             Authentication.REJECT_NICK, 1,
                             Authentication.REJECT_SESSION, 1,
                             Authentication.REJECT_AUTH, 15,
                             Authentication.REJECT_RATE_LIMIT, 1),
                     authentication.rejections());
+            // 21 rejections over 5 reasons: one counter line each plus a single mismatch ERROR.
+            assertEquals(
+                    5,
+                    logged.stream()
+                            .filter(line -> line.startsWith("warn login-rejections"))
+                            .count(),
+                    logged.toString());
+            assertEquals(
+                    1,
+                    logged.stream()
+                            .filter(line -> line.startsWith("error Velocity/Raknetify"))
+                            .count(),
+                    logged.toString());
         } finally {
             server.stop(0);
         }

@@ -69,12 +69,6 @@ class RaknetOnlyTest {
         Minecraft delegatedConnection();
     }
 
-    /** Makes a Velocity API fake look like a login that arrived over RakNet. */
-    @SuppressWarnings("unchecked")
-    static <T> T overRaknet(Class<T> type, T fake) {
-        return overTransport(type, fake, true, null);
-    }
-
     /** Makes a Velocity API fake look like a login that arrived over plain TCP. */
     @SuppressWarnings("unchecked")
     static <T> T overTcp(Class<T> type, T fake) {
@@ -111,7 +105,7 @@ class RaknetOnlyTest {
     }
 
     @Test
-    void onlyRaknetifyPipelinesMayLogIn() throws Exception {
+    void raknetifyPipelineIsDetected() throws Exception {
         assertTrue(RaknetOnly.raknet(new Login(Map.of(RaknetOnly.RAKNET_HANDLER, new Object()))));
         assertFalse(RaknetOnly.raknet(new Login(Map.of("handler", new Object()))));
     }
@@ -132,14 +126,12 @@ class RaknetOnlyTest {
     }
 
     @Test
-    void mismatchedInternalsRefuseEveryLogin() {
+    void tcpAndRaknetLogInButMismatchedInternalsRefuseEveryLogin() {
         InboundConnection api = GateEvictionTest.fake(InboundConnection.class, (m, a) -> null);
         var reported = new ArrayList<Exception>();
         assertSame(RaknetOnly.UNAVAILABLE, RaknetOnly.denial(api, reported::add));
         assertEquals(1, reported.size());
-        assertSame(
-                RaknetOnly.DENIED,
-                RaknetOnly.denial(new Login(Map.of("handler", new Object())), reported::add));
+        assertNull(RaknetOnly.denial(new Login(Map.of("handler", new Object())), reported::add));
         assertNull(
                 RaknetOnly.denial(
                         new Login(Map.of(RaknetOnly.RAKNET_HANDLER, new Object())), reported::add));
