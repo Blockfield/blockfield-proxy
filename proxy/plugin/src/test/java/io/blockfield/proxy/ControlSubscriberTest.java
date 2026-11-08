@@ -19,10 +19,13 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 
 class ControlSubscriberTest {
     private static final String CONSUMER = "proxy-1";
@@ -746,6 +749,47 @@ class ControlSubscriberTest {
         assertTrue(
                 recording.bodies.getLast().contains("\"revision\":null"),
                 "a fractional revision degrades to null in the ACK");
+    }
+
+    @Test
+    void gateAppliesBeforeBlockingAcks() throws Exception {
+        CountDownLatch ackInFlight = new CountDownLatch(1);
+        CountDownLatch releaseAck = new CountDownLatch(1);
+        List<String> sent = Collections.synchronizedList(new ArrayList<>());
+        ControlSubscriber sub =
+                ControlSubscriber.fromParts(
+                        "https://cp.invalid",
+                        "token",
+                        CONSUMER,
+                        LoggerFactory.getLogger("test"),
+                        clock::get,
+                        message -> {},
+                        body -> {
+                            sent.add(body);
+                            ackInFlight.countDown();
+                            releaseAck.await(15, TimeUnit.SECONDS);
+                        },
+                        nanos::get);
+        assertNotNull(sub);
+        assertTrue(sub.applySnapshot(snapshot("open", 5)));
+        AtomicReference<ControlSubscriber.Verdict> verdict = new AtomicReference<>();
+        Thread offer =
+                new Thread(
+                        () ->
+                                verdict.set(
+                                        sub.offer(envelope(6, true, null, gatePayload("closed")))));
+        offer.setDaemon(true);
+        offer.start();
+        assertTrue(ackInFlight.await(15, TimeUnit.SECONDS), "the first ACK blocks in flight");
+        // The gate-closing frame is already enforced while its ACKs still block.
+        assertEquals("closed", sub.current().state());
+        assertEquals(5, sub.cursor(), "the cursor still implies the ACKs were sent");
+        releaseAck.countDown();
+        offer.join(15_000);
+        assertFalse(offer.isAlive(), "offer returns once the ACKs go through");
+        assertEquals(ControlSubscriber.Verdict.APPLIED, verdict.get());
+        assertEquals(6, sub.cursor());
+        assertEquals(3, sent.size(), "received, validated and applied are all sent");
     }
 
     @Test
