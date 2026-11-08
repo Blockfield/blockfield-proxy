@@ -1012,6 +1012,96 @@ class ControlSubscriberTest {
     }
 
     @Test
+    void snapshotDownEventsHealthyStillStreams() throws Exception {
+        AtomicInteger snapshots = new AtomicInteger();
+        AtomicInteger events = new AtomicInteger();
+        String openSnap = snapshot("open", 5);
+        String closedFrame = envelope(6, true, null, gatePayload("closed"));
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        ExecutorService pool = Executors.newCachedThreadPool();
+        server.setExecutor(pool);
+        server.createContext(
+                "/v2/agents/" + CONSUMER + "/snapshot",
+                exchange -> {
+                    if (snapshots.incrementAndGet() == 1) {
+                        byte[] bytes = openSnap.getBytes(StandardCharsets.UTF_8);
+                        exchange.sendResponseHeaders(200, bytes.length);
+                        try (OutputStream out = exchange.getResponseBody()) {
+                            out.write(bytes);
+                        }
+                    } else {
+                        // /snapshot goes down while /events stays healthy.
+                        exchange.sendResponseHeaders(500, -1);
+                        exchange.close();
+                    }
+                });
+        server.createContext(
+                "/v2/agents/" + CONSUMER + "/events",
+                exchange -> {
+                    if (events.incrementAndGet() == 1) {
+                        // The first stream dies while snapshots still work.
+                        exchange.sendResponseHeaders(500, -1);
+                        exchange.close();
+                        return;
+                    }
+                    exchange.getResponseHeaders().add("Content-Type", "text/event-stream");
+                    exchange.sendResponseHeaders(200, 0);
+                    try {
+                        OutputStream out = exchange.getResponseBody();
+                        out.write(": keep-alive\n\n".getBytes(StandardCharsets.UTF_8));
+                        out.flush();
+                        out.write(
+                                ("event: control\ndata: " + closedFrame + "\n\n")
+                                        .getBytes(StandardCharsets.UTF_8));
+                        out.flush();
+                        Thread.sleep(8_000);
+                        out.close();
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    } catch (IOException e) {
+                        // The test stopped the server mid-stream; nothing to assert here.
+                    }
+                });
+        server.start();
+        try {
+            ControlSubscriber sub =
+                    ControlSubscriber.fromParts(
+                            "http://127.0.0.1:" + server.getAddress().getPort(),
+                            "token",
+                            CONSUMER,
+                            LoggerFactory.getLogger("test"),
+                            clock::get,
+                            message -> {},
+                            recording,
+                            nanos::get);
+            assertNotNull(sub);
+            sub.start();
+            long openDeadline = System.currentTimeMillis() + 10_000;
+            while (!sub.current().open() && System.currentTimeMillis() < openDeadline) {
+                Thread.sleep(50);
+            }
+            assertTrue(
+                    sub.current().open(),
+                    "the opening snapshot applies before the first stream dies");
+            long deadline = System.currentTimeMillis() + 25_000;
+            while (!"closed".equals(sub.current().state())
+                    && System.currentTimeMillis() < deadline) {
+                Thread.sleep(50);
+            }
+            assertEquals(
+                    "closed",
+                    sub.current().state(),
+                    "a dead snapshot must not pin the events leg:"
+                            + " the gate-closed frame still applies");
+            assertTrue(events.get() >= 2, "the events leg re-attaches after the snapshot fails");
+            sub.stop();
+        } finally {
+            server.stop(0);
+            pool.shutdownNow();
+        }
+    }
+
+    @Test
     void outOfRangeRevisionLabeledSafely() throws Exception {
         ControlSubscriber sub = subscriber();
         assertTrue(sub.applySnapshot(snapshot("open", 5)));

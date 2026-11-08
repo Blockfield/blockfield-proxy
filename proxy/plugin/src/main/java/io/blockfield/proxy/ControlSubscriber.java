@@ -886,7 +886,16 @@ final class ControlSubscriber {
     private void loop() {
         while (!stopped && !Thread.currentThread().isInterrupted()) {
             try {
-                if (needSnapshot()) snapshot();
+                if (needSnapshot()) {
+                    try {
+                        snapshot();
+                    } catch (IOException e) {
+                        // Best-effort: with /snapshot down the events leg still carries
+                        // verified frames, so re-attach instead of stalling. Stale frames
+                        // verify against the held epoch/generation into the RESYNC path.
+                        warnOnce("control-plane v2 snapshot failed, staying on events: " + e);
+                    }
+                }
                 stream();
                 // A clean close re-verifies too: the gate may have changed while
                 // the stream was down, and fail-static must not hide that.
@@ -902,8 +911,8 @@ final class ControlSubscriber {
                 return;
             } catch (Exception e) {
                 // Transport failure: re-verify via snapshot first, so a reachable
-                // snapshot sees the change; fail-static applies only when the
-                // snapshot is unreachable too.
+                // snapshot sees the change; the snapshot itself is best-effort, so
+                // fail-static applies only when the events leg is down too.
                 setNeedSnapshot();
                 warnOnce("control-plane v2 stream failed, keeping last gate: " + e);
             }
