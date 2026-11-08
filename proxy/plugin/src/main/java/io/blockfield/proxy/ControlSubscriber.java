@@ -459,7 +459,7 @@ final class ControlSubscriber {
                     "control-plane v2 fail-static active, serving last verified gate (transition "
                             + failStaticTransitions
                             + ")");
-        } else if (from == Mode.STATIC && to == Mode.NORMAL) {
+        } else if ((from == Mode.STATIC || from == Mode.EXPIRED) && to == Mode.NORMAL) {
             failStaticTransitions++;
             warn.accept(
                     "control-plane v2 recovered on verified gate (transition "
