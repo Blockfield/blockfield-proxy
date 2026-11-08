@@ -19,8 +19,11 @@ import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 import java.util.function.LongSupplier;
@@ -62,9 +65,9 @@ final class ControlSubscriber {
 
     /** What {@link #offer} did with one stream envelope. */
     enum Verdict {
-        /** Gate and cursor advanced; ACKs sent. */
+        /** Gate applied; receipts queued on the ordered ACK worker. */
         APPLIED,
-        /** Cursor advanced, gate unchanged (duplicate, held or rejected frame). */
+        /** Gate unchanged; frame consumed and its receipts queued. */
         HELD,
         /** Caller must re-snapshot (epoch/generation/cursor/audience mismatch or gap). */
         RESYNC,
@@ -89,10 +92,19 @@ final class ControlSubscriber {
     private final Consumer<String> warn;
     private final AckSender acks;
 
+    /** ACK jobs waiting on the ordered worker; bounds memory under an ACK outage. */
+    private static final int ACK_QUEUE_CAP = 256;
+
     private final Object lock = new Object();
     private String epoch;
     private String generation;
+
+    /** Last ACKed sequence: the visible cursor, also used for SSE resume. Lags applied. */
     private long cursor = -1;
+
+    /** Last applied sequence: duplicate/gap checks use this, never the ACKed cursor. */
+    private long applied = -1;
+
     private Gate gate = Gate.closed();
     private volatile long freshAt = -LEASE_NS - 1;
     private volatile long lastWarnMs = -WARN_MS;
@@ -101,6 +113,11 @@ final class ControlSubscriber {
     private volatile Thread streamThread;
     private volatile InputStream liveBody;
     private volatile long lastLineAt;
+
+    /** One ordered FIFO worker: stream thread enqueues, worker POSTs then advances. */
+    private final BlockingQueue<AckJob> ackQueue = new ArrayBlockingQueue<>(ACK_QUEUE_CAP);
+
+    private final Thread ackThread;
 
     ControlSubscriber(
             String consumer,
@@ -123,6 +140,11 @@ final class ControlSubscriber {
         this.acks = acks;
         this.monotonic = monotonic;
         this.live = live;
+        // Started last: the worker only touches final fields, the queue and the lock.
+        Thread ackWorker = new Thread(this::drainAcks, "cp-v2-acks");
+        ackWorker.setDaemon(true);
+        this.ackThread = ackWorker;
+        ackWorker.start();
     }
 
     /**
@@ -227,12 +249,13 @@ final class ControlSubscriber {
         thread.start();
     }
 
-    /** Stops the stream thread; closing the body unblocks a read immediately. */
+    /** Stops the stream thread and the ACK worker; pending ACKs are dropped. */
     void stop() {
         stopped = true;
         Thread thread = streamThread;
         if (thread != null) thread.interrupt();
         closeBody(liveBody);
+        ackThread.interrupt();
     }
 
     /** Closing the body aborts a blocked read; a stale close is a no-op. */
@@ -254,9 +277,17 @@ final class ControlSubscriber {
         }
     }
 
+    /** Last ACKed sequence: lags applied state during an ACK outage, never runs ahead. */
     long cursor() {
         synchronized (lock) {
             return cursor;
+        }
+    }
+
+    /** Last applied sequence: what the gate already enforces, ACKs pending or not. */
+    long applied() {
+        synchronized (lock) {
+            return applied;
         }
     }
 
@@ -276,6 +307,7 @@ final class ControlSubscriber {
             epoch = parsed.epoch;
             generation = parsed.generation;
             cursor = parsed.cursor;
+            applied = parsed.cursor;
             gate = parsed.gate;
         }
         freshAt = monotonic.getAsLong();
@@ -313,12 +345,12 @@ final class ControlSubscriber {
         }
         synchronized (lock) {
             if (epoch == null || !epoch.equals(envEpoch)) return Verdict.RESYNC;
-            if (sequence <= cursor) {
+            if (sequence <= applied) {
                 // Duplicate delivery on a live stream: the CP is reachable, so the lease holds.
                 freshAt = monotonic.getAsLong();
                 return Verdict.HELD;
             }
-            if (sequence > cursor + 1) return Verdict.RESYNC;
+            if (sequence > applied + 1) return Verdict.RESYNC;
             if (!generation.equals(envGeneration)) return Verdict.RESYNC;
         }
         String payloadHash = text(envelope, "payloadHash");
@@ -326,8 +358,15 @@ final class ControlSubscriber {
         Long revision = integral(envelope, "revision");
         if (!executable || envelope.get("reason") != null && !envelope.get("reason").isJsonNull()) {
             freshAt = monotonic.getAsLong();
-            ack(envEpoch, sequence, envGeneration, revision, payloadHash, "received", "ok");
-            advance(sequence);
+            markApplied(sequence);
+            enqueueAcks(
+                    new AckJob(
+                            envEpoch,
+                            sequence,
+                            envGeneration,
+                            revision,
+                            payloadHash,
+                            List.of(new AckState("received", "ok"))));
             return Verdict.HELD;
         }
         if (payloadHash == null || !payloadHash.matches("[0-9a-f]{64}")) {
@@ -337,39 +376,117 @@ final class ControlSubscriber {
         }
         if (expired(envelope)) {
             freshAt = monotonic.getAsLong();
-            ack(envEpoch, sequence, envGeneration, revision, payloadHash, "rejected", "ok");
-            advance(sequence);
+            markApplied(sequence);
+            enqueueAcks(
+                    new AckJob(
+                            envEpoch,
+                            sequence,
+                            envGeneration,
+                            revision,
+                            payloadHash,
+                            List.of(new AckState("rejected", "ok"))));
             return Verdict.HELD;
         }
         Gate next = gateFromPayload(envelope.get("payload"));
         if (next == null) {
             freshAt = monotonic.getAsLong();
-            ack(envEpoch, sequence, envGeneration, revision, payloadHash, "rejected", "ok");
-            advance(sequence);
+            markApplied(sequence);
+            enqueueAcks(
+                    new AckJob(
+                            envEpoch,
+                            sequence,
+                            envGeneration,
+                            revision,
+                            payloadHash,
+                            List.of(new AckState("rejected", "ok"))));
             return Verdict.HELD;
         }
-        // State first: a stalled ACK endpoint must never delay the gate.
+        // State first, on this thread: a stalled ACK endpoint must never delay the gate
+        // or the next frame. Receipts and the visible cursor follow on the worker.
         synchronized (lock) {
             gate = next;
+            applied = sequence;
         }
         freshAt = monotonic.getAsLong();
-        ack(envEpoch, sequence, envGeneration, revision, payloadHash, "received", "ok");
-        ack(envEpoch, sequence, envGeneration, revision, payloadHash, "validated", "ok");
-        ack(envEpoch, sequence, envGeneration, revision, payloadHash, "applied", "ok");
-        advance(sequence);
+        enqueueAcks(
+                new AckJob(
+                        envEpoch,
+                        sequence,
+                        envGeneration,
+                        revision,
+                        payloadHash,
+                        List.of(
+                                new AckState("received", "ok"),
+                                new AckState("validated", "ok"),
+                                new AckState("applied", "ok"))));
         return Verdict.APPLIED;
     }
 
-    // Callers apply the frame's state before its ACKs and advance last: a slow ACK
-    // endpoint must never delay the gate, and a visible cursor N still implies the
-    // receipts for N were already sent. ack() never throws.
+    private void markApplied(long sequence) {
+        synchronized (lock) {
+            applied = sequence;
+        }
+    }
+
+    // The worker advances the visible cursor after its receipts are POSTed, so the
+    // cursor still implies the receipts were sent but may lag applied state.
     private void advance(long sequence) {
         synchronized (lock) {
             cursor = sequence;
         }
     }
 
-    private void ack(
+    private record AckState(String name, String result) {}
+
+    private record AckJob(
+            String epoch,
+            long sequence,
+            String generation,
+            Long revision,
+            String payloadHash,
+            List<AckState> states) {}
+
+    /** Ordered ACK worker: POSTs each frame's receipts, then advances the visible cursor. */
+    private void drainAcks() {
+        try {
+            while (!stopped) {
+                AckJob job = ackQueue.take();
+                if (stopped) return;
+                for (AckState state : job.states()) {
+                    String body =
+                            ackBody(
+                                    job.epoch(),
+                                    job.sequence(),
+                                    job.generation(),
+                                    job.revision(),
+                                    job.payloadHash(),
+                                    state.name(),
+                                    state.result());
+                    if (body != null) sendBody(body);
+                }
+                advance(job.sequence());
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    // Never blocks the stream thread: a stalled ACK endpoint must never delay the next
+    // frame. Bounded: a full queue sheds the newest receipts (the frame's state stays
+    // applied); the resume cursor then lags behind applied, never runs ahead of it.
+    // shortcut: shed receipts are dropped, not retried; when upgrading, re-enqueue
+    // un-ACKed frames on replay or use cumulative ACKs.
+    private void enqueueAcks(AckJob job) {
+        if (stopped) return;
+        if (!ackQueue.offer(job)) {
+            warnOnce(
+                    "control-plane v2 ack queue full, shedding receipts for sequence "
+                            + job.sequence());
+        }
+    }
+
+    /** Builds one ACK body on the worker just before POSTing, so actualAt is send time. */
+    private String ackBody(
             String envEpoch,
             long sequence,
             String envGeneration,
@@ -377,25 +494,27 @@ final class ControlSubscriber {
             String payloadHash,
             String state,
             String result) {
-        if (payloadHash == null) return;
-        String body =
-                "{\"epoch\":\""
-                        + envEpoch
-                        + "\",\"sequence\":"
-                        + sequence
-                        + ",\"generation\":\""
-                        + envGeneration
-                        + "\",\"revision\":"
-                        + (revision == null ? "null" : revision)
-                        + ",\"payloadHash\":\""
-                        + payloadHash
-                        + "\",\"state\":\""
-                        + state
-                        + "\",\"actualAt\":\""
-                        + Instant.ofEpochMilli(clock.now()).toString()
-                        + "\",\"result\":\""
-                        + result
-                        + "\"}";
+        if (payloadHash == null) return null;
+        return "{\"epoch\":\""
+                + envEpoch
+                + "\",\"sequence\":"
+                + sequence
+                + ",\"generation\":\""
+                + envGeneration
+                + "\",\"revision\":"
+                + (revision == null ? "null" : revision)
+                + ",\"payloadHash\":\""
+                + payloadHash
+                + "\",\"state\":\""
+                + state
+                + "\",\"actualAt\":\""
+                + Instant.ofEpochMilli(clock.now()).toString()
+                + "\",\"result\":\""
+                + result
+                + "\"}";
+    }
+
+    private void sendBody(String body) {
         try {
             acks.send(body);
         } catch (Exception e) {
@@ -535,6 +654,7 @@ final class ControlSubscriber {
             } catch (Resync e) {
                 synchronized (lock) {
                     cursor = -1;
+                    applied = -1;
                 }
             } catch (InterruptedException e) {
                 return;
@@ -695,7 +815,7 @@ final class ControlSubscriber {
     }
 
     static final class Recording implements AckSender {
-        final List<String> bodies = new ArrayList<>();
+        final List<String> bodies = Collections.synchronizedList(new ArrayList<>());
 
         @Override
         public void send(String body) {

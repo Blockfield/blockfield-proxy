@@ -169,13 +169,15 @@ class ControlSubscriberTest {
     }
 
     @Test
-    void executableGateFrameAppliesAndAcksInOrder() {
+    void executableGateFrameAppliesAndAcksInOrder() throws Exception {
         ControlSubscriber sub = subscriber();
         assertTrue(sub.applySnapshot(snapshot("open", 5)));
         assertEquals(
                 ControlSubscriber.Verdict.APPLIED,
                 sub.offer(envelope(6, true, null, gatePayload("maintenance"))));
         assertEquals("closed", sub.current().state());
+        awaitCursor(sub, 6);
+        awaitBodies(recording.bodies, 3);
         assertEquals(6, sub.cursor());
         assertEquals(3, recording.bodies.size());
         String[] states =
@@ -192,7 +194,7 @@ class ControlSubscriberTest {
     }
 
     @Test
-    void expiredFrameAdvancesCursorWithoutApplying() {
+    void expiredFrameAdvancesCursorWithoutApplying() throws Exception {
         ControlSubscriber sub = subscriber();
         assertTrue(sub.applySnapshot(snapshot("open", 5)));
         String expired =
@@ -202,6 +204,8 @@ class ControlSubscriberTest {
                                 Instant.ofEpochMilli(clock.get() - 1_000).toString());
         assertEquals(ControlSubscriber.Verdict.HELD, sub.offer(expired));
         assertTrue(sub.current().open(), "expired frame must not close or open entry");
+        awaitCursor(sub, 6);
+        awaitBodies(recording.bodies, 1);
         assertEquals(6, sub.cursor());
         assertEquals(1, recording.bodies.size());
         assertEquals("received", stateOf(recording.bodies.get(0)));
@@ -229,7 +233,7 @@ class ControlSubscriberTest {
     }
 
     @Test
-    void nonGatePayloadIsRejectedWithoutApplying() {
+    void nonGatePayloadIsRejectedWithoutApplying() throws Exception {
         ControlSubscriber sub = subscriber();
         assertTrue(sub.applySnapshot(snapshot("open", 5)));
         String action =
@@ -237,6 +241,8 @@ class ControlSubscriberTest {
                         + "\"value\":{\"command\":\"kick\"}}";
         assertEquals(ControlSubscriber.Verdict.HELD, sub.offer(envelope(6, true, null, action)));
         assertTrue(sub.current().open());
+        awaitCursor(sub, 6);
+        awaitBodies(recording.bodies, 1);
         assertEquals(6, sub.cursor());
         assertEquals("rejected", stateOf(recording.bodies.get(0)));
     }
@@ -282,6 +288,20 @@ class ControlSubscriberTest {
 
     private static String stateOf(String ackBody) {
         return JsonParser.parseString(ackBody).getAsJsonObject().get("state").getAsString();
+    }
+
+    private static void awaitCursor(ControlSubscriber sub, long want) throws Exception {
+        long deadline = System.currentTimeMillis() + 10_000;
+        while (sub.cursor() != want && System.currentTimeMillis() < deadline) {
+            Thread.sleep(25);
+        }
+    }
+
+    private static void awaitBodies(List<String> bodies, int want) throws Exception {
+        long deadline = System.currentTimeMillis() + 10_000;
+        while (bodies.size() < want && System.currentTimeMillis() < deadline) {
+            Thread.sleep(25);
+        }
     }
 
     @Test
@@ -355,13 +375,15 @@ class ControlSubscriberTest {
     }
 
     @Test
-    void foreignTargetFrameIsRejectedWithoutApplying() {
+    void foreignTargetFrameIsRejectedWithoutApplying() throws Exception {
         ControlSubscriber sub = subscriber();
         assertTrue(sub.applySnapshot(snapshot("open", 5)));
         String other =
                 gatePayload("maintenance").replace("\"target\":\"*\"", "\"target\":\"workshop\"");
         assertEquals(ControlSubscriber.Verdict.HELD, sub.offer(envelope(6, true, null, other)));
         assertTrue(sub.current().open(), "another target's gate must never drive game entry");
+        awaitCursor(sub, 6);
+        awaitBodies(recording.bodies, 1);
         assertEquals(6, sub.cursor());
         assertEquals("rejected", stateOf(recording.bodies.get(0)));
     }
@@ -402,6 +424,7 @@ class ControlSubscriberTest {
             assertEquals(
                     ControlSubscriber.Verdict.APPLIED,
                     sub.offer(envelope(6, true, null, gatePayload("maintenance"))));
+            awaitBodies(bodies, 3);
             assertEquals(3, bodies.size(), "production ACKs reach POST /acks");
             for (String body : bodies) {
                 JsonObject ack = JsonParser.parseString(body).getAsJsonObject();
@@ -725,7 +748,7 @@ class ControlSubscriberTest {
     }
 
     @Test
-    void outOfRangeRevisionLabeledSafely() {
+    void outOfRangeRevisionLabeledSafely() throws Exception {
         ControlSubscriber sub = subscriber();
         assertTrue(sub.applySnapshot(snapshot("open", 5)));
         String huge =
@@ -735,6 +758,7 @@ class ControlSubscriberTest {
                 ControlSubscriber.Verdict.APPLIED,
                 sub.offer(huge),
                 "an out-of-int revision labels the ACK instead of corrupting it");
+        awaitCursor(sub, 6);
         assertEquals(6, sub.cursor());
         ControlSubscriber again = subscriber();
         assertTrue(again.applySnapshot(snapshot("open", 5)));
@@ -742,6 +766,8 @@ class ControlSubscriberTest {
                 envelope(6, true, null, gatePayload("maintenance"))
                         .replace("\"revision\":4", "\"revision\":1.5");
         assertEquals(ControlSubscriber.Verdict.APPLIED, again.offer(frac));
+        awaitCursor(again, 6);
+        awaitBodies(recording.bodies, 6);
         assertEquals(6, again.cursor());
         assertTrue(
                 recording.bodies.stream().anyMatch(b -> b.contains("\"revision\":5000000000")),
@@ -788,8 +814,69 @@ class ControlSubscriberTest {
         offer.join(15_000);
         assertFalse(offer.isAlive(), "offer returns once the ACKs go through");
         assertEquals(ControlSubscriber.Verdict.APPLIED, verdict.get());
+        awaitCursor(sub, 6);
+        awaitBodies(sent, 3);
         assertEquals(6, sub.cursor());
         assertEquals(3, sent.size(), "received, validated and applied are all sent");
+    }
+
+    @Test
+    void nextFrameAppliesWhilePriorAcksBlocked() throws Exception {
+        CountDownLatch firstAckInFlight = new CountDownLatch(1);
+        CountDownLatch releaseAcks = new CountDownLatch(1);
+        List<String> sent = Collections.synchronizedList(new ArrayList<>());
+        ControlSubscriber sub =
+                ControlSubscriber.fromParts(
+                        "https://cp.invalid",
+                        "token",
+                        CONSUMER,
+                        LoggerFactory.getLogger("test"),
+                        clock::get,
+                        message -> {},
+                        body -> {
+                            sent.add(body);
+                            if (sent.size() == 1) {
+                                firstAckInFlight.countDown();
+                                releaseAcks.await(15, TimeUnit.SECONDS);
+                            }
+                        },
+                        nanos::get);
+        assertNotNull(sub);
+        assertTrue(sub.applySnapshot(snapshot("open", 5)));
+        AtomicReference<ControlSubscriber.Verdict> sixth = new AtomicReference<>();
+        Thread first =
+                new Thread(
+                        () -> sixth.set(sub.offer(envelope(6, true, null, gatePayload("open")))));
+        first.setDaemon(true);
+        first.start();
+        assertTrue(
+                firstAckInFlight.await(15, TimeUnit.SECONDS), "frame 6 ACK blocks on the worker");
+        // Frame 7 closes the gate while frame 6's ACKs are still in flight.
+        assertEquals(
+                ControlSubscriber.Verdict.APPLIED,
+                sub.offer(envelope(7, true, null, gatePayload("closed"))),
+                "a stalled ACK endpoint must not delay the next frame");
+        assertEquals("closed", sub.current().state());
+        assertEquals(7, sub.applied(), "applied tracks the gate, not the ACKs");
+        assertEquals(5, sub.cursor(), "the visible cursor still implies the ACKs were sent");
+        releaseAcks.countDown();
+        first.join(15_000);
+        assertFalse(first.isAlive(), "frame 6 returns once its ACKs go through");
+        assertEquals(ControlSubscriber.Verdict.APPLIED, sixth.get());
+        awaitCursor(sub, 7);
+        awaitBodies(sent, 6);
+        assertEquals(6, sent.size(), "received, validated and applied per frame, in order");
+        List<Integer> seqs =
+                sent.stream()
+                        .map(
+                                body ->
+                                        JsonParser.parseString(body)
+                                                .getAsJsonObject()
+                                                .get("sequence")
+                                                .getAsInt())
+                        .toList();
+        assertEquals(List.of(6, 6, 6, 7, 7, 7), seqs, "one ordered worker keeps frame order");
+        sub.stop();
     }
 
     @Test
