@@ -129,7 +129,7 @@ class ControlSubscriberTest {
                         clock::get,
                         message -> {},
                         recording),
-                "without a consumer id the U1 poll/file path stays in charge");
+                "without a consumer id there is no subscriber: the caller pins entry closed");
     }
 
     @Test
@@ -260,30 +260,20 @@ class ControlSubscriberTest {
     }
 
     @Test
-    void v2GameLegNeverOpensOrClosesTheWorkshopFileLeg() {
-        String id = "f3e1b9a622703dee8782b7cdd8519efe";
-        Gate file =
-                Gate.parse(
-                        "{\"schema\":1,\"gate\":\"public\",\"backend\":\"game\",\"message\":\"\","
-                            + "\"allowed\":[],\"backends\":{"
-                            + "\"game\":{\"gate\":\"closed\",\"message\":\"\",\"allowed\":[]},"
-                            + "\"workshop\":{\"gate\":\"builders\",\"message\":\"\",\"allowed\":"
-                            + "[{\"draslId\":\""
-                                + id
-                                + "\",\"name\":\"NetherG\"}]}}}");
+    void v2GameLegNeverAdmitsWorkshop() {
+        // CP-C2 cutover: the file gate is gone, so the workshop leg has no CP source and reads
+        // closed. Workshop members are never evicted by a game-leg change — they never enter.
         ControlSubscriber sub = subscriber();
         assertTrue(sub.applySnapshot(snapshot("open", 5)));
-        Gate merged = file.withGame(sub.current());
-        assertTrue(merged.allows("game", null, "Anyone", false));
-        assertTrue(merged.allows("workshop", id, "NetherG", false));
-        assertFalse(merged.allows("workshop", null, "Anyone", false));
+        Gate current = sub.current();
+        assertTrue(current.allows("game", null, "Anyone", false));
+        assertEquals("closed", current.forBackend("workshop").state());
+        assertFalse(current.allows("workshop", EPOCH.replace("-", ""), "NetherG", false));
 
         nanos.addAndGet(ControlSubscriber.LEASE_NS + 1);
-        Gate expired = file.withGame(sub.current());
+        Gate expired = sub.current();
         assertFalse(expired.allows("game", null, "Anyone", true));
-        assertTrue(
-                expired.allows("workshop", id, "NetherG", false),
-                "a closed/expired game leg must not evict workshop members");
+        assertFalse(expired.allows("workshop", EPOCH.replace("-", ""), "NetherG", false));
     }
 
     private static String stateOf(String ackBody) {
@@ -1266,5 +1256,40 @@ class ControlSubscriberTest {
         } finally {
             server.stop(0);
         }
+    }
+
+    @Test
+    void gateUriNormalizesSlashesAndRejectsGarbage() {
+        // P1-2: trailing slash делал путь //v1/gate и закрывал вход навсегда.
+        assertEquals(
+                "https://cp.invalid:8080/v1/gate",
+                ControlSubscriber.gateUri("https://cp.invalid:8080/").toString());
+        assertEquals(
+                "https://cp.invalid:8080/v1/gate",
+                ControlSubscriber.gateUri("  https://cp.invalid:8080  ").toString());
+        assertEquals(
+                "https://cp.invalid:8080/v1/gate",
+                ControlSubscriber.gateUri("https://cp.invalid:8080").toString());
+        assertThrows(
+                IllegalArgumentException.class,
+                () -> ControlSubscriber.gateUri("not a url with spaces"));
+    }
+
+    @Test
+    void gateUriStripsPathQueryAndFragment() {
+        // P1-2 remainder: a path prefix made the poll path /prefix/v1/gate, CP 404s on
+        // exact-path match, entry closed from boot forever.
+        assertEquals(
+                "https://cp.invalid:8080/v1/gate",
+                ControlSubscriber.gateUri("https://cp.invalid:8080/prefix").toString());
+        assertEquals(
+                "https://cp.invalid:8080/v1/gate",
+                ControlSubscriber.gateUri("https://cp.invalid:8080/prefix/?next=1#frag")
+                        .toString());
+        assertEquals(
+                "http://[::1]:8080/v1/gate",
+                ControlSubscriber.gateUri("http://[::1]:8080/prefix/").toString());
+        assertThrows(
+                IllegalArgumentException.class, () -> ControlSubscriber.gateUri("cp.invalid:8080"));
     }
 }

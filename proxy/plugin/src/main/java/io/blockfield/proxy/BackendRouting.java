@@ -28,7 +28,6 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
-import java.nio.file.attribute.FileTime;
 import java.time.Duration;
 import java.util.List;
 import java.util.Locale;
@@ -70,20 +69,11 @@ final class BackendRouting {
             "Игровой сервер обновляется, это займёт несколько минут. Переподключитесь позже.";
     private static final long WAKE_INTERVAL_MS = TimeUnit.MINUTES.toMillis(1);
 
-    private final Path gateFile =
-            Optional.ofNullable(System.getenv("BLOCKFIELD_GATE_FILE"))
-                    .filter(s -> !s.isBlank())
-                    .map(Path::of)
-                    .orElse(null);
-    private volatile Gate fileGate = Gate.load(gateFile);
-    private volatile Gate gate = fileGate;
-    private volatile FileTime gateStamp;
-    // U1: с BLOCKFIELD_CP_URL вход читается из control-plane (файл — запасной путь лишь без CP).
-    // Никогда не null из-за битого окружения: fromEnv не бросает, а битый хост мастерской
-    // лишь отключает мастерскую (как пустой), а не роняет весь плагин.
-    private GatePoller gatePoller;
+    /** Sole gate source (CP-C2 cutover): the CP push/ACK consumer. Null pins entry closed. */
     private volatile ControlSubscriber controlPlane;
-    private volatile boolean controlProbed;
+
+    /** Fail-closed admission state: last verified CP snapshot, closed past the lease. */
+    private volatile Gate gate = Gate.closed();
 
     /**
      * Gate whose evictions tick() last applied. A ping or connect may reload the file first; tick
@@ -245,15 +235,14 @@ final class BackendRouting {
         }
         this.workshopPort = workshopPort;
         this.inboxDir = inboxDir;
-        this.gatePoller = GatePoller.fromEnv(logger);
-        String source =
-                gateSource(
-                        System.getenv("BLOCKFIELD_CP_URL"),
-                        System.getenv("BLOCKFIELD_CP_TOKEN"),
-                        gateFile);
-        if (source.startsWith("file (") || source.startsWith("control-plane URL invalid"))
-            logger.warn("gate source: {}", source);
-        else logger.info("gate source: {}", source);
+        // Fail-closed: no consumer (or a half-configured one) pins game entry closed, never open;
+        // fromEnv never throws, and a bad workshop host only disables Workshop (as if empty).
+        this.controlPlane = ControlSubscriber.fromEnv(logger);
+        if (controlPlane == null)
+            logger.warn(
+                    "gate source: control-plane consumer not configured"
+                            + " (BLOCKFIELD_CP_CONSUMER), entry stays closed");
+        else logger.info("gate source: control-plane push");
     }
 
     /** Plain hostname or IP, without a port: the constructor never throws, this decides. */
@@ -263,27 +252,6 @@ final class BackendRouting {
         } catch (URISyntaxException e) {
             return false;
         }
-    }
-
-    /**
-     * Active gate source for the startup log; pure for tests. A half-configured CP (URL without
-     * token or vice versa) silently falls back to the file: the log names it so a maintenance
-     * toggle that "doesn't take" points at the env, not at the gate.
-     */
-    static String gateSource(String cpUrl, String cpToken, Path gateFile) {
-        boolean hasUrl = cpUrl != null && !cpUrl.isBlank();
-        boolean hasToken = cpToken != null && !cpToken.isBlank();
-        if (hasUrl && hasToken) {
-            try {
-                GatePoller.gateUri(cpUrl);
-                return "control-plane";
-            } catch (IllegalArgumentException e) {
-                return "control-plane URL invalid, entry stays closed: " + e.getMessage();
-            }
-        }
-        if (hasUrl || hasToken)
-            return "file (BLOCKFIELD_CP_URL/TOKEN half-configured, control-plane disabled)";
-        return "file (" + (gateFile == null ? "bundled default" : gateFile.toString()) + ")";
     }
 
     private static Path inboxDirFromEnv() {
@@ -394,12 +362,11 @@ final class BackendRouting {
     }
 
     private void reloadGate() {
-        boolean fileChanged = reloadGateFile();
-        // A configured v2 consumer owns game entry even without a gate file: returning
-        // early here would leave the bundled default instead of the pinned-closed v2 leg.
-        if (gatePoller == null && controlPlane() == null && !fileChanged) return;
-        // CP owns game entry only; the Workshop keeps the controller's gate.json rules.
-        Gate next = mergeGate();
+        // No CP consumer: entry stays closed (fail closed); tests inject gates directly.
+        // The CP push consumer owns the whole gate; workshop admission therefore also reads
+        // closed until CP serves workshop state.
+        if (controlPlane == null) return;
+        Gate next = controlPlane.current();
         if (!next.equals(gate))
             logger.info(
                     "Gate game={} workshop={} ({} workshop members)",
@@ -407,40 +374,6 @@ final class BackendRouting {
                     next.forBackend("workshop").state(),
                     next.forBackend("workshop").allowed().size());
         gate = next;
-    }
-
-    /**
-     * v2 push consumer (CP-S5). Lazy so the constructor chain stays untouched; separate from the U1
-     * poller. Null means v2 is off (the U1 poll/file path applies); non-null but closed means
-     * half-configured, and then the game leg stays closed instead of falling back to the file.
-     */
-    private synchronized ControlSubscriber controlPlane() {
-        if (!controlProbed) {
-            controlProbed = true;
-            controlPlane = ControlSubscriber.fromEnv(logger);
-        }
-        return controlPlane;
-    }
-
-    /** Game leg source: v2 push wins when configured, otherwise the U1 poll/file path. */
-    private Gate mergeGate() {
-        ControlSubscriber v2 = controlPlane();
-        if (v2 != null) return fileGate.withGame(v2.current());
-        return gatePoller == null ? fileGate : fileGate.withGame(gatePoller.current());
-    }
-
-    private boolean reloadGateFile() {
-        if (gateFile == null) return false;
-        FileTime stamp;
-        try {
-            stamp = Files.getLastModifiedTime(gateFile);
-        } catch (java.io.IOException e) {
-            stamp = null;
-        }
-        if (stamp != null && stamp.equals(gateStamp)) return false;
-        gateStamp = stamp;
-        fileGate = Gate.load(gateFile);
-        return true;
     }
 
     /**

@@ -40,15 +40,8 @@ class ColdWorkshopTest {
     private static final String DRASL = "6727890496a93613a33463780ae01220";
 
     @Test
-    void sleepingGateParsesButNeverAdmits() {
-        Gate gate =
-                Gate.parse(
-                        GateTest.dual(
-                                "{\"game\":"
-                                        + GateTest.entry("public", "", "")
-                                        + ",\"workshop\":"
-                                        + GateTest.entry("sleeping", "Спит", member("Builder"))
-                                        + "}"));
+    void sleepingGateNeverAdmitsButKeepsMembers() {
+        Gate gate = GateTest.dual("public", "sleeping", DRASL, "Builder");
         Gate workshop = gate.forBackend("workshop");
         assertTrue(workshop.sleeping());
         assertTrue(workshop.waking());
@@ -128,22 +121,15 @@ class ColdWorkshopTest {
         var fixture = new Fixture("workshop.invalid", inbox);
         Player builder = fixture.player(UUID.randomUUID(), "workshop.invalid", "Builder");
         fixture.authenticate(builder);
-        fixture.gate(Gate.parse("{"));
+        fixture.gate(Gate.closed());
         var denied = fixture.connect(builder, "workshop");
         assertFalse(denied.getResult().isAllowed());
         assertTrue(
                 fixture.messages.get(builder.getUniqueId()).stream()
                         .anyMatch(text -> text.contains(Gate.DEFAULT_MESSAGE)),
-                "malformed gate falls back to the existing closed message");
-        assertEquals(List.of(), fixture.wakes(), "malformed gate never wakes");
-        fixture.gate(
-                Gate.parse(
-                        GateTest.dual(
-                                "{\"game\":"
-                                        + GateTest.entry("public", "", "")
-                                        + ",\"workshop\":"
-                                        + GateTest.entry("unknown", "", "")
-                                        + "}")));
+                "closed gate falls back to the existing closed message");
+        assertEquals(List.of(), fixture.wakes(), "closed gate never wakes");
+        fixture.gate(GateTest.dual("public", "unknown", null, null));
         assertFalse(fixture.connect(builder, "workshop").getResult().isAllowed());
         assertEquals(List.of(), fixture.wakes(), "unknown workshop state never wakes");
     }
@@ -200,10 +186,6 @@ class ColdWorkshopTest {
         assertEquals(fixture.servers.get("game"), fixture.choose(gamer));
         assertTrue(fixture.connect(gamer, "game").getResult().isAllowed());
         assertEquals(List.of(), fixture.wakes(), "game traffic never wakes the workshop");
-    }
-
-    private static String member(String name) {
-        return "{\"draslId\":\"" + DRASL + "\",\"name\":\"" + name + "\"}";
     }
 
     private static Gate SleepingGate() {

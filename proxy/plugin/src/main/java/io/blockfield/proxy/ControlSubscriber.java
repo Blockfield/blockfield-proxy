@@ -11,6 +11,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.net.URI;
+import java.net.URISyntaxException;
 import java.net.URLEncoder;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
@@ -29,26 +30,25 @@ import java.util.function.Consumer;
 import java.util.function.LongSupplier;
 
 /**
- * Control-plane v2 push consumer for the game gate leg (plan CP-S5).
+ * Control-plane v2 push consumer: the sole game-gate source (plan CP-S5; CP-C2 cutover removed the
+ * U1 {@code GET /v1/gate} poller and the {@code gate.json} file gate).
  *
- * <p>Replaces {@link GatePoller} polling once {@code BLOCKFIELD_CP_CONSUMER} is set: it bootstraps
- * from {@code GET /v2/agents/{id}/snapshot}, streams {@code GET /v2/agents/{id}/events} (SSE) and
- * confirms each frame with {@code POST /v2/agents/{id}/acks}. Wire contract is frozen at
- * control-plane origin/main {@code 6df1f95 + cf660e4}; this class consumes it and never invents an
- * alternative API.
+ * <p>It bootstraps from {@code GET /v2/agents/{id}/snapshot}, streams {@code GET
+ * /v2/agents/{id}/events} (SSE) and confirms each frame with {@code POST /v2/agents/{id}/acks}.
+ * Wire contract is frozen at control-plane origin/main {@code 6df1f95 + cf660e4}; this class
+ * consumes it and never invents an alternative API.
  *
- * <p>Safety properties: fail closed before the first snapshot and past the lease (same 60 s lease
- * as the U1 poller, on a monotonic clock so wall steps cannot extend it); a stream with no frame or
- * keep-alive for three keep-alive intervals is aborted and reconnected; stale/forged/gapped or
- * unparseable frames never move the gate (they request a re-snapshot instead); non-executable and
- * non-gate frames advance the cursor without changing admission; ACKs are best-effort — a lost ACK
- * replays on reconnect and the cursor/epoch guards make the replay idempotent (a cursor that ran
- * ahead of the server's durable cursor self-heals through a {@code 409 snapshot_required}
- * re-snapshot).
+ * <p>Safety properties: fail closed before the first snapshot and past the lease (60 s, on a
+ * monotonic clock so wall steps cannot extend it); a stream with no frame or keep-alive for three
+ * keep-alive intervals is aborted and reconnected; stale/forged/gapped or unparseable frames never
+ * move the gate (they request a re-snapshot instead); non-executable and non-gate frames advance
+ * the cursor without changing admission; ACKs are best-effort — a lost ACK replays on reconnect and
+ * the cursor/epoch guards make the replay idempotent (a cursor that ran ahead of the server's
+ * durable cursor self-heals through a {@code 409 snapshot_required} re-snapshot).
  */
 final class ControlSubscriber {
-    /** Frames past this age without a fresh snapshot/apply close entry, like the U1 lease. */
-    static final long LEASE_MS = GatePoller.LEASE_MS;
+    /** Admission lease: 60 s without a fresh snapshot/apply closes entry (fail closed). */
+    static final long LEASE_MS = 60_000;
 
     private static final Duration RPC_TIMEOUT = Duration.ofSeconds(5);
     private static final Duration STREAM_TIMEOUT = Duration.ofSeconds(75);
@@ -157,9 +157,39 @@ final class ControlSubscriber {
     }
 
     /**
-     * Null when v2 is not configured (no consumer): the caller keeps the U1 poll/file path.
-     * Non-null but never-live when half-configured: the game leg stays closed, never falls back to
-     * the file for game entry. Never throws.
+     * Normalized control-plane gate URI. A trailing slash must not turn the path into {@code
+     * //v1/gate}, and a path prefix, query or fragment must not move it elsewhere: CP matches the
+     * exact path /v1/gate, so anything else 404s every poll and closes entry from boot. Throws
+     * IllegalArgumentException on malformed input.
+     */
+    static URI gateUri(String raw) {
+        String base = raw.strip().replaceAll("/+$", "");
+        URI parsed;
+        try {
+            parsed = new URI(base);
+        } catch (URISyntaxException e) {
+            throw new IllegalArgumentException("invalid control-plane URL: " + base, e);
+        }
+        if (parsed.getScheme() == null || parsed.getHost() == null)
+            throw new IllegalArgumentException("invalid control-plane URL: " + base);
+        try {
+            return new URI(
+                    parsed.getScheme(),
+                    null,
+                    parsed.getHost(),
+                    parsed.getPort(),
+                    "/v1/gate",
+                    null,
+                    null);
+        } catch (URISyntaxException e) {
+            throw new IllegalArgumentException("invalid control-plane URL: " + base, e);
+        }
+    }
+
+    /**
+     * Null when v2 is not configured (no consumer): the caller pins the game leg closed, never
+     * falls back to a file. Non-null but never-live when half-configured: the game leg stays
+     * closed. Never throws.
      */
     static ControlSubscriber fromEnv(Logger logger) {
         ControlSubscriber sub =
@@ -213,7 +243,7 @@ final class ControlSubscriber {
                     consumer, null, null, null, "", clock, warn, unconfigured, monotonic, false);
         }
         try {
-            URI base = GatePoller.gateUri(url);
+            URI base = gateUri(url);
             String id = URLEncoder.encode(consumer, StandardCharsets.UTF_8);
             String prefix = "https://" + base.getAuthority();
             if (!base.getScheme().equals("https"))
@@ -278,7 +308,13 @@ final class ControlSubscriber {
         }
     }
 
-    /** Current game-leg gate: last verified snapshot, closed past the lease or before it. */
+    /**
+     * Current game-leg gate: last verified snapshot, closed past the lease or before it.
+     *
+     * <p>cp#5 (fail-static, later unit): the last verified snapshot lives here ({@code gate} +
+     * {@code freshAt}); that unit keeps serving it past the lease instead of closing, once CP
+     * defines staleness bounds. This cutover keeps fail-closed.
+     */
     Gate current() {
         if (monotonic.getAsLong() - freshAt > LEASE_NS) return Gate.closed();
         synchronized (lock) {

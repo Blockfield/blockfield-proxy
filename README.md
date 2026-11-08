@@ -80,7 +80,7 @@ JAR и не заменяется LICENSE Blockfield. При распростра
 [`BlockfieldProxy`](proxy/plugin/src/main/java/io/blockfield/proxy/BlockfieldProxy.java) регистрирует три модуля:
 
 - [`Authentication`](proxy/plugin/src/main/java/io/blockfield/proxy/Authentication.java): Drasl, `/login`, `/register`, `/logout`, сохранённые сессии и лимиты попыток.
-- [`BackendRouting`](proxy/plugin/src/main/java/io/blockfield/proxy/BackendRouting.java): `gate.json`, ACL мастерской, лобби и возврат после рестарта.
+- [`BackendRouting`](proxy/plugin/src/main/java/io/blockfield/proxy/BackendRouting.java): гейт control-plane (push/ACK), ACL мастерской, лобби и возврат после рестарта.
 - [`LoginForwarding`](proxy/plugin/src/main/java/io/blockfield/proxy/LoginForwarding.java): ответы о версии пака и контракте совместимости, а также перенос конфигурации TaCZ Tweaks из login в play.
 
 Drasl UUID подтверждается до ответа Minecraft LoginSuccess и используется в современном
@@ -122,7 +122,7 @@ DNS-имени и завершающая точка не влияют на ср�
 выбора больше не используется): порт `BLOCKFIELD_RAKNET_WORKSHOP_PORT`
 (default `25567`)
 означает мастерскую, остальные порты (включая TCP 25565) — игру. `BLOCKFIELD_WORKSHOP_HOST`
-остался только для совместимости ping-выдачи. Этот выбор не даёт прав: авторизация Drasl, ACL и `gate.json`
+остался только для совместимости ping-выдачи. Этот выбор не даёт прав: авторизация Drasl, ACL и гейт control-plane
 проверяются дополнительно при каждом входе в backend. Игра и мастерская могут
 работать одновременно: допуск каждого backend задаётся отдельно. Если выбранный
 backend закрыт или не отвечает на ping, игрок ждёт в Limbo и автоматически
@@ -150,15 +150,19 @@ backend — существующий контроллер.
 }
 ```
 
-Если `backends` присутствует, прокси проверяет только запись выбранного backend:
+Если `backends` присутствует, проверка хостового файла (deploy probe
+`entry_liveness.py --gate-file`) читает только запись выбранного backend:
 отсутствующая или некорректная запись закрывает его, без возврата к верхним полям.
 Некорректный объект `backends` закрывает оба входа. Для игры допустимы только
 `public`, `draining`, `closed`, для мастерской — `builders`, `testers`, `closed`;
 состояние другого backend закрывает выбранный вход. ACL мастерской по-прежнему
 требует совпадения Drasl UUID и имени; `testers` ограничивает вход аналогично
 `builders`. Старый файл без `backends` сохраняет прежний единственный активный
-backend. Поэтому прокси с поддержкой нового формата нужно развернуть до включения
-одновременной работы в контроллере.
+backend.
+
+CP-C2 cutover: прокси больше не читает этот файл — гейт приходит только из
+control-plane push/ACK (`ControlSubscriber`); хостовый файл остаётся для
+deploy-проверки и будет удалён отдельным юнитом.
 
 `BLOCKFIELD_WORKSHOP_PACK_CONTRACT` задаёт ожидаемый хэш Workshop-пака (contract-часть
 ответа `blockfield:pack_contract`, тот же формат, что `compatibility` в build.json):
