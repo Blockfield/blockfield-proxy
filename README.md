@@ -28,21 +28,23 @@ Blacksmith проверяет main и PR. Тег `v*` публикует `ghcr.i
 
 ## Транспорт клиента
 
-Игроки входят только по RakNet (решение владельца 2026-10-18): Game —
-`raknet;play.blockfield.pro:25566`, Workshop —
+Основной вход — RakNet: Game — `raknet;play.blockfield.pro:25566`, Workshop —
 `raknet;workshop.blockfield.pro:25567`. Raknetify — сборка Blockfield `bf3`
-(GitHub Release `Blockfield/raknetify`, SHA256 закреплён в Dockerfile):
-upstream `76ab30a` + фикс утечки SYNC FrameData + второй UDP-порт мастерской
-(`raknetify.velocity.workshopPort`). TCP `play.blockfield.pro:25565`
-обслуживает только status ping (launcher >= 1.0.11 пингует `raknet;` адрес по
-TCP 25565 того же хоста): `PreLoginEvent` отклоняет login без pipeline handler
-`raknetify-velocity-event-listener`, который Raknetify добавляет только каналам
-`RakNet$Config` (`RaknetOnly`). Исключений по адресу нет: локальные стенды
-подключаются напрямую к backend, минуя Velocity. Если внутренности
-Velocity/Raknetify после обновления не совпали, proxy пишет ERROR
-`Velocity/Raknetify internals mismatch` и отклоняет **каждый** вход (fail closed,
-решение владельца 2026-10-18); status ping не затронут. При обновлении Velocity или
-Raknetify перепроверьте вход по RakNet (оба порта) и отказ TCP.
+(`0.1.0+alpha.5.1-bf3`, GitHub Release `Blockfield/raknetify`, SHA256 закреплён в Dockerfile,
+`tests/test_raknetify_pin.py` проверяет пин): upstream `76ab30a` + фикс утечки SYNC FrameData +
+второй UDP-порт мастерской (`raknetify.velocity.workshopPort`). Клиентский пак закрепляет fabric-jar
+того же релиза. TCP `play.blockfield.pro:25565` обслуживает status ping (launcher >= 1.0.11 пингует `raknet;`
+адрес по TCP 25565 того же хоста) и принимает вход для
+игроков, у которых режут UDP (proxy#74): TCP-вход проходит тот же Drasl-шлюз и всегда попадает в
+Game (порт 25565 не порт мастерской). RakNet-вход `PreLoginEvent` узнаёт по pipeline handler
+`raknetify-velocity-event-listener`, который Raknetify добавляет только каналам `RakNet$Config`
+(`RaknetOnly`). Исключений по адресу нет: локальные стенды подключаются напрямую к backend, минуя
+Velocity. Если внутренности Velocity/Raknetify после обновления не совпали, proxy пишет ERROR
+`Velocity/Raknetify internals mismatch` и отклоняет **каждый** вход (fail closed, решение владельца
+2026-10-18): из тех же внутренностей берётся порт, выбирающий Game или Workshop; status ping не
+затронут. Отказы входа считаются по причинам; в лог (WARN `login-rejections first <причина>`)
+попадает только первый отказ каждой причины с текущими счётчиками. При обновлении Velocity или
+Raknetify перепроверьте вход по RakNet (оба порта) и по TCP.
 Backend Fabric не требует Raknetify: UDP завершается на Velocity, внутреннее
 соединение с game/workshop остаётся TCP.
 
@@ -56,7 +58,7 @@ Velocity получает RakNet-порты флагами `-Draknetify.velocity
 конфигурация не меняется.
 
 Dokploy `blockfield-proxy-niocmj` публикует **UDP 25566 → 25566 и UDP 25567 → 25567,
-mode host** (порты открыты в firewall), TCP 25565 (status ping) и UDP 25565
+mode host** (порты открыты в firewall), TCP 25565 (status ping и TCP-вход) и UDP 25565
 (voice chat); `EXPOSE` не публикует порт сам. Не снимайте TCP 25565: без него
 launcher не видит статус сервера.
 Изменение Dokploy и Deploy proxy выполняет владелец отдельно; PR их не выполняет. `BLOCKFIELD_WORKSHOP_HOST` (имя хоста мастерской) остаётся для
@@ -119,7 +121,7 @@ DNS-имени и завершающая точка не влияют на ср�
 Прокси выбирает профиль по входящему RakNet-порту (`Player.getVirtualHost` для
 выбора больше не используется): порт `BLOCKFIELD_RAKNET_WORKSHOP_PORT`
 (default `25567`)
-означает мастерскую, остальные RakNet-порты — игру. `BLOCKFIELD_WORKSHOP_HOST`
+означает мастерскую, остальные порты (включая TCP 25565) — игру. `BLOCKFIELD_WORKSHOP_HOST`
 остался только для совместимости ping-выдачи. Этот выбор не даёт прав: авторизация Drasl, ACL и `gate.json`
 проверяются дополнительно при каждом входе в backend. Игра и мастерская могут
 работать одновременно: допуск каждого backend задаётся отдельно. Если выбранный
