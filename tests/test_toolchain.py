@@ -10,12 +10,14 @@ token) and fails on drift in either direction: re-sync, never hand-edit.
 import json
 import os
 import sys
+import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
-from toolchain import read_url, retried  # noqa: E402
+from toolchain import java_home, read_url, retried  # noqa: E402
 
 WORKSPACE_MAIN = (
     "https://raw.githubusercontent.com/Blockfield/blockfield-workspace/main"
@@ -73,6 +75,26 @@ class VendoredCore(unittest.TestCase):
             "asm-tree",
         ):
             self.assertIn(name, lock["tools"], f"{name} not pinned")
+
+
+class JavaHome(unittest.TestCase):
+    def test_shim_ahead_of_jdk_picks_jdk(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            shim = Path(tmp) / "shim"
+            shim.mkdir()
+            fake = shim / "java"
+            fake.write_text("#!/bin/sh\nexit 3\n")
+            fake.chmod(0o755)
+            home = Path(tmp) / "jdk"
+            (home / "bin").mkdir(parents=True)
+            real = home / "bin" / "java"
+            real.write_text("#!/bin/sh\nexit 0\n")
+            real.chmod(0o755)
+            env = os.environ.copy()
+            env["PATH"] = os.pathsep.join((str(shim), str(home / "bin")))
+            env.pop("JAVA_HOME", None)
+            with unittest.mock.patch.dict(os.environ, env, clear=True):
+                self.assertEqual(java_home(), real.resolve().parents[1])
 
 
 if __name__ == "__main__":
