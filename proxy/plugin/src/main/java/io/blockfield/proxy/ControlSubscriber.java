@@ -99,6 +99,15 @@ final class ControlSubscriber {
     private String epoch;
     private String generation;
 
+    /**
+     * Bumped under {@code lock} on every cursor reset (resync, snapshot): the ACK worker drops jobs
+     * queued in an older era, so a slow ACK cannot write the cursor after a reset.
+     */
+    private long resetEpoch;
+
+    /** Set until a snapshot is applied; a resync sets it again. The loop snapshots on this. */
+    private boolean needSnapshot = true;
+
     /** Last ACKed sequence: the visible cursor, also used for SSE resume. Lags applied. */
     private long cursor = -1;
 
@@ -309,6 +318,8 @@ final class ControlSubscriber {
             cursor = parsed.cursor;
             applied = parsed.cursor;
             gate = parsed.gate;
+            needSnapshot = false;
+            resetEpoch++;
         }
         freshAt = monotonic.getAsLong();
         return true;
@@ -343,7 +354,9 @@ final class ControlSubscriber {
                 || !audience.equals(consumer)) {
             return Verdict.RESYNC;
         }
+        long era;
         synchronized (lock) {
+            era = resetEpoch;
             if (epoch == null || !epoch.equals(envEpoch)) return Verdict.RESYNC;
             if (sequence <= applied) {
                 // Duplicate delivery on a live stream: the CP is reachable, so the lease holds.
@@ -366,7 +379,8 @@ final class ControlSubscriber {
                             envGeneration,
                             revision,
                             payloadHash,
-                            List.of(new AckState("received", "ok"))));
+                            List.of(new AckState("received", "ok")),
+                            era));
             return Verdict.HELD;
         }
         if (payloadHash == null || !payloadHash.matches("[0-9a-f]{64}")) {
@@ -384,7 +398,8 @@ final class ControlSubscriber {
                             envGeneration,
                             revision,
                             payloadHash,
-                            List.of(new AckState("rejected", "ok"))));
+                            List.of(new AckState("rejected", "ok")),
+                            era));
             return Verdict.HELD;
         }
         Gate next = gateFromPayload(envelope.get("payload"));
@@ -398,7 +413,8 @@ final class ControlSubscriber {
                             envGeneration,
                             revision,
                             payloadHash,
-                            List.of(new AckState("rejected", "ok"))));
+                            List.of(new AckState("rejected", "ok")),
+                            era));
             return Verdict.HELD;
         }
         // State first, on this thread: a stalled ACK endpoint must never delay the gate
@@ -418,7 +434,8 @@ final class ControlSubscriber {
                         List.of(
                                 new AckState("received", "ok"),
                                 new AckState("validated", "ok"),
-                                new AckState("applied", "ok"))));
+                                new AckState("applied", "ok")),
+                        era));
         return Verdict.APPLIED;
     }
 
@@ -429,10 +446,12 @@ final class ControlSubscriber {
     }
 
     // The worker advances the visible cursor after its receipts are POSTed, so the
-    // cursor still implies the receipts were sent but may lag applied state.
-    private void advance(long sequence) {
+    // cursor still implies the receipts were sent but may lag applied state. A job queued
+    // before a reset (resync, snapshot) must not write the cursor afterwards, and the cursor
+    // never moves backwards.
+    private void advance(long sequence, long era) {
         synchronized (lock) {
-            cursor = sequence;
+            if (era == resetEpoch && sequence > cursor) cursor = sequence;
         }
     }
 
@@ -444,7 +463,8 @@ final class ControlSubscriber {
             String generation,
             Long revision,
             String payloadHash,
-            List<AckState> states) {}
+            List<AckState> states,
+            long resetEpoch) {}
 
     /** Ordered ACK worker: POSTs each frame's receipts, then advances the visible cursor. */
     private void drainAcks() {
@@ -464,7 +484,7 @@ final class ControlSubscriber {
                                     state.result());
                     if (body != null) sendBody(body);
                 }
-                advance(job.sequence());
+                advance(job.sequence(), job.resetEpoch());
             }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
@@ -649,12 +669,14 @@ final class ControlSubscriber {
     private void loop() {
         while (!stopped && !Thread.currentThread().isInterrupted()) {
             try {
-                if (cursor() < 0) snapshot();
+                if (needSnapshot()) snapshot();
                 stream();
             } catch (Resync e) {
                 synchronized (lock) {
                     cursor = -1;
                     applied = -1;
+                    needSnapshot = true;
+                    resetEpoch++;
                 }
             } catch (InterruptedException e) {
                 return;
@@ -667,6 +689,12 @@ final class ControlSubscriber {
             } catch (InterruptedException e) {
                 return;
             }
+        }
+    }
+
+    private boolean needSnapshot() {
+        synchronized (lock) {
+            return needSnapshot;
         }
     }
 

@@ -880,6 +880,163 @@ class ControlSubscriberTest {
     }
 
     @Test
+    void ackFinishingAfterResyncKeepsCursorResetAndResnapshots() throws Exception {
+        AtomicInteger snapshots = new AtomicInteger();
+        AtomicInteger streams = new AtomicInteger();
+        AtomicLong cursorAtResnapshot = new AtomicLong(Long.MIN_VALUE);
+        AtomicReference<ControlSubscriber> subRef = new AtomicReference<>();
+        CountDownLatch ackInFlight = new CountDownLatch(1);
+        CountDownLatch releaseAck = new CountDownLatch(1);
+        String snap = snapshot("open", 5);
+        String frame6 = envelope(6, true, null, gatePayload("open"));
+        // Applied is 6, so frame 8 is a gap: the loop must reset and re-snapshot.
+        String frame8 = envelope(8, true, null, gatePayload("open"));
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        ExecutorService pool = Executors.newCachedThreadPool();
+        server.setExecutor(pool);
+        server.createContext(
+                "/v2/agents/" + CONSUMER + "/snapshot",
+                exchange -> {
+                    if (snapshots.incrementAndGet() == 2) {
+                        cursorAtResnapshot.set(subRef.get().cursor());
+                    }
+                    byte[] body = snap.getBytes(StandardCharsets.UTF_8);
+                    exchange.sendResponseHeaders(200, body.length);
+                    try (OutputStream out = exchange.getResponseBody()) {
+                        out.write(body);
+                    }
+                });
+        server.createContext(
+                "/v2/agents/" + CONSUMER + "/events",
+                exchange -> {
+                    exchange.getResponseHeaders().add("Content-Type", "text/event-stream");
+                    exchange.sendResponseHeaders(200, 0);
+                    try {
+                        OutputStream out = exchange.getResponseBody();
+                        if (streams.incrementAndGet() == 1) {
+                            out.write(
+                                    ("event: control\ndata: " + frame6 + "\n\n")
+                                            .getBytes(StandardCharsets.UTF_8));
+                            out.flush();
+                            ackInFlight.await(10, TimeUnit.SECONDS);
+                            out.write(
+                                    ("event: control\ndata: " + frame8 + "\n\n")
+                                            .getBytes(StandardCharsets.UTF_8));
+                            out.flush();
+                        }
+                        Thread.sleep(15_000);
+                        out.close();
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    } catch (IOException e) {
+                        // The loop closed the stream after the resync; nothing to assert here.
+                    }
+                });
+        server.createContext(
+                "/v2/agents/" + CONSUMER + "/acks",
+                exchange -> {
+                    exchange.getRequestBody().readAllBytes();
+                    ackInFlight.countDown();
+                    try {
+                        releaseAck.await(15, TimeUnit.SECONDS);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                    byte[] ok = "{}".getBytes(StandardCharsets.UTF_8);
+                    exchange.sendResponseHeaders(200, ok.length);
+                    try (OutputStream out = exchange.getResponseBody()) {
+                        out.write(ok);
+                    }
+                });
+        server.start();
+        ControlSubscriber sub = null;
+        try {
+            sub =
+                    ControlSubscriber.fromParts(
+                            "http://127.0.0.1:" + server.getAddress().getPort(),
+                            "token",
+                            CONSUMER,
+                            LoggerFactory.getLogger("test"),
+                            clock::get,
+                            message -> {},
+                            null,
+                            nanos::get);
+            assertNotNull(sub);
+            subRef.set(sub);
+            sub.start();
+            assertTrue(ackInFlight.await(10, TimeUnit.SECONDS), "frame 6 applies, its ACK blocks");
+            awaitCursor(sub, -1);
+            assertEquals(-1, sub.cursor(), "the gap resets the cursor while the ACK is in flight");
+            // Frame 6's ACK finishes after the reset: its advance must be discarded.
+            releaseAck.countDown();
+            long deadline = System.currentTimeMillis() + 12_000;
+            while (snapshots.get() < 2 && System.currentTimeMillis() < deadline) {
+                Thread.sleep(50);
+            }
+            assertEquals(2, snapshots.get(), "the loop re-snapshots after a resync");
+            assertEquals(
+                    -1, cursorAtResnapshot.get(), "a stale ACK must not restore the old cursor");
+        } finally {
+            if (sub != null) sub.stop();
+            releaseAck.countDown();
+            server.stop(0);
+            pool.shutdownNow();
+        }
+    }
+
+    @Test
+    void oldEpochAckDoesNotLowerCursorAfterSnapshot() throws Exception {
+        CountDownLatch firstInFlight = new CountDownLatch(1);
+        CountDownLatch releaseFirst = new CountDownLatch(1);
+        CountDownLatch secondInFlight = new CountDownLatch(1);
+        CountDownLatch releaseSecond = new CountDownLatch(1);
+        List<String> sent = Collections.synchronizedList(new ArrayList<>());
+        ControlSubscriber sub =
+                ControlSubscriber.fromParts(
+                        "https://cp.invalid",
+                        "token",
+                        CONSUMER,
+                        LoggerFactory.getLogger("test"),
+                        clock::get,
+                        message -> {},
+                        body -> {
+                            sent.add(body);
+                            if (sent.size() == 1) {
+                                firstInFlight.countDown();
+                                releaseFirst.await(15, TimeUnit.SECONDS);
+                            } else if (sent.size() == 4) {
+                                // Frame 10's first receipt: frame 6's job, advance included,
+                                // is already done, and this one has not advanced yet.
+                                secondInFlight.countDown();
+                                releaseSecond.await(15, TimeUnit.SECONDS);
+                            }
+                        },
+                        nanos::get);
+        assertNotNull(sub);
+        try {
+            assertTrue(sub.applySnapshot(snapshot("open", 5)));
+            assertEquals(
+                    ControlSubscriber.Verdict.APPLIED,
+                    sub.offer(envelope(6, true, null, gatePayload("open"))));
+            assertTrue(firstInFlight.await(15, TimeUnit.SECONDS), "frame 6 ACK blocks");
+            assertTrue(sub.applySnapshot(snapshot("open", 9)));
+            assertEquals(
+                    ControlSubscriber.Verdict.APPLIED,
+                    sub.offer(envelope(10, true, null, gatePayload("open"))));
+            releaseFirst.countDown();
+            assertTrue(secondInFlight.await(15, TimeUnit.SECONDS));
+            assertEquals(9, sub.cursor(), "an ACK queued before the snapshot must not lower it");
+            releaseSecond.countDown();
+            awaitCursor(sub, 10);
+            assertEquals(10, sub.cursor(), "a job from the current epoch still advances");
+        } finally {
+            releaseFirst.countDown();
+            releaseSecond.countDown();
+            sub.stop();
+        }
+    }
+
+    @Test
     void partialLineStallReconnectsWithinIdle() throws Exception {
         AtomicInteger events = new AtomicInteger();
         String snap = snapshot("open", 5);
