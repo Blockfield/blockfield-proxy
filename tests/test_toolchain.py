@@ -8,6 +8,7 @@ token) and fails on drift in either direction: re-sync, never hand-edit.
 """
 
 import json
+import os
 import sys
 import unittest
 from pathlib import Path
@@ -30,6 +31,12 @@ class VendoredCore(unittest.TestCase):
         url = WORKSPACE_MAIN + "/" + relative
         return retried(lambda: read_url(url))
 
+    # Network-bound drift check: runs only on schedule (tools-drift.yml
+    # sets BF_DRIFT_CHECK=1), never as a required PR check.
+    @unittest.skipUnless(
+        os.environ.get("BF_DRIFT_CHECK") == "1",
+        "drift check runs on schedule only (tools-drift.yml, BF_DRIFT_CHECK=1)",
+    )
     def test_vendored_files_equal_workspace_origin_main(self):
         for relative in (*VENDORED, *HELPERS):
             with self.subTest(relative):
