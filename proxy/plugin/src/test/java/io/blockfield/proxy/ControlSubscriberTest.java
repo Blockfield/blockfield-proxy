@@ -1102,6 +1102,195 @@ class ControlSubscriberTest {
     }
 
     @Test
+    void resyncPendingSkipsStreamUntilSnapshotSucceeds() throws Exception {
+        AtomicInteger snapshots = new AtomicInteger();
+        AtomicInteger events = new AtomicInteger();
+        List<String> warnings = Collections.synchronizedList(new ArrayList<>());
+        String openSnap = snapshot("open", 5);
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        ExecutorService pool = Executors.newCachedThreadPool();
+        server.setExecutor(pool);
+        server.createContext(
+                "/v2/agents/" + CONSUMER + "/snapshot",
+                exchange -> {
+                    if (snapshots.incrementAndGet() == 1) {
+                        byte[] bytes = openSnap.getBytes(StandardCharsets.UTF_8);
+                        exchange.sendResponseHeaders(200, bytes.length);
+                        try (OutputStream out = exchange.getResponseBody()) {
+                            out.write(bytes);
+                        }
+                    } else {
+                        // /snapshot goes down right after the resync below.
+                        exchange.sendResponseHeaders(500, -1);
+                        exchange.close();
+                    }
+                });
+        server.createContext(
+                "/v2/agents/" + CONSUMER + "/events",
+                exchange -> {
+                    events.incrementAndGet();
+                    exchange.getResponseHeaders().add("Content-Type", "text/event-stream");
+                    exchange.sendResponseHeaders(200, 0);
+                    try {
+                        OutputStream out = exchange.getResponseBody();
+                        // A generation change on the live leg: re-snapshot, no valid cursor.
+                        out.write("event: resync\n\n".getBytes(StandardCharsets.UTF_8));
+                        out.flush();
+                        Thread.sleep(15_000);
+                        out.close();
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    } catch (IOException e) {
+                        // The test stopped the server mid-stream; nothing to assert here.
+                    }
+                });
+        server.start();
+        try {
+            ControlSubscriber sub =
+                    ControlSubscriber.fromParts(
+                            "http://127.0.0.1:" + server.getAddress().getPort(),
+                            "token",
+                            CONSUMER,
+                            LoggerFactory.getLogger("test"),
+                            clock::get,
+                            warnings::add,
+                            recording,
+                            nanos::get);
+            assertNotNull(sub);
+            sub.start();
+            long retryDeadline = System.currentTimeMillis() + 25_000;
+            while (snapshots.get() < 2 && System.currentTimeMillis() < retryDeadline) {
+                Thread.sleep(50);
+            }
+            assertTrue(
+                    snapshots.get() >= 2,
+                    "RESYNC_PENDING retries the snapshot instead of stalling on it");
+            assertEquals(
+                    1,
+                    events.get(),
+                    "RESYNC_PENDING never re-attaches the stream: no frame could apply");
+            nanos.addAndGet(ControlSubscriber.LEASE_NS + 1);
+            assertEquals(
+                    "closed",
+                    sub.current().state(),
+                    "without a valid cursor fail-static must not serve the stale open gate");
+            assertEquals(
+                    1,
+                    warnings.stream()
+                            .filter(w -> w.contains("resync pending, entry closes"))
+                            .count(),
+                    "the CURSOR_VALID -> RESYNC_PENDING transition logs once");
+            sub.stop();
+        } finally {
+            server.stop(0);
+            pool.shutdownNow();
+        }
+    }
+
+    @Test
+    void snapshotConflictKeepsResyncPendingUntilSnapshotSucceeds() throws Exception {
+        AtomicInteger snapshots = new AtomicInteger();
+        AtomicInteger events = new AtomicInteger();
+        AtomicReference<String> snapBody = new AtomicReference<>(null);
+        String openSnap = snapshot("open", 5);
+        String recoveredSnap = snapshot("open", 6);
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        ExecutorService pool = Executors.newCachedThreadPool();
+        server.setExecutor(pool);
+        server.createContext(
+                "/v2/agents/" + CONSUMER + "/snapshot",
+                exchange -> {
+                    int n = snapshots.incrementAndGet();
+                    if (n == 1) {
+                        byte[] bytes = openSnap.getBytes(StandardCharsets.UTF_8);
+                        exchange.sendResponseHeaders(200, bytes.length);
+                        try (OutputStream out = exchange.getResponseBody()) {
+                            out.write(bytes);
+                        }
+                        return;
+                    }
+                    String body = snapBody.get();
+                    if (body != null) {
+                        byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
+                        exchange.sendResponseHeaders(200, bytes.length);
+                        try (OutputStream out = exchange.getResponseBody()) {
+                            out.write(bytes);
+                        }
+                        return;
+                    }
+                    // The server lost the cursor: every snapshot asks for a resync.
+                    exchange.sendResponseHeaders(409, -1);
+                    exchange.close();
+                });
+        server.createContext(
+                "/v2/agents/" + CONSUMER + "/events",
+                exchange -> {
+                    int n = events.incrementAndGet();
+                    exchange.getResponseHeaders().add("Content-Type", "text/event-stream");
+                    exchange.sendResponseHeaders(200, 0);
+                    try {
+                        if (n == 1) {
+                            // A clean close: the next snapshot reports the lost cursor.
+                            exchange.getResponseBody().close();
+                            exchange.close();
+                            return;
+                        }
+                        OutputStream out = exchange.getResponseBody();
+                        out.write(": keep-alive\n\n".getBytes(StandardCharsets.UTF_8));
+                        out.flush();
+                        Thread.sleep(15_000);
+                        out.close();
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    } catch (IOException e) {
+                        // The test stopped the server mid-stream; nothing to assert here.
+                    }
+                });
+        server.start();
+        try {
+            ControlSubscriber sub =
+                    ControlSubscriber.fromParts(
+                            "http://127.0.0.1:" + server.getAddress().getPort(),
+                            "token",
+                            CONSUMER,
+                            LoggerFactory.getLogger("test"),
+                            clock::get,
+                            message -> {},
+                            recording,
+                            nanos::get);
+            assertNotNull(sub);
+            sub.start();
+            long conflictDeadline = System.currentTimeMillis() + 25_000;
+            while (snapshots.get() < 3 && System.currentTimeMillis() < conflictDeadline) {
+                Thread.sleep(50);
+            }
+            assertTrue(snapshots.get() >= 3, "a 409 snapshot keeps RESYNC_PENDING and is retried");
+            assertEquals(1, events.get(), "a 409 snapshot never re-attaches the events leg");
+            nanos.addAndGet(ControlSubscriber.LEASE_NS + 1);
+            assertEquals(
+                    "closed",
+                    sub.current().state(),
+                    "while the cursor is invalid the lease must close entry, not fail-static");
+            snapBody.set(recoveredSnap);
+            long recoverDeadline = System.currentTimeMillis() + 25_000;
+            while (sub.applied() != 6 && System.currentTimeMillis() < recoverDeadline) {
+                Thread.sleep(50);
+            }
+            assertEquals(6, sub.applied(), "a good snapshot recovers RESYNC_PENDING");
+            assertTrue(sub.current().open(), "the recovered snapshot serves again");
+            long streamDeadline = System.currentTimeMillis() + 25_000;
+            while (events.get() < 2 && System.currentTimeMillis() < streamDeadline) {
+                Thread.sleep(50);
+            }
+            assertTrue(events.get() >= 2, "the stream re-attaches once the snapshot succeeds");
+            sub.stop();
+        } finally {
+            server.stop(0);
+            pool.shutdownNow();
+        }
+    }
+
+    @Test
     void outOfRangeRevisionLabeledSafely() throws Exception {
         ControlSubscriber sub = subscriber();
         assertTrue(sub.applySnapshot(snapshot("open", 5)));

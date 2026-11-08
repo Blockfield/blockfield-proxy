@@ -423,7 +423,9 @@ final class ControlSubscriber {
         synchronized (lock) {
             Mode mode;
             if (now - freshAt <= LEASE_NS) mode = Mode.NORMAL;
-            else if (verifiedAt != Long.MIN_VALUE && now - verifiedAt <= maxAgeNs)
+            // Fail-static serves only with a valid cursor: while RESYNC_PENDING the
+            // lease is not extended, so entry closes after it as before fail-static.
+            else if (applied >= 0 && verifiedAt != Long.MIN_VALUE && now - verifiedAt <= maxAgeNs)
                 mode = Mode.STATIC;
             else mode = verifiedAt == Long.MIN_VALUE ? Mode.BOOT : Mode.EXPIRED;
             if (mode != lastMode) {
@@ -886,7 +888,20 @@ final class ControlSubscriber {
     private void loop() {
         while (!stopped && !Thread.currentThread().isInterrupted()) {
             try {
-                if (needSnapshot()) {
+                if (isResyncPending()) {
+                    // RESYNC_PENDING (no valid cursor): the snapshot must succeed before
+                    // re-attaching; a 409 keeps this state. Never stream here: with no
+                    // cursor every frame would resync, so the gate could never apply
+                    // while the snapshot is down.
+                    try {
+                        snapshot();
+                    } catch (IOException e) {
+                        warnOnce(
+                                "control-plane v2 snapshot failed while resync pending,"
+                                        + " retrying: "
+                                        + e);
+                    }
+                } else if (needSnapshot()) {
                     try {
                         snapshot();
                     } catch (IOException e) {
@@ -896,17 +911,27 @@ final class ControlSubscriber {
                         warnOnce("control-plane v2 snapshot failed, staying on events: " + e);
                     }
                 }
-                stream();
-                // A clean close re-verifies too: the gate may have changed while
-                // the stream was down, and fail-static must not hide that.
-                setNeedSnapshot();
+                if (!isResyncPending()) {
+                    stream();
+                    // A clean close re-verifies too: the gate may have changed while
+                    // the stream was down, and fail-static must not hide that.
+                    setNeedSnapshot();
+                }
             } catch (Resync e) {
+                boolean fresh;
                 synchronized (lock) {
+                    fresh = applied >= 0;
                     cursor = -1;
                     applied = -1;
                     needSnapshot = true;
                     resetEpoch++;
                 }
+                // Log the CURSOR_VALID -> RESYNC_PENDING transition once; retries
+                // while already pending stay silent.
+                if (fresh)
+                    warn.accept(
+                            "control-plane v2 resync pending, entry closes after lease"
+                                    + " until a snapshot succeeds");
             } catch (InterruptedException e) {
                 return;
             } catch (Exception e) {
@@ -928,6 +953,17 @@ final class ControlSubscriber {
     private boolean needSnapshot() {
         synchronized (lock) {
             return needSnapshot;
+        }
+    }
+
+    /**
+     * RESYNC_PENDING: no valid cursor (applied is negative after a resync, a 409, or a generation
+     * change). While pending the loop must not attach the stream and fail-static must not serve;
+     * the snapshot is retried until one succeeds.
+     */
+    private boolean isResyncPending() {
+        synchronized (lock) {
+            return applied < 0;
         }
     }
 
