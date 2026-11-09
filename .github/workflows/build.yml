@@ -154,7 +154,7 @@ jobs:
     # inputs are unchanged (the release merge next->main is the common case).
     needs: [bot-gate, decide]
     if: always() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || (needs.bot-gate.outputs.verdict == 'permit' && needs.bot-gate.outputs.sha_match == 'true')) && (needs.decide.outputs.tested != 'true' || needs.decide.outputs.image == 'true')
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     permissions:
       contents: read
@@ -289,7 +289,7 @@ jobs:
     name: ${{ (github.event_name == 'pull_request_review' && (github.event.review.user.login != 'blockfield-review-bot[bot]' || github.event.review.state != 'approved')) && 'release (skipped review)' || 'release' }}
     if: github.ref_type == 'tag'
     needs: build
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
       contents: write
