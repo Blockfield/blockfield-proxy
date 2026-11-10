@@ -32,9 +32,7 @@ import org.junit.jupiter.api.Test;
 import org.slf4j.LoggerFactory;
 
 import java.lang.reflect.Field;
-import java.lang.reflect.Modifier;
 import java.net.InetSocketAddress;
-import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -248,24 +246,6 @@ class BackendRoutingTest {
     }
 
     @Test
-    void gateSourceNamesTheActiveSource() {
-        Path file = Path.of("gate.json");
-        assertEquals(
-                "control-plane", BackendRouting.gateSource("https://cp.invalid", "token", file));
-        assertEquals(
-                "control-plane", BackendRouting.gateSource("https://cp.invalid/", "token", file));
-        assertTrue(
-                BackendRouting.gateSource("not a url", "token", file)
-                        .startsWith("control-plane URL invalid"));
-        assertTrue(
-                BackendRouting.gateSource("https://cp.invalid", null, file)
-                        .contains("half-configured"));
-        assertTrue(BackendRouting.gateSource(null, "token", file).contains("half-configured"));
-        assertTrue(BackendRouting.gateSource(null, null, file).contains("gate.json"));
-        assertTrue(BackendRouting.gateSource(null, null, null).contains("bundled default"));
-    }
-
-    @Test
     void readinessRestartAndReconnectKeepTheSelectedProfile() throws Exception {
         var fixture = new Fixture("workshop.invalid");
         UUID id = UUID.randomUUID();
@@ -436,15 +416,7 @@ class BackendRoutingTest {
     }
 
     @Test
-    void controlPlaneProbeIsSynchronized() throws Exception {
-        assertTrue(
-                Modifier.isSynchronized(
-                        BackendRouting.class.getDeclaredMethod("controlPlane").getModifiers()),
-                "the lazy v2 probe is a check-then-act shared by ping and admit threads");
-    }
-
-    @Test
-    void halfConfiguredV2PinsGameClosedWithoutGateFile() throws Exception {
+    void halfConfiguredV2PinsGameClosed() throws Exception {
         var fixture = new Fixture("workshop.invalid");
         ControlSubscriber v2 =
                 ControlSubscriber.fromParts(
@@ -456,12 +428,6 @@ class BackendRoutingTest {
                         message -> {},
                         null);
         assertNotNull(v2, "a consumer without URL/token pins the game leg closed");
-        Field poller = BackendRouting.class.getDeclaredField("gatePoller");
-        poller.setAccessible(true);
-        poller.set(fixture.routing, null);
-        Field probed = BackendRouting.class.getDeclaredField("controlProbed");
-        probed.setAccessible(true);
-        probed.set(fixture.routing, true);
         Field plane = BackendRouting.class.getDeclaredField("controlPlane");
         plane.setAccessible(true);
         plane.set(fixture.routing, v2);
@@ -473,7 +439,7 @@ class BackendRoutingTest {
         assertEquals(
                 "closed",
                 ((Gate) gate.get(fixture.routing)).forBackend("game").state(),
-                "a configured v2 consumer owns game entry even without a gate file");
+                "the v2 consumer owns game entry; without it entry stays closed");
     }
 
     private static InboundConnection connection(String host) {
@@ -487,24 +453,15 @@ class BackendRoutingTest {
 
     @Test
     void deployingGameShowsDeployInProgress() {
-        Gate deploying =
-                Gate.parse(
-                        "{\"schema\":2,\"revision\":1,\"gate\":\"closed\",\"backend\":\"game\","
-                                + "\"message\":\"\",\"allowed\":[],\"deploying\":true}");
+        Gate deploying = new Gate("closed", "game", "", Set.of(), true);
         assertEquals(
                 BackendRouting.DEPLOYING_GAME,
                 BackendRouting.displayText(deploying, "game", "Игровой сервер недоступен."));
-        Gate custom =
-                Gate.parse(
-                        "{\"schema\":2,\"revision\":1,\"gate\":\"closed\",\"backend\":\"game\",\"message\":\"Скоро"
-                            + " вернёмся\",\"allowed\":[],\"deploying\":true}");
+        Gate custom = new Gate("closed", "game", "Скоро вернёмся", Set.of(), true);
         assertEquals(
                 "Скоро вернёмся",
                 BackendRouting.displayText(custom, "game", "Игровой сервер недоступен."));
-        Gate workshop =
-                Gate.parse(
-                        "{\"schema\":1,\"gate\":\"closed\",\"backend\":\"workshop\",\"message\":\"Техработы\","
-                            + "\"allowed\":[]}");
+        Gate workshop = new Gate("closed", "workshop", "Техработы", Set.of());
         assertEquals(
                 "Техработы",
                 BackendRouting.displayText(workshop, "workshop", "Мастерская сейчас недоступна."));
@@ -648,23 +605,7 @@ class BackendRoutingTest {
         }
 
         void dualGate(String gameState, String workshopState, String name) throws Exception {
-            gate(
-                    Gate.parse(
-                            GateTest.dual(
-                                    "{\"game\":"
-                                            + GateTest.entry(gameState, "", "")
-                                            + ",\"workshop\":"
-                                            + GateTest.entry(
-                                                    workshopState,
-                                                    "Workshop gate",
-                                                    name == null
-                                                            ? ""
-                                                            : "{\"draslId\":\""
-                                                                    + DRASL
-                                                                    + "\",\"name\":\""
-                                                                    + name
-                                                                    + "\"}")
-                                            + "}")));
+            gate(GateTest.dual(gameState, workshopState, DRASL, name));
         }
 
         void gate(Gate gate) throws Exception {

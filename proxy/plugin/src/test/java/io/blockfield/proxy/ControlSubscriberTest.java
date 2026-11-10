@@ -13,6 +13,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.InetSocketAddress;
+import java.net.http.HttpClient;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -48,6 +49,23 @@ class ControlSubscriberTest {
                 message -> {},
                 recording,
                 nanos::get);
+    }
+
+    private ControlSubscriber subscriber(List<String> warnings) {
+        return subscriber(warnings, ControlSubscriber.FAIL_STATIC_MAX_AGE_MS);
+    }
+
+    private ControlSubscriber subscriber(List<String> warnings, long maxAgeMs) {
+        return ControlSubscriber.fromParts(
+                "https://cp.invalid",
+                "token",
+                CONSUMER,
+                LoggerFactory.getLogger("test"),
+                clock::get,
+                warnings::add,
+                recording,
+                nanos::get,
+                maxAgeMs);
     }
 
     private static String snapshot(String mode, long cursor) {
@@ -101,9 +119,62 @@ class ControlSubscriberTest {
                 + "\",\"message\":\"\"},\"timing\":\"live\"}";
     }
 
+    private static String workshopPayload(String state, String memberId, String memberName) {
+        String allowed =
+                memberId == null
+                        ? "[]"
+                        : "[{\"draslId\":\"" + memberId + "\",\"name\":\"" + memberName + "\"}]";
+        return "{\"kind\":\"settings\",\"namespace\":\"gate\",\"target\":\"workshop\","
+                + "\"value\":{\"state\":\""
+                + state
+                + "\",\"message\":\"night build\",\"allowed\":"
+                + allowed
+                + "},\"timing\":\"live\"}";
+    }
+
+    private static String snapshotDual(
+            String gameMode,
+            String workshopState,
+            String memberId,
+            String memberName,
+            long cursor) {
+        String allowed =
+                memberId == null
+                        ? "[]"
+                        : "[{\"draslId\":\"" + memberId + "\",\"name\":\"" + memberName + "\"}]";
+        return "{\"schema\":2,\"audience\":\""
+                + CONSUMER
+                + "\",\"epoch\":\""
+                + EPOCH
+                + "\",\"generation\":\""
+                + GENERATION
+                + "\",\"cursor\":"
+                + cursor
+                + ",\"settings\":[{\"namespace\":\"gate\",\"target\":\"*\",\"revision\":3,"
+                + "\"value\":{\"mode\":\""
+                + gameMode
+                + "\",\"message\":\"\"},\"value_hash\":\""
+                + HASH
+                + "\"},{\"namespace\":\"gate\",\"target\":\"workshop\",\"revision\":4,"
+                + "\"value\":{\"state\":\""
+                + workshopState
+                + "\",\"message\":\"night build\",\"allowed\":"
+                + allowed
+                + "},\"value_hash\":\""
+                + HASH
+                + "\"}],\"hash\":\""
+                + HASH
+                + "\"}";
+    }
+
     @Test
     void firstBootWithoutSnapshotStaysClosed() {
         assertEquals("closed", subscriber().current().state());
+    }
+
+    @Test
+    void httpClientPinsHttp11() {
+        assertEquals(HttpClient.Version.HTTP_1_1, ControlSubscriber.newHttpClient().version());
     }
 
     @Test
@@ -129,7 +200,7 @@ class ControlSubscriberTest {
                         clock::get,
                         message -> {},
                         recording),
-                "without a consumer id the U1 poll/file path stays in charge");
+                "without a consumer id there is no subscriber: the caller pins entry closed");
     }
 
     @Test
@@ -248,42 +319,91 @@ class ControlSubscriberTest {
     }
 
     @Test
-    void partitionHoldsLastGateThenClosesPastTheLease() {
-        ControlSubscriber sub = subscriber();
+    void partitionServesLastVerifiedSnapshotPastTheLease() {
+        List<String> warnings = new ArrayList<>();
+        ControlSubscriber sub = subscriber(warnings);
         assertTrue(sub.applySnapshot(snapshot("open", 5)));
         nanos.addAndGet(ControlSubscriber.LEASE_NS - 1);
         assertTrue(sub.current().open(), "partition inside the lease keeps the last snapshot");
+        assertFalse(sub.failStaticActive(), "a fresh lease is normal service, not fail-static");
         nanos.addAndGet(2);
-        Gate closed = sub.current();
-        assertEquals("closed", closed.state(), "partition past the lease closes entry");
-        assertFalse(closed.allows("game", null, "Anyone", true));
+        assertTrue(
+                sub.current().open(),
+                "partition past the lease still serves the last verified snapshot");
+        assertTrue(sub.failStaticActive());
+        assertEquals(1, sub.failStaticTransitions());
+        assertEquals(1, warnings.size(), "one log line per transition into fail-static");
+        assertTrue(warnings.get(0).contains("fail-static active"));
+        assertTrue(sub.current().open());
+        assertEquals(1, warnings.size(), "steady fail-static does not log again");
+        assertTrue(sub.current().allows("game", null, "Anyone", true));
     }
 
     @Test
-    void v2GameLegNeverOpensOrClosesTheWorkshopFileLeg() {
-        String id = "f3e1b9a622703dee8782b7cdd8519efe";
-        Gate file =
-                Gate.parse(
-                        "{\"schema\":1,\"gate\":\"public\",\"backend\":\"game\",\"message\":\"\","
-                            + "\"allowed\":[],\"backends\":{"
-                            + "\"game\":{\"gate\":\"closed\",\"message\":\"\",\"allowed\":[]},"
-                            + "\"workshop\":{\"gate\":\"builders\",\"message\":\"\",\"allowed\":"
-                            + "[{\"draslId\":\""
-                                + id
-                                + "\",\"name\":\"NetherG\"}]}}}");
+    void rejectedSnapshotNeverVerifiesNorServes() {
+        List<String> warnings = new ArrayList<>();
+        ControlSubscriber sub = subscriber(warnings);
+        assertFalse(
+                sub.applySnapshot(snapshot("open", 5).replace(CONSUMER, "proxy-9")),
+                "a foreign snapshot fails verification");
+        assertFalse(
+                sub.applySnapshot(snapshot("open", 5).replace("\"schema\":2", "\"schema\":1")),
+                "a bad-schema snapshot fails verification");
+        nanos.addAndGet(ControlSubscriber.LEASE_NS + 1);
+        assertEquals(
+                "closed",
+                sub.current().state(),
+                "a snapshot that fails verification never serves, even past the lease");
+        assertFalse(sub.failStaticActive());
+        assertEquals(0, sub.failStaticTransitions());
+        assertTrue(warnings.isEmpty(), "no verified snapshot means no fail-static transition");
+    }
+
+    @Test
+    void verifiedSnapshotPastMaxAgeClosesAgainAndRecovers() {
+        List<String> warnings = new ArrayList<>();
+        long maxAgeMs = ControlSubscriber.LEASE_MS * 4;
+        long maxAgeNs = TimeUnit.MILLISECONDS.toNanos(maxAgeMs);
+        ControlSubscriber sub = subscriber(warnings, maxAgeMs);
+        assertTrue(sub.applySnapshot(snapshot("open", 5)));
+        nanos.addAndGet(ControlSubscriber.LEASE_NS + 1);
+        assertTrue(sub.current().open(), "inside max age the last verified snapshot still serves");
+        nanos.addAndGet(maxAgeNs - ControlSubscriber.LEASE_NS);
+        assertEquals(
+                "closed",
+                sub.current().state(),
+                "past max age entry closes again, even with a verified snapshot");
+        assertFalse(sub.failStaticActive());
+        assertEquals(2, sub.failStaticTransitions(), "enter fail-static, then expire");
+        assertEquals(2, warnings.size(), "one log line per transition");
+        assertTrue(warnings.get(1).contains("expired"));
+        assertTrue(sub.applySnapshot(snapshot("maintenance", 6)));
+        assertEquals(
+                "closed", sub.current().state(), "resume normal on the next verified snapshot");
+        assertFalse(sub.failStaticActive());
+        assertEquals(3, sub.failStaticTransitions(), "recovery is a transition too");
+        assertTrue(warnings.get(2).contains("recovered"));
+    }
+
+    @Test
+    void v2GameLegNeverAdmitsWorkshop() {
+        // A snapshot without the workshop leg leaves it closed; workshop members are never
+        // evicted by a game-leg change — they never enter.
         ControlSubscriber sub = subscriber();
         assertTrue(sub.applySnapshot(snapshot("open", 5)));
-        Gate merged = file.withGame(sub.current());
-        assertTrue(merged.allows("game", null, "Anyone", false));
-        assertTrue(merged.allows("workshop", id, "NetherG", false));
-        assertFalse(merged.allows("workshop", null, "Anyone", false));
+        Gate current = sub.current();
+        assertTrue(current.allows("game", null, "Anyone", false));
+        assertEquals("closed", current.forBackend("workshop").state());
+        assertFalse(current.allows("workshop", EPOCH.replace("-", ""), "NetherG", false));
 
         nanos.addAndGet(ControlSubscriber.LEASE_NS + 1);
-        Gate expired = file.withGame(sub.current());
-        assertFalse(expired.allows("game", null, "Anyone", true));
+        Gate failStatic = sub.current();
         assertTrue(
-                expired.allows("workshop", id, "NetherG", false),
-                "a closed/expired game leg must not evict workshop members");
+                failStatic.allows("game", null, "Anyone", false),
+                "past the lease the last verified snapshot still admits game entry");
+        assertFalse(
+                failStatic.allows("workshop", EPOCH.replace("-", ""), "NetherG", false),
+                "a missing workshop leg stays closed under fail-static");
     }
 
     private static String stateOf(String ackBody) {
@@ -320,6 +440,29 @@ class ControlSubscriberTest {
     }
 
     @Test
+    void gateFrameWithoutStringModeFailsClosedWithoutThrowing() throws Exception {
+        for (String payload :
+                new String[] {
+                    gatePayload("maintenance").replace("\"mode\":\"maintenance\",", ""),
+                    gatePayload("maintenance").replace("\"mode\":\"maintenance\"", "\"mode\":42")
+                }) {
+            ControlSubscriber sub = subscriber();
+            assertTrue(sub.applySnapshot(snapshot("open", 5)));
+            assertEquals(
+                    ControlSubscriber.Verdict.APPLIED,
+                    sub.offer(envelope(6, true, null, payload)),
+                    "a mode-less gate frame must fail closed, never throw out of offer()");
+            assertEquals("closed", sub.current().state());
+            awaitCursor(sub, 6);
+            assertEquals(
+                    ControlSubscriber.Verdict.APPLIED,
+                    sub.offer(envelope(7, true, null, gatePayload("open"))),
+                    "the stream keeps moving after a corrupt frame");
+            assertTrue(sub.current().open());
+        }
+    }
+
+    @Test
     void heldFrameRefreshesLease() {
         ControlSubscriber sub = subscriber();
         assertTrue(sub.applySnapshot(snapshot("open", 5)));
@@ -335,14 +478,18 @@ class ControlSubscriberTest {
     }
 
     @Test
-    void foreignTargetSnapshotStaysClosed() {
+    void workshopTargetNeverDrivesGameEntry() {
         ControlSubscriber sub = subscriber();
-        String foreign = snapshot("open", 5).replace("\"target\":\"*\"", "\"target\":\"workshop\"");
-        assertTrue(sub.applySnapshot(foreign));
-        assertEquals(
-                "closed",
-                sub.current().state(),
-                "another target's gate must never drive game entry");
+        // A game-shaped value at the workshop target is an invalid workshop leg: it fails
+        // that leg closed and leaves the game leg exactly as it was.
+        String mixed =
+                snapshotDual("open", "builders", GateTest.ID, "Nether", 5)
+                        .replace("\"state\":\"builders\"", "\"mode\":\"open\"");
+        assertTrue(sub.applySnapshot(mixed));
+        assertTrue(
+                sub.current().allows("game", null, "Anyone", false),
+                "a workshop entry must never drive game entry");
+        assertEquals("closed", sub.current().forBackend("workshop").state());
         assertEquals(5, sub.cursor());
     }
 
@@ -375,17 +522,72 @@ class ControlSubscriberTest {
     }
 
     @Test
-    void foreignTargetFrameIsRejectedWithoutApplying() throws Exception {
+    void workshopLegInSnapshotAdmitsWorkshop() {
+        ControlSubscriber sub = subscriber();
+        assertTrue(sub.applySnapshot(snapshotDual("open", "builders", GateTest.ID, "Nether", 5)));
+        Gate current = sub.current();
+        assertTrue(current.allows("game", null, "Anyone", false));
+        assertTrue(current.allows("workshop", GateTest.ID, "Nether", false));
+        assertFalse(current.allows("workshop", GateTest.ID, "Impostor", false));
+        assertEquals(5, sub.cursor());
+    }
+
+    @Test
+    void workshopFrameAppliesWithoutTouchingGameLeg() throws Exception {
+        ControlSubscriber sub = subscriber();
+        assertTrue(sub.applySnapshot(snapshot("open", 5)));
+        assertEquals(
+                ControlSubscriber.Verdict.APPLIED,
+                sub.offer(
+                        envelope(
+                                6,
+                                true,
+                                null,
+                                workshopPayload("builders", GateTest.ID, "Nether"))));
+        assertTrue(sub.current().allows("game", null, "Anyone", false));
+        assertTrue(sub.current().allows("workshop", GateTest.ID, "Nether", false));
+        awaitCursor(sub, 6);
+        assertEquals(
+                ControlSubscriber.Verdict.APPLIED,
+                sub.offer(envelope(7, true, null, gatePayload("maintenance"))));
+        assertFalse(sub.current().allows("game", null, "Anyone", true));
+        assertTrue(
+                sub.current().allows("workshop", GateTest.ID, "Nether", false),
+                "a game-leg frame must not close the workshop leg");
+    }
+
+    @Test
+    void staleLeasePastMaxAgeClosesBothLegs() {
+        List<String> warnings = new ArrayList<>();
+        long maxAgeMs = ControlSubscriber.LEASE_MS * 4;
+        ControlSubscriber sub = subscriber(warnings, maxAgeMs);
+        assertTrue(sub.applySnapshot(snapshotDual("open", "builders", GateTest.ID, "Nether", 5)));
+        nanos.addAndGet(ControlSubscriber.LEASE_NS + 1);
+        Gate failStatic = sub.current();
+        assertTrue(failStatic.allows("game", null, "Anyone", true));
+        assertTrue(failStatic.allows("workshop", GateTest.ID, "Nether", false));
+        nanos.addAndGet(TimeUnit.MILLISECONDS.toNanos(maxAgeMs) - ControlSubscriber.LEASE_NS);
+        Gate expired = sub.current();
+        assertFalse(expired.allows("game", null, "Anyone", true));
+        assertFalse(expired.allows("workshop", GateTest.ID, "Nether", false));
+    }
+
+    @Test
+    void workshopFrameLeavesGameLegUntouched() throws Exception {
         ControlSubscriber sub = subscriber();
         assertTrue(sub.applySnapshot(snapshot("open", 5)));
         String other =
                 gatePayload("maintenance").replace("\"target\":\"*\"", "\"target\":\"workshop\"");
-        assertEquals(ControlSubscriber.Verdict.HELD, sub.offer(envelope(6, true, null, other)));
-        assertTrue(sub.current().open(), "another target's gate must never drive game entry");
+        assertEquals(ControlSubscriber.Verdict.APPLIED, sub.offer(envelope(6, true, null, other)));
+        assertTrue(sub.current().open(), "a workshop entry must never drive game entry");
+        assertEquals(
+                "closed",
+                sub.current().forBackend("workshop").state(),
+                "a game-shaped workshop value is an invalid workshop leg, fails closed");
         awaitCursor(sub, 6);
-        awaitBodies(recording.bodies, 1);
+        awaitBodies(recording.bodies, 3);
         assertEquals(6, sub.cursor());
-        assertEquals("rejected", stateOf(recording.bodies.get(0)));
+        assertEquals("applied", stateOf(recording.bodies.get(2)));
     }
 
     @Test
@@ -574,10 +776,17 @@ class ControlSubscriberTest {
         clock.addAndGet(-30_000);
         clock.addAndGet(2);
         nanos.addAndGet(2);
+        assertTrue(
+                sub.current().open(),
+                "a backward wall step must not close the fail-static window past a partition");
+        nanos.addAndGet(
+                TimeUnit.MILLISECONDS.toNanos(ControlSubscriber.FAIL_STATIC_MAX_AGE_MS)
+                        - ControlSubscriber.LEASE_NS
+                        + 1);
         assertEquals(
                 "closed",
                 sub.current().state(),
-                "a backward wall step must not extend the lease past a partition");
+                "the max age is monotonic too: wall steps never extend it");
     }
 
     @Test
@@ -740,6 +949,346 @@ class ControlSubscriberTest {
             assertEquals(6, sub.cursor(), "an idle stream is aborted and reconnected");
             assertTrue(events.get() >= 2, "the reconnect opens a fresh stream");
             assertEquals(3, acks.size(), "the replayed frame is ACKed after reconnect");
+            sub.stop();
+        } finally {
+            server.stop(0);
+            pool.shutdownNow();
+        }
+    }
+
+    @Test
+    void transportFailureReverifiesViaSnapshot() throws Exception {
+        AtomicInteger snapshots = new AtomicInteger();
+        String openSnap = snapshot("open", 5);
+        String closedSnap = snapshot("closed", 5);
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        ExecutorService pool = Executors.newCachedThreadPool();
+        server.setExecutor(pool);
+        server.createContext(
+                "/v2/agents/" + CONSUMER + "/snapshot",
+                exchange -> {
+                    String body = snapshots.incrementAndGet() == 1 ? openSnap : closedSnap;
+                    byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
+                    exchange.sendResponseHeaders(200, bytes.length);
+                    try (OutputStream out = exchange.getResponseBody()) {
+                        out.write(bytes);
+                    }
+                });
+        server.createContext(
+                "/v2/agents/" + CONSUMER + "/events",
+                exchange -> {
+                    // The events leg is down while snapshots stay reachable.
+                    exchange.sendResponseHeaders(500, -1);
+                    exchange.close();
+                });
+        server.start();
+        try {
+            ControlSubscriber sub =
+                    ControlSubscriber.fromParts(
+                            "http://127.0.0.1:" + server.getAddress().getPort(),
+                            "token",
+                            CONSUMER,
+                            LoggerFactory.getLogger("test"),
+                            clock::get,
+                            message -> {},
+                            recording,
+                            nanos::get);
+            assertNotNull(sub);
+            sub.start();
+            long openDeadline = System.currentTimeMillis() + 10_000;
+            while (!sub.current().open() && System.currentTimeMillis() < openDeadline) {
+                Thread.sleep(50);
+            }
+            assertTrue(sub.current().open(), "the opening snapshot applies before the stream dies");
+            long deadline = System.currentTimeMillis() + 25_000;
+            while (!"closed".equals(sub.current().state())
+                    && System.currentTimeMillis() < deadline) {
+                Thread.sleep(50);
+            }
+            assertEquals(
+                    "closed",
+                    sub.current().state(),
+                    "a dead stream must re-verify via snapshot, not serve the stale open gate");
+            assertTrue(snapshots.get() >= 2, "the retry snapshots before re-streaming");
+            sub.stop();
+        } finally {
+            server.stop(0);
+            pool.shutdownNow();
+        }
+    }
+
+    @Test
+    void snapshotDownEventsHealthyStillStreams() throws Exception {
+        AtomicInteger snapshots = new AtomicInteger();
+        AtomicInteger events = new AtomicInteger();
+        String openSnap = snapshot("open", 5);
+        String closedFrame = envelope(6, true, null, gatePayload("closed"));
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        ExecutorService pool = Executors.newCachedThreadPool();
+        server.setExecutor(pool);
+        server.createContext(
+                "/v2/agents/" + CONSUMER + "/snapshot",
+                exchange -> {
+                    if (snapshots.incrementAndGet() == 1) {
+                        byte[] bytes = openSnap.getBytes(StandardCharsets.UTF_8);
+                        exchange.sendResponseHeaders(200, bytes.length);
+                        try (OutputStream out = exchange.getResponseBody()) {
+                            out.write(bytes);
+                        }
+                    } else {
+                        // /snapshot goes down while /events stays healthy.
+                        exchange.sendResponseHeaders(500, -1);
+                        exchange.close();
+                    }
+                });
+        server.createContext(
+                "/v2/agents/" + CONSUMER + "/events",
+                exchange -> {
+                    if (events.incrementAndGet() == 1) {
+                        // The first stream dies while snapshots still work.
+                        exchange.sendResponseHeaders(500, -1);
+                        exchange.close();
+                        return;
+                    }
+                    exchange.getResponseHeaders().add("Content-Type", "text/event-stream");
+                    exchange.sendResponseHeaders(200, 0);
+                    try {
+                        OutputStream out = exchange.getResponseBody();
+                        out.write(": keep-alive\n\n".getBytes(StandardCharsets.UTF_8));
+                        out.flush();
+                        out.write(
+                                ("event: control\ndata: " + closedFrame + "\n\n")
+                                        .getBytes(StandardCharsets.UTF_8));
+                        out.flush();
+                        Thread.sleep(8_000);
+                        out.close();
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    } catch (IOException e) {
+                        // The test stopped the server mid-stream; nothing to assert here.
+                    }
+                });
+        server.start();
+        try {
+            ControlSubscriber sub =
+                    ControlSubscriber.fromParts(
+                            "http://127.0.0.1:" + server.getAddress().getPort(),
+                            "token",
+                            CONSUMER,
+                            LoggerFactory.getLogger("test"),
+                            clock::get,
+                            message -> {},
+                            recording,
+                            nanos::get);
+            assertNotNull(sub);
+            sub.start();
+            long openDeadline = System.currentTimeMillis() + 10_000;
+            while (!sub.current().open() && System.currentTimeMillis() < openDeadline) {
+                Thread.sleep(50);
+            }
+            assertTrue(
+                    sub.current().open(),
+                    "the opening snapshot applies before the first stream dies");
+            long deadline = System.currentTimeMillis() + 25_000;
+            while (!"closed".equals(sub.current().state())
+                    && System.currentTimeMillis() < deadline) {
+                Thread.sleep(50);
+            }
+            assertEquals(
+                    "closed",
+                    sub.current().state(),
+                    "a dead snapshot must not pin the events leg:"
+                            + " the gate-closed frame still applies");
+            assertTrue(events.get() >= 2, "the events leg re-attaches after the snapshot fails");
+            sub.stop();
+        } finally {
+            server.stop(0);
+            pool.shutdownNow();
+        }
+    }
+
+    @Test
+    void resyncPendingSkipsStreamUntilSnapshotSucceeds() throws Exception {
+        AtomicInteger snapshots = new AtomicInteger();
+        AtomicInteger events = new AtomicInteger();
+        List<String> warnings = Collections.synchronizedList(new ArrayList<>());
+        String openSnap = snapshot("open", 5);
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        ExecutorService pool = Executors.newCachedThreadPool();
+        server.setExecutor(pool);
+        server.createContext(
+                "/v2/agents/" + CONSUMER + "/snapshot",
+                exchange -> {
+                    if (snapshots.incrementAndGet() == 1) {
+                        byte[] bytes = openSnap.getBytes(StandardCharsets.UTF_8);
+                        exchange.sendResponseHeaders(200, bytes.length);
+                        try (OutputStream out = exchange.getResponseBody()) {
+                            out.write(bytes);
+                        }
+                    } else {
+                        // /snapshot goes down right after the resync below.
+                        exchange.sendResponseHeaders(500, -1);
+                        exchange.close();
+                    }
+                });
+        server.createContext(
+                "/v2/agents/" + CONSUMER + "/events",
+                exchange -> {
+                    events.incrementAndGet();
+                    exchange.getResponseHeaders().add("Content-Type", "text/event-stream");
+                    exchange.sendResponseHeaders(200, 0);
+                    try {
+                        OutputStream out = exchange.getResponseBody();
+                        // A generation change on the live leg: re-snapshot, no valid cursor.
+                        out.write("event: resync\n\n".getBytes(StandardCharsets.UTF_8));
+                        out.flush();
+                        Thread.sleep(15_000);
+                        out.close();
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    } catch (IOException e) {
+                        // The test stopped the server mid-stream; nothing to assert here.
+                    }
+                });
+        server.start();
+        try {
+            ControlSubscriber sub =
+                    ControlSubscriber.fromParts(
+                            "http://127.0.0.1:" + server.getAddress().getPort(),
+                            "token",
+                            CONSUMER,
+                            LoggerFactory.getLogger("test"),
+                            clock::get,
+                            warnings::add,
+                            recording,
+                            nanos::get);
+            assertNotNull(sub);
+            sub.start();
+            long retryDeadline = System.currentTimeMillis() + 25_000;
+            while (snapshots.get() < 2 && System.currentTimeMillis() < retryDeadline) {
+                Thread.sleep(50);
+            }
+            assertTrue(
+                    snapshots.get() >= 2,
+                    "RESYNC_PENDING retries the snapshot instead of stalling on it");
+            assertEquals(
+                    1,
+                    events.get(),
+                    "RESYNC_PENDING never re-attaches the stream: no frame could apply");
+            nanos.addAndGet(ControlSubscriber.LEASE_NS + 1);
+            assertEquals(
+                    "closed",
+                    sub.current().state(),
+                    "without a valid cursor fail-static must not serve the stale open gate");
+            assertEquals(
+                    1,
+                    warnings.stream()
+                            .filter(w -> w.contains("resync pending, entry closes"))
+                            .count(),
+                    "the CURSOR_VALID -> RESYNC_PENDING transition logs once");
+            sub.stop();
+        } finally {
+            server.stop(0);
+            pool.shutdownNow();
+        }
+    }
+
+    @Test
+    void snapshotConflictKeepsResyncPendingUntilSnapshotSucceeds() throws Exception {
+        AtomicInteger snapshots = new AtomicInteger();
+        AtomicInteger events = new AtomicInteger();
+        AtomicReference<String> snapBody = new AtomicReference<>(null);
+        String openSnap = snapshot("open", 5);
+        String recoveredSnap = snapshot("open", 6);
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        ExecutorService pool = Executors.newCachedThreadPool();
+        server.setExecutor(pool);
+        server.createContext(
+                "/v2/agents/" + CONSUMER + "/snapshot",
+                exchange -> {
+                    int n = snapshots.incrementAndGet();
+                    if (n == 1) {
+                        byte[] bytes = openSnap.getBytes(StandardCharsets.UTF_8);
+                        exchange.sendResponseHeaders(200, bytes.length);
+                        try (OutputStream out = exchange.getResponseBody()) {
+                            out.write(bytes);
+                        }
+                        return;
+                    }
+                    String body = snapBody.get();
+                    if (body != null) {
+                        byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
+                        exchange.sendResponseHeaders(200, bytes.length);
+                        try (OutputStream out = exchange.getResponseBody()) {
+                            out.write(bytes);
+                        }
+                        return;
+                    }
+                    // The server lost the cursor: every snapshot asks for a resync.
+                    exchange.sendResponseHeaders(409, -1);
+                    exchange.close();
+                });
+        server.createContext(
+                "/v2/agents/" + CONSUMER + "/events",
+                exchange -> {
+                    int n = events.incrementAndGet();
+                    exchange.getResponseHeaders().add("Content-Type", "text/event-stream");
+                    exchange.sendResponseHeaders(200, 0);
+                    try {
+                        if (n == 1) {
+                            // A clean close: the next snapshot reports the lost cursor.
+                            exchange.getResponseBody().close();
+                            exchange.close();
+                            return;
+                        }
+                        OutputStream out = exchange.getResponseBody();
+                        out.write(": keep-alive\n\n".getBytes(StandardCharsets.UTF_8));
+                        out.flush();
+                        Thread.sleep(15_000);
+                        out.close();
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    } catch (IOException e) {
+                        // The test stopped the server mid-stream; nothing to assert here.
+                    }
+                });
+        server.start();
+        try {
+            ControlSubscriber sub =
+                    ControlSubscriber.fromParts(
+                            "http://127.0.0.1:" + server.getAddress().getPort(),
+                            "token",
+                            CONSUMER,
+                            LoggerFactory.getLogger("test"),
+                            clock::get,
+                            message -> {},
+                            recording,
+                            nanos::get);
+            assertNotNull(sub);
+            sub.start();
+            long conflictDeadline = System.currentTimeMillis() + 25_000;
+            while (snapshots.get() < 3 && System.currentTimeMillis() < conflictDeadline) {
+                Thread.sleep(50);
+            }
+            assertTrue(snapshots.get() >= 3, "a 409 snapshot keeps RESYNC_PENDING and is retried");
+            assertEquals(1, events.get(), "a 409 snapshot never re-attaches the events leg");
+            nanos.addAndGet(ControlSubscriber.LEASE_NS + 1);
+            assertEquals(
+                    "closed",
+                    sub.current().state(),
+                    "while the cursor is invalid the lease must close entry, not fail-static");
+            snapBody.set(recoveredSnap);
+            long recoverDeadline = System.currentTimeMillis() + 25_000;
+            while (sub.applied() != 6 && System.currentTimeMillis() < recoverDeadline) {
+                Thread.sleep(50);
+            }
+            assertEquals(6, sub.applied(), "a good snapshot recovers RESYNC_PENDING");
+            assertTrue(sub.current().open(), "the recovered snapshot serves again");
+            long streamDeadline = System.currentTimeMillis() + 25_000;
+            while (events.get() < 2 && System.currentTimeMillis() < streamDeadline) {
+                Thread.sleep(50);
+            }
+            assertTrue(events.get() >= 2, "the stream re-attaches once the snapshot succeeds");
             sub.stop();
         } finally {
             server.stop(0);
@@ -1266,5 +1815,40 @@ class ControlSubscriberTest {
         } finally {
             server.stop(0);
         }
+    }
+
+    @Test
+    void gateUriNormalizesSlashesAndRejectsGarbage() {
+        // P1-2: trailing slash делал путь //v1/gate и закрывал вход навсегда.
+        assertEquals(
+                "https://cp.invalid:8080/v1/gate",
+                ControlSubscriber.gateUri("https://cp.invalid:8080/").toString());
+        assertEquals(
+                "https://cp.invalid:8080/v1/gate",
+                ControlSubscriber.gateUri("  https://cp.invalid:8080  ").toString());
+        assertEquals(
+                "https://cp.invalid:8080/v1/gate",
+                ControlSubscriber.gateUri("https://cp.invalid:8080").toString());
+        assertThrows(
+                IllegalArgumentException.class,
+                () -> ControlSubscriber.gateUri("not a url with spaces"));
+    }
+
+    @Test
+    void gateUriStripsPathQueryAndFragment() {
+        // P1-2 remainder: a path prefix made the poll path /prefix/v1/gate, CP 404s on
+        // exact-path match, entry closed from boot forever.
+        assertEquals(
+                "https://cp.invalid:8080/v1/gate",
+                ControlSubscriber.gateUri("https://cp.invalid:8080/prefix").toString());
+        assertEquals(
+                "https://cp.invalid:8080/v1/gate",
+                ControlSubscriber.gateUri("https://cp.invalid:8080/prefix/?next=1#frag")
+                        .toString());
+        assertEquals(
+                "http://[::1]:8080/v1/gate",
+                ControlSubscriber.gateUri("http://[::1]:8080/prefix/").toString());
+        assertThrows(
+                IllegalArgumentException.class, () -> ControlSubscriber.gateUri("cp.invalid:8080"));
     }
 }
