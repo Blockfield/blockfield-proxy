@@ -13,6 +13,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.InetSocketAddress;
+import java.net.http.HttpClient;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -169,6 +170,11 @@ class ControlSubscriberTest {
     @Test
     void firstBootWithoutSnapshotStaysClosed() {
         assertEquals("closed", subscriber().current().state());
+    }
+
+    @Test
+    void httpClientPinsHttp11() {
+        assertEquals(HttpClient.Version.HTTP_1_1, ControlSubscriber.newHttpClient().version());
     }
 
     @Test

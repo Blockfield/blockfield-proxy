@@ -1078,7 +1078,18 @@ final class ControlSubscriber {
     }
 
     private HttpClient http() {
-        return HttpClient.newBuilder().connectTimeout(RPC_TIMEOUT).build();
+        return newHttpClient();
+    }
+
+    /**
+     * The control plane serves plain HTTP with no h2c support: an HTTP/2 client sends an {@code
+     * Upgrade} header on every poll and the server logs "Unsupported upgrade request" each time.
+     */
+    static HttpClient newHttpClient() {
+        return HttpClient.newBuilder()
+                .version(HttpClient.Version.HTTP_1_1)
+                .connectTimeout(RPC_TIMEOUT)
+                .build();
     }
 
     private static final class Resync extends RuntimeException {}
@@ -1108,10 +1119,7 @@ final class ControlSubscriber {
                             .POST(HttpRequest.BodyPublishers.ofString(body))
                             .build();
             HttpResponse<String> response =
-                    HttpClient.newBuilder()
-                            .connectTimeout(RPC_TIMEOUT)
-                            .build()
-                            .send(request, HttpResponse.BodyHandlers.ofString());
+                    newHttpClient().send(request, HttpResponse.BodyHandlers.ofString());
             if (response.statusCode() >= 400)
                 throw new IOException("CP ack status " + response.statusCode());
         }
