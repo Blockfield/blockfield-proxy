@@ -287,7 +287,10 @@ jobs:
   # Описание версии: только GitHub Release с release-notes.md и announcement.json; деплой — отдельный ручной workflow.
   release:
     name: ${{ (github.event_name == 'pull_request_review' && (github.event.review.user.login != 'blockfield-review-bot[bot]' || github.event.review.state != 'approved')) && 'release (skipped review)' || 'release' }}
-    if: github.ref_type == 'tag'
+    # always(): bot-gate skips on pushes and GitHub extends that skip down the
+    # whole chain unless this job opts out; the result check keeps the old
+    # "publish only what build validated" guarantee.
+    if: always() && github.ref_type == 'tag' && needs.build.result == 'success'
     needs: build
     runs-on: ubuntu-24.04
     timeout-minutes: 15
