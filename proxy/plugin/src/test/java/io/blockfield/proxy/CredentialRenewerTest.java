@@ -1,6 +1,7 @@
 package io.blockfield.proxy;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import org.junit.jupiter.api.Test;
@@ -74,6 +75,7 @@ class CredentialRenewerTest {
         assertEquals(
                 shortIssued.plus(Duration.ofMinutes(6)),
                 CredentialRenewer.renewAt(shortIssued, shortIssued.plus(Duration.ofMinutes(8))));
+        assertEquals(issued, CredentialRenewer.renewAt(issued.plus(Duration.ofDays(31)), issued));
 
         FakeCp cp = new FakeCp();
         cp.issued = issued;
@@ -145,6 +147,25 @@ class CredentialRenewerTest {
         CredentialRenewer r = renewer(cp, state, "env");
         r.tick();
         assertEquals("env", r.token());
+        // The rejected successor must not come back after a restart.
+        assertFalse(Files.exists(state));
+    }
+
+    @Test
+    void a401RightAfterAConfirmedRenewalKeepsTheSuccessor() throws Exception {
+        Path state = dir.resolve("s.json");
+        CredentialRenewer.persist(state, "next-env", "env");
+        CredentialRenewer r =
+                new CredentialRenewer(
+                        (method, path, token) ->
+                                new CredentialRenewer.Reply(
+                                        path.endsWith("/confirm") ? 200 : 401, "{}"),
+                        state,
+                        "env",
+                        NOPLogger.NOP_LOGGER,
+                        () -> now);
+        assertEquals(CredentialRenewer.RETRY_MS, r.tick());
+        assertEquals("next-env", r.token());
     }
 
     @Test

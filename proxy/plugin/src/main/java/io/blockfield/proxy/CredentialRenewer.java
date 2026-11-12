@@ -131,15 +131,23 @@ final class CredentialRenewer {
     /** One renewal step; returns the delay in ms before the next one. */
     long tick() throws IOException, InterruptedException {
         if (token.isEmpty()) return MAX_SLEEP_MS;
+        boolean justConfirmed = false;
         if (confirmPending) {
             int status = cp.call("POST", "/v2/credentials/renew/confirm", token).status();
             // 404: nothing pending for this token; 401: the /v2/me check below falls back.
             if (status == 200 || status == 404 || status == 401) confirmPending = false;
             else return RETRY_MS;
+            justConfirmed = status == 200;
         }
         Reply me = cp.call("GET", "/v2/me", token);
-        if (me.status() == 401 && !token.equals(envToken) && !envToken.isEmpty()) {
+        // Right after a confirmed renewal a 401 is replication lag: the env token is revoked.
+        if (me.status() == 401
+                && !justConfirmed
+                && !token.equals(envToken)
+                && !envToken.isEmpty()) {
             log.warn("persisted CP credential rejected, falling back to the env token");
+            // Else a restart would adopt the rejected successor again.
+            Files.deleteIfExists(state);
             adopt(envToken);
             return 0;
         }
@@ -180,6 +188,8 @@ final class CredentialRenewer {
 
     static Instant renewAt(Instant issued, Instant expires) {
         Duration lead = Duration.between(issued, expires).dividedBy(4);
+        // A skewed issuedAt after expiresAt gives a negative lead: renew at expiry, not after it.
+        if (lead.isNegative()) lead = Duration.ZERO;
         if (lead.compareTo(MAX_LEAD) > 0) lead = MAX_LEAD;
         return expires.minus(lead);
     }
