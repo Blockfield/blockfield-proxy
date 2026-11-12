@@ -34,6 +34,10 @@ import java.util.function.LongSupplier;
 final class CredentialRenewer {
     static final Duration MAX_LEAD = Duration.ofDays(7);
     static final long RETRY_MS = 30_000;
+
+    /** A 401 this soon after a renewal is replication lag, not a rejected successor. */
+    static final long LAG_GRACE_MS = Duration.ofMinutes(10).toMillis();
+
     private static final long MAX_SLEEP_MS = Duration.ofHours(1).toMillis();
     private static final Duration RPC_TIMEOUT = Duration.ofSeconds(10);
 
@@ -53,6 +57,7 @@ final class CredentialRenewer {
     private volatile Consumer<String> onToken = t -> {};
     private volatile String token;
     private boolean confirmPending;
+    private long renewedAtMs;
     private volatile boolean stopped;
     private volatile Thread thread;
 
@@ -62,10 +67,14 @@ final class CredentialRenewer {
         this.envToken = envToken == null ? "" : envToken.strip();
         this.log = log;
         this.clockMs = clockMs;
-        String persisted = load(state, this.envToken, log);
-        this.token = persisted != null ? persisted : this.envToken;
+        JsonObject persisted = load(state, this.envToken, log);
+        this.token = persisted != null ? persisted.get("token").getAsString() : this.envToken;
         // A persisted successor may be unconfirmed (crash before confirm); confirm is idempotent.
         this.confirmPending = persisted != null;
+        this.renewedAtMs =
+                persisted != null && persisted.has("renewedAt")
+                        ? persisted.get("renewedAt").getAsLong()
+                        : 0;
     }
 
     static CredentialRenewer http(String baseUrl, Path state, String envToken, Logger log) {
@@ -131,18 +140,17 @@ final class CredentialRenewer {
     /** One renewal step; returns the delay in ms before the next one. */
     long tick() throws IOException, InterruptedException {
         if (token.isEmpty()) return MAX_SLEEP_MS;
-        boolean justConfirmed = false;
         if (confirmPending) {
             int status = cp.call("POST", "/v2/credentials/renew/confirm", token).status();
             // 404: nothing pending for this token; 401: the /v2/me check below falls back.
             if (status == 200 || status == 404 || status == 401) confirmPending = false;
             else return RETRY_MS;
-            justConfirmed = status == 200;
         }
         Reply me = cp.call("GET", "/v2/me", token);
-        // Right after a confirmed renewal a 401 is replication lag: the env token is revoked.
+        // Within the grace a 401 is replication lag and the env token is already revoked; the
+        // renewal time lives in the state file so a restart during the lag keeps the successor.
         if (me.status() == 401
-                && !justConfirmed
+                && clockMs.getAsLong() - renewedAtMs > LAG_GRACE_MS
                 && !token.equals(envToken)
                 && !envToken.isEmpty()) {
             log.warn("persisted CP credential rejected, falling back to the env token");
@@ -172,7 +180,8 @@ final class CredentialRenewer {
                 JsonParser.parseString(renewed.body()).getAsJsonObject().get("token").getAsString();
         // Persist before confirm: confirm revokes the old token, so a successor that only lives
         // in memory would be lost on restart. A failed write retries renew, which replays it.
-        persist(state, next, envToken);
+        persist(state, next, envToken, now);
+        renewedAtMs = now;
         adopt(next);
         confirmPending = true;
         log.info(
@@ -209,8 +218,8 @@ final class CredentialRenewer {
         }
     }
 
-    /** The persisted token, or null when absent, unreadable or from another env token. */
-    static String load(Path state, String envToken, Logger log) {
+    /** The persisted state, or null when absent, unreadable or from another env token. */
+    static JsonObject load(Path state, String envToken, Logger log) {
         if (state == null || !Files.isRegularFile(state)) return null;
         try {
             JsonObject json = JsonParser.parseString(Files.readString(state)).getAsJsonObject();
@@ -219,17 +228,19 @@ final class CredentialRenewer {
                 log.info("CP credential state file predates the env token, using env");
                 return null;
             }
-            return token.isBlank() ? null : token;
+            return token.isBlank() ? null : json;
         } catch (IOException | RuntimeException e) {
             log.warn("CP credential state file unreadable, using env: {}", e.toString());
             return null;
         }
     }
 
-    static void persist(Path state, String token, String envToken) throws IOException {
+    static void persist(Path state, String token, String envToken, long renewedAtMs)
+            throws IOException {
         JsonObject json = new JsonObject();
         json.addProperty("token", token);
         json.addProperty("base", sha256(envToken));
+        json.addProperty("renewedAt", renewedAtMs);
         Path dir = state.toAbsolutePath().getParent();
         Files.createDirectories(dir);
         Path temp =
