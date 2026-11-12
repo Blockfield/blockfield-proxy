@@ -110,15 +110,17 @@ class CredentialRenewerTest {
                         "/v2/me next-env"),
                 cp.calls.subList(0, 4));
         assertTrue(cp.stateAtConfirm.contains("\"token\":\"next-env\""), cp.stateAtConfirm);
+        assertTrue(cp.stateAtConfirm.contains("\"confirmed\":false"), cp.stateAtConfirm);
         assertEquals(List.of("next-env"), swapped);
         assertEquals(
                 "rw-------", PosixFilePermissions.toString(Files.getPosixFilePermissions(state)));
+        assertTrue(Files.readString(state).contains("\"confirmed\":true"), Files.readString(state));
     }
 
     @Test
     void restartReadsTheStateFileAndConfirmsIt() throws Exception {
         Path state = dir.resolve("s.json");
-        CredentialRenewer.persist(state, "next-env", "env", now);
+        CredentialRenewer.persist(state, "next-env", "env", false);
         FakeCp cp = new FakeCp();
         cp.issued = Instant.ofEpochMilli(now);
         cp.expires = cp.issued.plus(Duration.ofDays(30));
@@ -127,6 +129,7 @@ class CredentialRenewerTest {
         r.tick();
         assertEquals(
                 List.of("/v2/credentials/renew/confirm next-env", "/v2/me next-env"), cp.calls);
+        assertTrue(Files.readString(state).contains("\"confirmed\":true"));
     }
 
     @Test
@@ -137,13 +140,12 @@ class CredentialRenewerTest {
         cp.expires = cp.issued.plus(Duration.ofDays(30));
         assertEquals("env", renewer(cp, state, "env").token());
         // The owner re-issued the env token: the old chain's state file no longer applies.
-        CredentialRenewer.persist(state, "next-old", "old-env", now);
+        CredentialRenewer.persist(state, "next-old", "old-env", false);
         assertEquals("env", renewer(cp, state, "env").token());
         Files.writeString(state, "not json");
         assertEquals("env", renewer(cp, state, "env").token());
-        // A persisted token the CP rejects long after its renewal falls back to env at runtime.
-        CredentialRenewer.persist(
-                state, "next-env", "env", now - CredentialRenewer.LAG_GRACE_MS - 1);
+        // An unconfirmed successor the CP rejects was never confirmed: env is still valid.
+        CredentialRenewer.persist(state, "next-env", "env", false);
         cp.rejected = "next-env";
         CredentialRenewer r = renewer(cp, state, "env");
         r.tick();
@@ -155,7 +157,7 @@ class CredentialRenewerTest {
     @Test
     void a401RightAfterAConfirmedRenewalKeepsTheSuccessor() throws Exception {
         Path state = dir.resolve("s.json");
-        CredentialRenewer.persist(state, "next-env", "env", now);
+        CredentialRenewer.persist(state, "next-env", "env", true);
         CredentialRenewer r =
                 new CredentialRenewer(
                         (method, path, token) ->
@@ -170,7 +172,7 @@ class CredentialRenewerTest {
     }
 
     @Test
-    void lagging401sAcrossTicksAndARestartKeepTheSuccessorWithinTheGrace() throws Exception {
+    void confirmed401sAcrossTicksAndARestartKeepTheSuccessor() throws Exception {
         Path state = dir.resolve("s.json");
         FakeCp cp = new FakeCp();
         cp.issued = Instant.ofEpochMilli(now).minus(Duration.ofDays(29));
@@ -182,12 +184,17 @@ class CredentialRenewerTest {
                 (method, path, token) ->
                         new CredentialRenewer.Reply(path.endsWith("/confirm") ? 200 : 401, "{}");
         r = new CredentialRenewer(lagging, state, "env", NOPLogger.NOP_LOGGER, () -> now);
-        for (int i = 0; i < 3; i++) {
+        assertEquals(CredentialRenewer.RETRY_MS, r.tick());
+        assertEquals("next-env", r.token());
+        assertTrue(Files.readString(state).contains("\"confirmed\":true"));
+        // Past the old 10-minute grace a confirmed successor is still kept, never env.
+        for (int i = 0; i < 30; i++) {
             assertEquals(CredentialRenewer.RETRY_MS, r.tick());
             now += CredentialRenewer.RETRY_MS;
         }
         assertEquals("next-env", r.token());
-        // A restart replays confirm (404 when already done) and must not drop the successor.
+        assertTrue(Files.exists(state));
+        // A restart with confirmed state keeps the successor without falling back.
         r =
                 new CredentialRenewer(
                         (method, path, token) ->
@@ -200,11 +207,6 @@ class CredentialRenewerTest {
         assertEquals(CredentialRenewer.RETRY_MS, r.tick());
         assertEquals("next-env", r.token());
         assertTrue(Files.exists(state));
-        // Past the grace a rejected successor is really rejected: back to env.
-        now += CredentialRenewer.LAG_GRACE_MS;
-        assertEquals(0, r.tick());
-        assertEquals("env", r.token());
-        assertFalse(Files.exists(state));
     }
 
     @Test
