@@ -7,11 +7,11 @@
 На старте `proxy/start-proxy.sh` запускает `LimboSelection` перед открытием портов.
 Без `BLOCKFIELD_LIMBO_SELECTION_FILE` используется схема из образа. Для общей истории нужны все три переменные:
 
-| Переменная                        | Значение в контейнере               | Host mount                                                        |
-| --------------------------------- | ----------------------------------- | ----------------------------------------------------------------- |
-| `BLOCKFIELD_MAP_ACTIVE_DIR`       | `/maps-active`                      | `/srv/minecraft/maps-active`, read-only, SSD                      |
-| `BLOCKFIELD_LIMBO_SELECTION_FILE` | `/maps-active/limbo/selection.json` | Часть того же каталога; отдельный bind файла мешает atomic rename |
-| `BLOCKFIELD_LIMBO_ARTIFACTS_DIR`  | `/limbo-artifacts`                  | `/mnt/media-hdd/blockfield/maps/limbo/artifacts`, read-only, HDD  |
+| Переменная                        | Значение в контейнере               | Host mount                                                              |
+| --------------------------------- | ----------------------------------- | ----------------------------------------------------------------------- |
+| `BLOCKFIELD_MAP_ACTIVE_DIR`       | `/maps-active`                      | `/srv/minecraft/maps-active`, read-only, SSD                            |
+| `BLOCKFIELD_LIMBO_SELECTION_FILE` | `/maps-active/limbo/selection.json` | Часть того же каталога; отдельный bind-mount файла мешает atomic rename |
+| `BLOCKFIELD_LIMBO_ARTIFACTS_DIR`  | `/limbo-artifacts`                  | `/mnt/media-hdd/blockfield/maps/limbo/artifacts`, read-only, HDD        |
 
 Текущий контейнер читает только эти mounts. Нужная схема копируется в его собственный `/opt/lobby/lobby.schem`, а spawn записывается в `/opt/lobby/server.properties`. Остальные properties сохраняются. Переменные и новые mounts требуют отдельного согласованного rollout; наличие кода не подтверждает их настройку в production.
 
