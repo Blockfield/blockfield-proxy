@@ -72,6 +72,9 @@ final class BackendRouting {
     /** Sole gate source (CP-C2 cutover): the CP push/ACK consumer. Null pins entry closed. */
     private volatile ControlSubscriber controlPlane;
 
+    /** Owner page for stuck-closed entry / unreachable CP; inert without its webhook URL. */
+    private final OwnerAlert ownerAlert;
+
     /** Fail-closed admission state: last verified CP snapshot, closed past the lease. */
     private volatile Gate gate = Gate.closed();
 
@@ -238,6 +241,7 @@ final class BackendRouting {
         // Fail-closed: no consumer (or a half-configured one) pins game entry closed, never open;
         // fromEnv never throws, and a bad workshop host only disables Workshop (as if empty).
         this.controlPlane = ControlSubscriber.fromEnv(logger);
+        this.ownerAlert = OwnerAlert.fromEnv(logger);
         if (controlPlane == null)
             logger.warn(
                     "gate source: control-plane consumer not configured"
@@ -634,6 +638,7 @@ final class BackendRouting {
                                         .forEach(p -> lastOnGame.put(p.getUniqueId(), now)));
         lastOnGame.values().removeIf(seen -> now - seen > GAME_MEMBER_MS);
         reloadGate();
+        ownerAlert.tick(controlPlane, gate, now);
         Optional<RegisteredServer> lobby = server("lobby");
         if (lobby.isEmpty()) return;
         if (!gate.equals(enforced)) {

@@ -139,6 +139,10 @@ final class ControlSubscriber {
     private long applied = -1;
 
     private Gate gate = Gate.closed();
+
+    /** Last verified game leg came from CP {@code maintenance} mode: closed entry is intended. */
+    private boolean gameMaintenance;
+
     private volatile long freshAt = -LEASE_NS - 1;
 
     /**
@@ -454,6 +458,22 @@ final class ControlSubscriber {
         }
     }
 
+    /** Any CP contact (snapshot, frame, keep-alive) within the lease. */
+    boolean linkFresh() {
+        return monotonic.getAsLong() - freshAt <= LEASE_NS;
+    }
+
+    /**
+     * The last verified game leg was an announced CP maintenance: a closed game gate then is
+     * operator intent, not an outage, so the closed-gate owner alert stays silent. Set only by
+     * verified game legs; workshop frames never touch it.
+     */
+    boolean maintenanceAnnounced() {
+        synchronized (lock) {
+            return gameMaintenance;
+        }
+    }
+
     /** One warn line per mode change into, out of, or past fail-static; boot stays silent. */
     private void reportTransition(Mode from, Mode to) {
         if (to == Mode.STATIC) {
@@ -510,6 +530,7 @@ final class ControlSubscriber {
             cursor = parsed.cursor;
             applied = parsed.cursor;
             gate = parsed.gate;
+            gameMaintenance = parsed.gameMaintenance;
             needSnapshot = false;
             resetEpoch++;
             // Verified here: schema, audience, epoch/generation, cursor and gate all checked.
@@ -622,6 +643,8 @@ final class ControlSubscriber {
         long now = monotonic.getAsLong();
         synchronized (lock) {
             gate = gate.withLeg(update.target(), update.leg());
+            if ("game".equals(update.target()))
+                gameMaintenance = "maintenance".equals(update.mode());
             applied = sequence;
             // Verified here: epoch, sequence continuity, generation, payload hash and gate.
             verifiedAt = now;
@@ -755,8 +778,8 @@ final class ControlSubscriber {
         }
     }
 
-    /** One gate leg with the target it applies to; frames carry a single target. */
-    private record TargetedGate(String target, Gate leg) {}
+    /** One gate leg with the target it applies to; {@code mode} is the CP game mode or null. */
+    private record TargetedGate(String target, Gate leg, String mode) {}
 
     /** Gate legs only; anything else (actions, other namespaces, other targets) is not ours. */
     private static TargetedGate gateFromPayload(JsonElement payload) {
@@ -769,14 +792,18 @@ final class ControlSubscriber {
         if (value == null || !value.isJsonObject()) return null;
         JsonObject v = value.getAsJsonObject();
         // The game leg follows v2; a workshop leg must never drive game entry, and vice versa.
-        if ("*".equals(target) || "game".equals(target))
-            return new TargetedGate("game", Gate.fromCp(text(v, "mode"), text(v, "message")));
+        if ("*".equals(target) || "game".equals(target)) {
+            String mode = text(v, "mode");
+            return new TargetedGate("game", Gate.fromCp(mode, text(v, "message")), mode);
+        }
         // The workshop leg drives workshop entry on the same lease as the game leg.
-        if ("workshop".equals(target)) return new TargetedGate("workshop", Gate.fromWorkshop(v));
+        if ("workshop".equals(target))
+            return new TargetedGate("workshop", Gate.fromWorkshop(v), null);
         return null;
     }
 
-    private record Snapshot(String epoch, String generation, long cursor, Gate gate) {}
+    private record Snapshot(
+            String epoch, String generation, long cursor, Gate gate, boolean gameMaintenance) {}
 
     private Snapshot parseSnapshot(String body) {
         JsonObject json = JsonParser.parseString(body).getAsJsonObject();
@@ -797,6 +824,7 @@ final class ControlSubscriber {
                 || !json.get("settings").isJsonArray()) return null;
         Gate game = null;
         int gameMatches = 0;
+        String gameMode = null;
         Gate workshop = null;
         int workshopMatches = 0;
         for (JsonElement el : json.getAsJsonArray("settings")) {
@@ -808,7 +836,8 @@ final class ControlSubscriber {
             JsonObject v = value.getAsJsonObject();
             String target = text(entry, "target");
             if ("*".equals(target) || "game".equals(target)) {
-                game = Gate.fromCp(text(v, "mode"), text(v, "message"));
+                gameMode = text(v, "mode");
+                game = Gate.fromCp(gameMode, text(v, "message"));
                 gameMatches++;
             } else if ("workshop".equals(target)) {
                 workshop = Gate.fromWorkshop(v);
@@ -824,7 +853,8 @@ final class ControlSubscriber {
                 snapCursor,
                 Gate.dual(
                         gameMatches == 1 ? game : Gate.closed(),
-                        workshopMatches <= 1 ? workshop : Gate.closed()));
+                        workshopMatches <= 1 ? workshop : Gate.closed()),
+                gameMatches == 1 && "maintenance".equals(gameMode));
     }
 
     private static String text(JsonObject obj, String key) {
