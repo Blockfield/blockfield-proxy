@@ -192,9 +192,65 @@ def kotlin(files, format=False):
     )
 
 
+def cache_key_parity():
+    """warm-caches.yml must restore exactly the entries build.yml restores.
+
+    Keys and paths are copies across two workflow files (YAML has no imports);
+    a PR that changes one copy without the other silently re-breaks first-run
+    cache hits, so fail the lint gate instead. Runs on every lint, unscoped
+    from the changed-file list: cheap (two small files) and must catch drift
+    no matter which file the PR touches.
+    """
+    import re
+
+    def entries(text):
+        lines = text.splitlines()
+        found = {}
+        for i, line in enumerate(lines):
+            match = re.match(r"^\s*key:\s*(.*(quality-tools|limbo)-.*)$", line)
+            if not match:
+                continue
+            # Nearest preceding `path:` line: either a `path: |` block (entries
+            # are the deeper-indented plain lines following it) or a
+            # single-line `path: <value>` (as in the Limbo restore step).
+            paths = []
+            for j in range(i - 1, -1, -1):
+                if lines[j].strip() == "path: |":
+                    indent = len(lines[j]) - len(lines[j].lstrip())
+                    for entry in lines[j + 1 :]:
+                        if not entry.strip():
+                            continue
+                        if len(entry) - len(entry.lstrip()) <= indent:
+                            break
+                        paths.append(entry.strip())
+                    break
+                single = re.match(r"^\s*path:\s*(\S.*)$", lines[j])
+                if single:
+                    paths.append(single.group(1).strip())
+                    break
+            found[match.group(2)] = (match.group(1), tuple(paths))
+        return found
+
+    check = (ROOT / ".github/workflows/build.yml").read_text()
+    warm = (ROOT / ".github/workflows/warm-caches.yml").read_text()
+    check_entries = entries(check)
+    warm_entries = entries(warm)
+    for name in ("quality-tools", "limbo"):
+        if (
+            check_entries.get(name) != warm_entries.get(name)
+            or name not in warm_entries
+        ):
+            raise SystemExit(
+                f"cache entry {name!r} differs between build.yml and warm-caches.yml "
+                f"(check={check_entries.get(name)}, warm={warm_entries.get(name)}): "
+                "update both copies"
+            )
+
+
 def lint(files):
     compile_check(files, "lintJava")
     run("actionlint")
+    cache_key_parity()
     each(["ruff", "check"], [f for f in files if f.endswith(".py")])
     each(["shellcheck", "--severity=error"], [f for f in files if f.endswith(".sh")])
     kotlin([f for f in files if f.endswith((".kt", ".kts"))])
