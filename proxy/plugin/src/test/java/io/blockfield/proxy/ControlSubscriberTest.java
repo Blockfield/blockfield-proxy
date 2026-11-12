@@ -1880,4 +1880,51 @@ class ControlSubscriberTest {
         assertThrows(
                 IllegalArgumentException.class, () -> ControlSubscriber.gateUri("cp.invalid:8080"));
     }
+
+    @Test
+    void linkFreshTracksContactWithinLease() {
+        ControlSubscriber sub = subscriber();
+        assertFalse(sub.linkFresh(), "no contact before the first snapshot");
+        assertTrue(sub.applySnapshot(snapshot("open", 5)));
+        assertTrue(sub.linkFresh());
+        nanos.addAndGet(ControlSubscriber.LEASE_NS + 1);
+        assertFalse(sub.linkFresh(), "no contact for a full lease reads stale");
+    }
+
+    @Test
+    void maintenanceSnapshotFlagsAnnouncedMaintenance() {
+        ControlSubscriber sub = subscriber();
+        assertTrue(sub.applySnapshot(snapshot("maintenance", 5)));
+        assertTrue(sub.maintenanceAnnounced());
+        assertEquals("closed", sub.current().state());
+        assertTrue(sub.applySnapshot(snapshot("open", 6)));
+        assertFalse(sub.maintenanceAnnounced());
+    }
+
+    @Test
+    void unknownModeSnapshotIsClosedButNotMaintenance() {
+        ControlSubscriber sub = subscriber();
+        assertTrue(sub.applySnapshot(snapshot("frozen", 5)));
+        assertEquals("closed", sub.current().state());
+        assertFalse(sub.maintenanceAnnounced());
+    }
+
+    @Test
+    void gameFrameTracksMaintenanceAndWorkshopFrameKeepsIt() {
+        ControlSubscriber sub = subscriber();
+        assertTrue(sub.applySnapshot(snapshot("open", 5)));
+        assertFalse(sub.maintenanceAnnounced());
+        assertEquals(
+                ControlSubscriber.Verdict.APPLIED,
+                sub.offer(envelope(6, true, null, gatePayload("maintenance"))));
+        assertTrue(sub.maintenanceAnnounced());
+        assertEquals(
+                ControlSubscriber.Verdict.APPLIED,
+                sub.offer(envelope(7, true, null, workshopPayload("builders", null, null))));
+        assertTrue(sub.maintenanceAnnounced(), "workshop frames never touch the game flag");
+        assertEquals(
+                ControlSubscriber.Verdict.APPLIED,
+                sub.offer(envelope(8, true, null, gatePayload("open"))));
+        assertFalse(sub.maintenanceAnnounced());
+    }
 }
