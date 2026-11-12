@@ -638,7 +638,8 @@ final class BackendRouting {
                                         .forEach(p -> lastOnGame.put(p.getUniqueId(), now)));
         lastOnGame.values().removeIf(seen -> now - seen > GAME_MEMBER_MS);
         reloadGate();
-        ownerAlert.tick(controlPlane, gate, now);
+        // Monotonic: a wall-clock jump must not fire or suppress the 2-min debounce.
+        ownerAlert.tick(controlPlane, gate, TimeUnit.NANOSECONDS.toMillis(System.nanoTime()));
         Optional<RegisteredServer> lobby = server("lobby");
         if (lobby.isEmpty()) return;
         if (!gate.equals(enforced)) {

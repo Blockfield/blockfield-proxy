@@ -147,6 +147,26 @@ class OwnerAlertTest {
     }
 
     @Test
+    void failedRecoveryIsRetriedAndKeepsOrder() {
+        OwnerAlert alert = alert(1_000);
+        alert.tick(true, false, true, 0);
+        alert.tick(true, false, true, 1_000);
+        assertEquals(1, sent.size());
+        failuresLeft = 1;
+        alert.tick(true, false, false, 2_000);
+        assertEquals(1, sent.size());
+        // Gate closes again before the recovery got through: recovery must still go first.
+        alert.tick(true, false, true, 3_000);
+        alert.tick(true, false, true, 4_000);
+        assertEquals(1, sent.size());
+        alert.tick(true, false, true, 62_000);
+        alert.tick(true, false, true, 63_000);
+        assertEquals(3, sent.size());
+        assertTrue(sent.get(1).contains("recovered"));
+        assertFalse(sent.get(2).contains("recovered"));
+    }
+
+    @Test
     void liveClassificationThroughSubscriber() {
         AtomicLong clock = new AtomicLong(1_000_000);
         AtomicLong nanos = new AtomicLong(0);

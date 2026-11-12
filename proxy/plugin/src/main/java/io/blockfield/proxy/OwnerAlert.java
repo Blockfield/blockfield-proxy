@@ -9,6 +9,7 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.ArrayDeque;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 
@@ -19,8 +20,9 @@ import java.util.function.Consumer;
  * <p>Watches the gate every scheduler tick and POSTs once when (a) the game leg reads closed
  * outside an announced CP maintenance for longer than {@link #ALERT_AFTER_MS}, or (b) the CP link
  * goes unfresh for that long; a recovery POST follows when the alerting condition clears. Alert
- * delivery never throws and never blocks the tick: sends run on a daemon thread, a failed send is
- * retried at most once a minute while its condition persists.
+ * delivery never throws and never blocks the tick: texts queue in order and go out one at a time on
+ * a daemon thread; a failed send (alert or recovery) stays at the head and is retried at most once
+ * a minute. Callers pass a monotonic clock.
  *
  * <p>Configured with a single secret, {@code BLOCKFIELD_OWNER_ALERT_URL}: unset or blank means
  * fully inert (no threads, no traffic, no state). The URL may embed its own token (Discord, Slack
@@ -33,6 +35,9 @@ final class OwnerAlert {
 
     /** Minimum gap between POST attempts while a send keeps failing. */
     private static final long RETRY_MS = TimeUnit.MINUTES.toMillis(1);
+
+    /** Oldest texts are dropped past this, so a long webhook outage cannot grow memory. */
+    private static final int OUTBOX_MAX = 32;
 
     private static final Duration RPC_TIMEOUT = Duration.ofSeconds(5);
 
@@ -58,7 +63,9 @@ final class OwnerAlert {
     private Condition pending = Condition.NONE;
     private long pendingSince;
     private Condition alerting = Condition.NONE;
-    private String unsent;
+    private final ArrayDeque<String> outbox = new ArrayDeque<>();
+    private boolean inFlight;
+    private boolean lastFailed;
     private long lastAttemptMs;
 
     /** Inert unless the webhook URL is set: no threads, no traffic, gate logic untouched. */
@@ -125,40 +132,46 @@ final class OwnerAlert {
             if (alerting != Condition.NONE && alerting != pending) {
                 // Condition changed under an active page: close the old incident first;
                 // the new one debounces from when it started.
-                Condition done = alerting;
+                enqueue(recoveredText(alerting));
                 alerting = Condition.NONE;
-                unsent = null;
-                due = recoveredText(done);
-            } else if (pending != Condition.NONE
+            }
+            if (pending != Condition.NONE
                     && alerting == Condition.NONE
                     && nowMs - pendingSince >= alertAfterMs) {
                 alerting = pending;
-                due = alertText(pending);
-            } else if (alerting != Condition.NONE
-                    && unsent != null
-                    && nowMs - lastAttemptMs >= RETRY_MS) {
-                // Earlier POST failed: retry at most once a minute while it persists.
-                due = unsent;
+                enqueue(alertText(pending));
             }
-            if (due != null) {
-                unsent = due;
+            if (!inFlight
+                    && !outbox.isEmpty()
+                    && (!lastFailed || nowMs - lastAttemptMs >= RETRY_MS)) {
+                due = outbox.peekFirst();
+                inFlight = true;
                 lastAttemptMs = nowMs;
             }
         }
         if (due != null) deliver(due);
     }
 
+    private void enqueue(String text) {
+        if (outbox.size() >= OUTBOX_MAX) outbox.pollFirst();
+        outbox.addLast(text);
+    }
+
     private void deliver(String text) {
         dispatch.accept(
                 () -> {
+                    boolean ok = false;
                     try {
                         sender.send(text);
-                        synchronized (lock) {
-                            if (text.equals(unsent)) unsent = null;
-                        }
+                        ok = true;
                     } catch (Exception e) {
-                        // The tick retries at most once a minute while the condition persists.
                         logger.warn("owner alert POST failed, retrying: {}", e.toString());
+                    }
+                    synchronized (lock) {
+                        // Identity check: the head may have been dropped by the cap meanwhile.
+                        if (ok && outbox.peekFirst() == text) outbox.pollFirst();
+                        lastFailed = !ok;
+                        inFlight = false;
                     }
                 });
     }
