@@ -55,7 +55,8 @@ final class ControlSubscriber {
 
     private static final Duration RPC_TIMEOUT = Duration.ofSeconds(5);
     private static final Duration STREAM_TIMEOUT = Duration.ofSeconds(75);
-    private static final long RECONNECT_MS = 5_000;
+    private static final long RECONNECT_MS = 1_000;
+    private static final long RECONNECT_MAX_MS = 30_000;
     private static final long WARN_MS = 60_000;
 
     /** The CP heartbeats a healthy stream every 10 s; three missed beats mean a dead stream. */
@@ -877,6 +878,16 @@ final class ControlSubscriber {
         }
     }
 
+    /**
+     * Reconnect delay with backoff: a transient blip re-attaches in ~1 s so a gate change is
+     * visible within about a second, while a persistent outage backs off to RECONNECT_MAX_MS
+     * instead of hammering the CP. Pure for tests.
+     */
+    static long reconnectDelayMs(int consecutiveFailures) {
+        long shift = Math.min(Math.max(consecutiveFailures, 0), 5);
+        return Math.min(RECONNECT_MS << shift, RECONNECT_MAX_MS);
+    }
+
     private void warnOnce(String message) {
         long now = clock.now();
         if (now - lastWarnMs >= WARN_MS) {
@@ -886,6 +897,7 @@ final class ControlSubscriber {
     }
 
     private void loop() {
+        int failures = 0;
         while (!stopped && !Thread.currentThread().isInterrupted()) {
             try {
                 if (isResyncPending()) {
@@ -896,6 +908,7 @@ final class ControlSubscriber {
                     try {
                         snapshot();
                     } catch (IOException e) {
+                        failures++;
                         warnOnce(
                                 "control-plane v2 snapshot failed while resync pending,"
                                         + " retrying: "
@@ -908,6 +921,7 @@ final class ControlSubscriber {
                         // Best-effort: with /snapshot down the events leg still carries
                         // verified frames, so re-attach instead of stalling. Stale frames
                         // verify against the held epoch/generation into the RESYNC path.
+                        failures++;
                         warnOnce("control-plane v2 snapshot failed, staying on events: " + e);
                     }
                 }
@@ -916,8 +930,10 @@ final class ControlSubscriber {
                     // A clean close re-verifies too: the gate may have changed while
                     // the stream was down, and fail-static must not hide that.
                     setNeedSnapshot();
+                    failures = 0;
                 }
             } catch (Resync e) {
+                failures++;
                 boolean fresh;
                 synchronized (lock) {
                     fresh = applied >= 0;
@@ -938,12 +954,14 @@ final class ControlSubscriber {
                 // Transport failure: re-verify via snapshot first, so a reachable
                 // snapshot sees the change; the snapshot itself is best-effort, so
                 // fail-static applies only when the events leg is down too.
+                failures++;
                 setNeedSnapshot();
                 warnOnce("control-plane v2 stream failed, keeping last gate: " + e);
             }
             if (stopped) return;
             try {
-                Thread.sleep(RECONNECT_MS);
+                // The first failure (failures == 1) waits the base 1 s, then doubles.
+                Thread.sleep(reconnectDelayMs(failures - 1));
             } catch (InterruptedException e) {
                 return;
             }

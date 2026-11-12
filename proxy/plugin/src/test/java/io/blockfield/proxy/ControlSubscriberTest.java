@@ -178,6 +178,35 @@ class ControlSubscriberTest {
     }
 
     @Test
+    void reconnectBackoffStartsAtOneSecondAndCaps() {
+        assertEquals(1_000, ControlSubscriber.reconnectDelayMs(0));
+        assertEquals(2_000, ControlSubscriber.reconnectDelayMs(1));
+        assertEquals(4_000, ControlSubscriber.reconnectDelayMs(2));
+        assertEquals(8_000, ControlSubscriber.reconnectDelayMs(3));
+        assertEquals(16_000, ControlSubscriber.reconnectDelayMs(4));
+        assertEquals(30_000, ControlSubscriber.reconnectDelayMs(5));
+        assertEquals(30_000, ControlSubscriber.reconnectDelayMs(99));
+        assertEquals(1_000, ControlSubscriber.reconnectDelayMs(-1));
+    }
+
+    @Test
+    void pushedGateChangeIsVisibleWithoutPolling() {
+        // No 1 s poller: the push path applies synchronously, so a gate
+        // toggle is visible to the next admission check, both directions.
+        ControlSubscriber sub = subscriber();
+        assertTrue(sub.applySnapshot(snapshot("open", 5)));
+        assertTrue(sub.current().open());
+        assertEquals(
+                ControlSubscriber.Verdict.APPLIED,
+                sub.offer(envelope(6, true, null, gatePayload("maintenance"))));
+        assertEquals("closed", sub.current().state());
+        assertEquals(
+                ControlSubscriber.Verdict.APPLIED,
+                sub.offer(envelope(7, true, null, gatePayload("open"))));
+        assertTrue(sub.current().open());
+    }
+
+    @Test
     void halfConfiguredConsumerNeverFallsBackToFile() {
         ControlSubscriber missingUrl =
                 ControlSubscriber.fromParts(
