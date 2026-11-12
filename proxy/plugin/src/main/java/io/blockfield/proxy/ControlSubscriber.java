@@ -960,7 +960,8 @@ final class ControlSubscriber {
             }
             if (stopped) return;
             try {
-                Thread.sleep(reconnectDelayMs(failures));
+                // The first failure (failures == 1) waits the base 1 s, then doubles.
+                Thread.sleep(reconnectDelayMs(failures - 1));
             } catch (InterruptedException e) {
                 return;
             }
