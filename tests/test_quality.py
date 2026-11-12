@@ -75,6 +75,8 @@ class JavaGatesTest(unittest.TestCase):
             with (
                 patch.object(quality, "ROOT", root),
                 patch.object(quality, "sources", return_value=files),
+                # The fixture root has no workflows; parity has its own tests.
+                patch.object(quality, "cache_key_parity"),
                 patch.object(quality, "run") as run,
             ):
                 for command, task in (
@@ -419,3 +421,24 @@ class WireHooksStrict(unittest.TestCase):
                     self.assertFalse(module.wire_hooks(root))
                     with self.assertRaises(SystemExit):
                         module.wire_hooks(root, strict=True)
+
+
+class CacheKeyParityTest(unittest.TestCase):
+    def test_repo_workflows_agree(self):
+        quality.cache_key_parity()
+
+    def test_drifted_key_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workflows = root / ".github" / "workflows"
+            workflows.mkdir(parents=True)
+            source = quality.ROOT / ".github" / "workflows"
+            (workflows / "build.yml").write_text((source / "build.yml").read_text())
+            warm = (source / "warm-caches.yml").read_text()
+            self.assertIn("key: quality-tools-v1", warm)
+            (workflows / "warm-caches.yml").write_text(
+                warm.replace("key: quality-tools-v1", "key: quality-tools-v2", 1)
+            )
+            with patch.object(quality, "ROOT", root):
+                with self.assertRaisesRegex(SystemExit, "quality-tools"):
+                    quality.cache_key_parity()
