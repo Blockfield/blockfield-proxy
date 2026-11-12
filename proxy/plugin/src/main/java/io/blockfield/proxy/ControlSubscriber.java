@@ -110,7 +110,10 @@ final class ControlSubscriber {
     private final URI snapshotUri;
     private final URI eventsUri;
     private final URI acksUri;
-    private final String token;
+
+    /** Swapped by {@link CredentialRenewer}; the next request uses the successor. */
+    private volatile String token;
+
     private final Clock clock;
     private final LongSupplier monotonic;
     private final Consumer<String> warn;
@@ -235,10 +238,21 @@ final class ControlSubscriber {
      * closed. Never throws.
      */
     static ControlSubscriber fromEnv(Logger logger) {
+        String url = System.getenv("BLOCKFIELD_CP_URL");
+        String envToken = System.getenv("BLOCKFIELD_CP_TOKEN");
+        CredentialRenewer renewer = null;
+        if (url != null && !url.isBlank() && envToken != null && !envToken.isBlank()) {
+            try {
+                renewer = CredentialRenewer.http(url, statePath(), envToken, logger);
+            } catch (IllegalArgumentException e) {
+                logger.warn(
+                        "control-plane URL invalid, credential renewal off: {}", e.getMessage());
+            }
+        }
         ControlSubscriber sub =
                 fromParts(
-                        System.getenv("BLOCKFIELD_CP_URL"),
-                        System.getenv("BLOCKFIELD_CP_TOKEN"),
+                        url,
+                        renewer != null ? renewer.token() : envToken,
                         System.getenv("BLOCKFIELD_CP_CONSUMER"),
                         logger,
                         System::currentTimeMillis,
@@ -248,7 +262,23 @@ final class ControlSubscriber {
                         failStaticMaxAgeMs(
                                 System.getenv("BLOCKFIELD_CP_FAIL_STATIC_MAX_AGE_MS"), logger));
         if (sub != null) sub.start();
+        if (renewer != null) {
+            if (sub != null) renewer.onToken(sub::setToken);
+            renewer.start();
+        }
         return sub;
+    }
+
+    /** Default sits on a mount prod already has; override with BLOCKFIELD_CP_STATE_FILE. */
+    static java.nio.file.Path statePath() {
+        String raw = System.getenv("BLOCKFIELD_CP_STATE_FILE");
+        return java.nio.file.Path.of(
+                raw == null || raw.isBlank() ? "/workshop-gate/.proxy-cp-credential.json" : raw);
+    }
+
+    void setToken(String next) {
+        token = next;
+        if (acks instanceof HttpAckSender http) http.token = next;
     }
 
     /** Fail-safe bound parse: blank or invalid values fall back to the default, never unbounded. */
@@ -1150,7 +1180,7 @@ final class ControlSubscriber {
     /** Production ACK sender: POSTs each receipt to {@code POST /v2/agents/{id}/acks}. */
     private static final class HttpAckSender implements AckSender {
         private final URI uri;
-        private final String token;
+        private volatile String token;
 
         HttpAckSender(URI uri, String token) {
             this.uri = uri;
