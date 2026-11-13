@@ -28,8 +28,9 @@ import java.util.function.LongSupplier;
 /**
  * Renews this service's control-plane credential before it expires (coordination#33): ~7 days ahead
  * (a quarter of the lifetime for short test TTLs), persists the successor to a 0600 state file and
- * only then confirms, which revokes the old token. The state file wins over the env token while it
- * descends from that env token; a re-issued env token starts a new chain.
+ * only then confirms, which revokes the old token. Until then the file keeps that old token as the
+ * predecessor to fall back to. The state file wins over the env token while it descends from that
+ * env token; a re-issued env token starts a new chain. The file is never deleted.
  */
 final class CredentialRenewer {
     static final Duration MAX_LEAD = Duration.ofDays(7);
@@ -53,7 +54,7 @@ final class CredentialRenewer {
     private final LongSupplier clockMs;
     private volatile Consumer<String> onToken = t -> {};
     private volatile String token;
-    private boolean confirmPending;
+    private String predecessor;
     private boolean confirmed;
     private volatile boolean stopped;
     private volatile Thread thread;
@@ -66,13 +67,15 @@ final class CredentialRenewer {
         this.clockMs = clockMs;
         JsonObject persisted = load(state, this.envToken, log);
         this.token = persisted != null ? persisted.get("token").getAsString() : this.envToken;
+        this.predecessor =
+                persisted != null && persisted.has("predecessor")
+                        ? persisted.get("predecessor").getAsString()
+                        : null;
         // A persisted successor may be unconfirmed (crash before confirm); confirm is idempotent.
-        // A confirmed successor's env token is already revoked: never fall back to it.
         this.confirmed =
-                persisted != null
-                        && persisted.has("confirmed")
-                        && persisted.get("confirmed").getAsBoolean();
-        this.confirmPending = persisted != null && !this.confirmed;
+                persisted == null
+                        || (persisted.has("confirmed")
+                                && persisted.get("confirmed").getAsBoolean());
     }
 
     static CredentialRenewer http(String baseUrl, Path state, String envToken, Logger log) {
@@ -138,31 +141,19 @@ final class CredentialRenewer {
     /** One renewal step; returns the delay in ms before the next one. */
     long tick() throws IOException, InterruptedException {
         if (token.isEmpty()) return MAX_SLEEP_MS;
-        if (confirmPending) {
+        if (!confirmed) {
             int status = cp.call("POST", "/v2/credentials/renew/confirm", token).status();
             if (status == 200 || status == 404) {
-                // Confirm revokes the env token: record it so a later 401 never falls back.
-                persist(state, token, envToken, true);
+                // Confirm revoked the predecessor: drop it so a later 401 never falls back.
+                persist(state, token, null, envToken, true);
                 confirmed = true;
-                confirmPending = false;
-            } else if (status == 401) confirmPending = false;
-            else return RETRY_MS;
+                predecessor = null;
+            } else if (status != 401) return RETRY_MS;
         }
         Reply me = cp.call("GET", "/v2/me", token);
-        // Unconfirmed means the env token is still valid: a 401 rejects the successor.
-        // Confirmed means the env token is already revoked: a 401 is lag or a real
-        // revocation, fixed by an operator re-issuing the env key (load drops the state).
-        if (me.status() == 401 && !token.equals(envToken) && !envToken.isEmpty()) {
-            if (!confirmed) {
-                log.warn("persisted CP credential rejected, falling back to the env token");
-                // Else a restart would adopt the rejected successor again.
-                Files.deleteIfExists(state);
-                adopt(envToken);
-                return 0;
-            }
-            log.error("confirmed CP credential rejected, keeping the successor");
-            return RETRY_MS;
-        }
+        if (me.status() == 401) return rejected();
+        // A 401 from confirm alone does not prove the successor rejected: keep confirming.
+        if (!confirmed) return RETRY_MS;
         if (me.status() != 200) {
             log.warn("CP credential check status {}", me.status());
             return RETRY_MS;
@@ -184,14 +175,33 @@ final class CredentialRenewer {
                 JsonParser.parseString(renewed.body()).getAsJsonObject().get("token").getAsString();
         // Persist before confirm: confirm revokes the old token, so a successor that only lives
         // in memory would be lost on restart. A failed write retries renew, which replays it.
-        persist(state, next, envToken, false);
+        persist(state, next, token, envToken, false);
+        predecessor = token;
         confirmed = false;
         adopt(next);
-        confirmPending = true;
         log.info(
                 "CP credential renewed, valid until {}",
                 instant(JsonParser.parseString(renewed.body()).getAsJsonObject(), "expiresAt"));
         return 0;
+    }
+
+    /** /v2/me answered 401 for the token in use. */
+    private long rejected() throws IOException, InterruptedException {
+        // Only an unconfirmed successor's predecessor can still be valid. Its 200 proves the
+        // successor rejected; anything else could be lag, so nothing changes on disk.
+        if (!confirmed
+                && predecessor != null
+                && cp.call("GET", "/v2/me", predecessor).status() == 200) {
+            log.warn("unconfirmed CP credential rejected, back on its predecessor");
+            persist(state, predecessor, null, envToken, true);
+            String back = predecessor;
+            predecessor = null;
+            confirmed = true;
+            adopt(back);
+            return RETRY_MS;
+        }
+        log.error("CP credential rejected; retrying, re-issue the env token if this persists");
+        return RETRY_MS;
     }
 
     private void adopt(String next) {
@@ -229,20 +239,24 @@ final class CredentialRenewer {
             JsonObject json = JsonParser.parseString(Files.readString(state)).getAsJsonObject();
             String token = json.get("token").getAsString();
             if (!json.get("base").getAsString().equals(sha256(envToken))) {
-                log.info("CP credential state file predates the env token, using env");
+                log.info("CP credential state file predates the env token, restarting from env");
+                // The old chain's tokens must not linger on disk.
+                persist(state, envToken, null, envToken, true);
                 return null;
             }
             return token.isBlank() ? null : json;
         } catch (IOException | RuntimeException e) {
-            log.warn("CP credential state file unreadable, using env: {}", e.toString());
+            log.warn("CP credential state file unusable, using env: {}", e.toString());
             return null;
         }
     }
 
-    static void persist(Path state, String token, String envToken, boolean confirmed)
+    static void persist(
+            Path state, String token, String predecessor, String envToken, boolean confirmed)
             throws IOException {
         JsonObject json = new JsonObject();
         json.addProperty("token", token);
+        if (predecessor != null) json.addProperty("predecessor", predecessor);
         json.addProperty("base", sha256(envToken));
         json.addProperty("confirmed", confirmed);
         Path dir = state.toAbsolutePath().getParent();
