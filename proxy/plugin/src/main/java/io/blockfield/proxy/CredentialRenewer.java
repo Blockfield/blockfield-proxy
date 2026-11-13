@@ -163,7 +163,7 @@ final class CredentialRenewer {
     long tick() throws IOException, InterruptedException {
         if (token.isEmpty()) return MAX_SLEEP_MS;
         if (!confirmed) {
-            // Confirm revokes the predecessor: sync state file and directory right before every
+            // Confirm revokes the predecessor: rewrite and sync in-memory state before every
             // attempt.
             if (!ensureDurable()) return RETRY_MS;
             int status = cp.call("POST", "/v2/credentials/renew/confirm", token).status();
@@ -240,13 +240,8 @@ final class CredentialRenewer {
 
     private boolean ensureDurable() {
         try {
-            Path dir = stateDir(state);
-            if (dir == null || !Files.isDirectory(dir)) {
-                log.warn("CP credential state directory missing, skipping confirm");
-                return false;
-            }
-            force(state, false);
-            force(dir, true);
+            // Rewrite in-memory state so disk == memory before confirm can revoke the predecessor.
+            persist(state, token, predecessor, envToken, confirmed);
             return true;
         } catch (IOException e) {
             log.warn("CP credential state sync failed, skipping confirm: {}", e.toString());

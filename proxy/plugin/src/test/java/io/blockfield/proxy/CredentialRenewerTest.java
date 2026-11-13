@@ -316,7 +316,7 @@ class CredentialRenewerTest {
                         "/v2/credentials/renew env",
                         "force temp",
                         "force dir",
-                        "force s.json",
+                        "force temp",
                         "force dir",
                         "/v2/credentials/renew/confirm next-env"),
                 cp.calls.subList(0, 7));
@@ -383,6 +383,49 @@ class CredentialRenewerTest {
         assertTrue(
                 cp.calls.contains("/v2/credentials/renew/confirm next-env"), cp.calls.toString());
         assertTrue(saved(state).get("confirmed").getAsBoolean());
+    }
+
+    @Test
+    void failedFallbackDirectorySyncRewritesSuccessorBeforeConfirm() throws Exception {
+        Path sub = dir.resolve("fallback-sync");
+        Files.createDirectory(sub);
+        Path state = sub.resolve("s.json");
+        CredentialRenewer.persist(state, "next-env", "env", "env", false);
+        FakeCp cp = new FakeCp();
+        cp.issued = Instant.ofEpochMilli(now);
+        cp.expires = cp.issued.plus(Duration.ofDays(30));
+        cp.state = state;
+        cp.rejected.add("next-env");
+        // When rejected() probes the predecessor before fallback persist, block directory read so
+        // the atomic rename replaces s.json with env while force(dir) throws IOException.
+        CredentialRenewer.Transport transport =
+                (method, path, token) -> {
+                    if (path.equals("/v2/me") && token.equals("env")) {
+                        Files.setPosixFilePermissions(
+                                sub, PosixFilePermissions.fromString("-wx------"));
+                    }
+                    return cp.call(method, path, token);
+                };
+        CredentialRenewer r =
+                new CredentialRenewer(transport, state, "env", NOPLogger.NOP_LOGGER, () -> now);
+        try {
+            assertThrows(IOException.class, r::tick);
+        } finally {
+            Files.setPosixFilePermissions(sub, PosixFilePermissions.fromString("rwx------"));
+        }
+        assertEquals("env", saved(state).get("token").getAsString());
+        assertTrue(saved(state).get("confirmed").getAsBoolean());
+        assertEquals("next-env", r.token());
+
+        cp.rejected.remove("next-env");
+        r.tick();
+        assertTrue(cp.stateAtConfirm.contains("\"token\":\"next-env\""), cp.stateAtConfirm);
+        assertTrue(cp.stateAtConfirm.contains("\"predecessor\":\"env\""), cp.stateAtConfirm);
+        assertTrue(cp.stateAtConfirm.contains("\"confirmed\":false"), cp.stateAtConfirm);
+        assertEquals("next-env", saved(state).get("token").getAsString());
+        assertTrue(saved(state).get("confirmed").getAsBoolean());
+        assertFalse(saved(state).has("predecessor"));
+        assertEquals("next-env", r.token());
     }
 
     @Test
