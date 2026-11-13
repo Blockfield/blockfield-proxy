@@ -28,7 +28,7 @@ jobs:
     # A push-to-`next` run would save under the `next` scope, which no review
     # run reads: warming here burns minutes without a reader. Forward instead.
     if: github.event_name == 'push'
-    runs-on: ubuntu-24.04
+    runs-on: tenki-standard-autoscale
     timeout-minutes: 5
     permissions:
       contents: read
@@ -47,7 +47,7 @@ jobs:
           fi
   warm:
     if: github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-24.04
+    runs-on: tenki-standard-autoscale
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
