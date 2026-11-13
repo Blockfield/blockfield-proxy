@@ -1,5 +1,6 @@
 package io.blockfield.proxy;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -13,16 +14,40 @@ import org.slf4j.Logger;
 import org.slf4j.helpers.NOPLogger;
 
 import java.io.IOException;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Proxy;
+import java.net.URI;
+import java.nio.channels.FileChannel;
+import java.nio.channels.SeekableByteChannel;
+import java.nio.file.AccessMode;
+import java.nio.file.AtomicMoveNotSupportedException;
+import java.nio.file.CopyOption;
+import java.nio.file.DirectoryStream;
+import java.nio.file.FileStore;
+import java.nio.file.FileSystem;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
+import java.nio.file.OpenOption;
 import java.nio.file.Path;
+import java.nio.file.PathMatcher;
+import java.nio.file.StandardCopyOption;
+import java.nio.file.WatchService;
+import java.nio.file.attribute.BasicFileAttributes;
+import java.nio.file.attribute.FileAttribute;
+import java.nio.file.attribute.FileAttributeView;
 import java.nio.file.attribute.PosixFilePermissions;
+import java.nio.file.attribute.UserPrincipalLookupService;
+import java.nio.file.spi.FileSystemProvider;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashSet;
+import java.util.Iterator;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Predicate;
 
 class CredentialRenewerTest {
@@ -581,5 +606,294 @@ class CredentialRenewerTest {
                         () -> now);
         assertEquals(Duration.ofHours(1).toMillis(), r.tick());
         assertEquals(List.of("/v2/me"), calls);
+    }
+
+    @Test
+    void atomicMoveRefusedLeavesOldStateAndSkipsConfirmUntilMoveWorks() throws Exception {
+        Path sub = Files.createDirectory(dir.resolve("atomic-refused"));
+        Path realState = sub.resolve("s.json");
+        CredentialRenewer.persist(realState, "next-env", "env", "env", false);
+        byte[] before = Files.readAllBytes(realState);
+
+        AtomicBoolean refuseAtomicMove = new AtomicBoolean(true);
+        Path state = wrapWithAtomicMoveGate(realState, refuseAtomicMove);
+        FakeCp cp = new FakeCp();
+        cp.issued = Instant.ofEpochMilli(now);
+        cp.expires = cp.issued.plus(Duration.ofDays(30));
+        cp.state = realState;
+        List<String> warns = new ArrayList<>();
+        CredentialRenewer r =
+                new CredentialRenewer(cp, state, "env", captureLogs("warn", warns), () -> now);
+
+        assertThrows(
+                AtomicMoveNotSupportedException.class,
+                () -> CredentialRenewer.persist(state, "other", null, "env", true));
+        assertArrayEquals(before, Files.readAllBytes(realState));
+        try (var entries = Files.list(sub)) {
+            assertEquals(List.of(realState), entries.toList());
+        }
+
+        assertEquals(CredentialRenewer.RETRY_MS, r.tick());
+        assertTrue(cp.calls.stream().noneMatch(c -> c.contains("/confirm")), cp.calls.toString());
+        assertArrayEquals(before, Files.readAllBytes(realState));
+        try (var entries = Files.list(sub)) {
+            assertEquals(List.of(realState), entries.toList());
+        }
+        assertEquals(1, warns.size(), warns.toString());
+        assertFalse(
+                warns.get(0).contains("next-env") || warns.get(0).contains("env"), warns.get(0));
+
+        refuseAtomicMove.set(false);
+        r.tick();
+        assertTrue(
+                cp.calls.contains("/v2/credentials/renew/confirm next-env"), cp.calls.toString());
+        assertTrue(saved(realState).get("confirmed").getAsBoolean());
+        assertFalse(saved(realState).has("predecessor"));
+        assertEquals("next-env", r.token());
+    }
+
+    private interface WrappedPath extends Path {
+        Path unwrap();
+    }
+
+    private static Path unwrap(Path path) {
+        return path instanceof WrappedPath w ? w.unwrap() : path;
+    }
+
+    private static Path wrapPath(Path real, FileSystem fs) {
+        if (real == null) return null;
+        return (Path)
+                Proxy.newProxyInstance(
+                        WrappedPath.class.getClassLoader(),
+                        new Class<?>[] {WrappedPath.class},
+                        (proxy, method, args) -> {
+                            String name = method.getName();
+                            if (name.equals("unwrap")) return real;
+                            if (name.equals("getFileSystem")) return fs;
+                            if (name.equals("equals")) {
+                                return args[0] instanceof Path other && real.equals(unwrap(other));
+                            }
+                            if (name.equals("hashCode")) return real.hashCode();
+                            if (name.equals("toString")) return real.toString();
+                            Object[] unwrapped = null;
+                            if (args != null) {
+                                unwrapped = args.clone();
+                                for (int i = 0; i < unwrapped.length; i++) {
+                                    if (unwrapped[i] instanceof Path p) unwrapped[i] = unwrap(p);
+                                }
+                            }
+                            try {
+                                Object res = method.invoke(real, unwrapped);
+                                if (res instanceof Path p) return wrapPath(p, fs);
+                                if (name.equals("iterator")) {
+                                    @SuppressWarnings("unchecked")
+                                    Iterator<Path> it = (Iterator<Path>) res;
+                                    return new Iterator<Path>() {
+                                        @Override
+                                        public boolean hasNext() {
+                                            return it.hasNext();
+                                        }
+
+                                        @Override
+                                        public Path next() {
+                                            return wrapPath(it.next(), fs);
+                                        }
+                                    };
+                                }
+                                return res;
+                            } catch (InvocationTargetException e) {
+                                throw e.getCause();
+                            }
+                        });
+    }
+
+    private static Path wrapWithAtomicMoveGate(Path realTarget, AtomicBoolean refuseAtomicMove) {
+        FileSystem realFs = realTarget.getFileSystem();
+        FileSystemProvider realProvider = realFs.provider();
+        FileSystem[] holder = new FileSystem[1];
+        FileSystemProvider provider =
+                new FileSystemProvider() {
+                    @Override
+                    public String getScheme() {
+                        return realProvider.getScheme();
+                    }
+
+                    @Override
+                    public FileSystem newFileSystem(URI uri, Map<String, ?> env) {
+                        throw new UnsupportedOperationException();
+                    }
+
+                    @Override
+                    public FileSystem getFileSystem(URI uri) {
+                        return holder[0];
+                    }
+
+                    @Override
+                    public Path getPath(URI uri) {
+                        return wrapPath(realProvider.getPath(uri), holder[0]);
+                    }
+
+                    @Override
+                    public FileChannel newFileChannel(
+                            Path path, Set<? extends OpenOption> options, FileAttribute<?>... attrs)
+                            throws IOException {
+                        return realProvider.newFileChannel(unwrap(path), options, attrs);
+                    }
+
+                    @Override
+                    public SeekableByteChannel newByteChannel(
+                            Path path, Set<? extends OpenOption> options, FileAttribute<?>... attrs)
+                            throws IOException {
+                        return realProvider.newByteChannel(unwrap(path), options, attrs);
+                    }
+
+                    @Override
+                    public DirectoryStream<Path> newDirectoryStream(
+                            Path dir, DirectoryStream.Filter<? super Path> filter)
+                            throws IOException {
+                        return realProvider.newDirectoryStream(unwrap(dir), filter);
+                    }
+
+                    @Override
+                    public void createDirectory(Path dir, FileAttribute<?>... attrs)
+                            throws IOException {
+                        realProvider.createDirectory(unwrap(dir), attrs);
+                    }
+
+                    @Override
+                    public void delete(Path path) throws IOException {
+                        realProvider.delete(unwrap(path));
+                    }
+
+                    @Override
+                    public boolean deleteIfExists(Path path) throws IOException {
+                        return realProvider.deleteIfExists(unwrap(path));
+                    }
+
+                    @Override
+                    public void copy(Path source, Path target, CopyOption... options)
+                            throws IOException {
+                        realProvider.copy(unwrap(source), unwrap(target), options);
+                    }
+
+                    @Override
+                    public void move(Path source, Path target, CopyOption... options)
+                            throws IOException {
+                        if (refuseAtomicMove.get()
+                                && Arrays.asList(options)
+                                        .contains(StandardCopyOption.ATOMIC_MOVE)) {
+                            throw new AtomicMoveNotSupportedException(
+                                    source.toString(), target.toString(), "simulated");
+                        }
+                        realProvider.move(unwrap(source), unwrap(target), options);
+                    }
+
+                    @Override
+                    public boolean isSameFile(Path path, Path path2) throws IOException {
+                        return realProvider.isSameFile(unwrap(path), unwrap(path2));
+                    }
+
+                    @Override
+                    public boolean isHidden(Path path) throws IOException {
+                        return realProvider.isHidden(unwrap(path));
+                    }
+
+                    @Override
+                    public FileStore getFileStore(Path path) throws IOException {
+                        return realProvider.getFileStore(unwrap(path));
+                    }
+
+                    @Override
+                    public void checkAccess(Path path, AccessMode... modes) throws IOException {
+                        realProvider.checkAccess(unwrap(path), modes);
+                    }
+
+                    @Override
+                    public <V extends FileAttributeView> V getFileAttributeView(
+                            Path path, Class<V> type, LinkOption... options) {
+                        return realProvider.getFileAttributeView(unwrap(path), type, options);
+                    }
+
+                    @Override
+                    public <A extends BasicFileAttributes> A readAttributes(
+                            Path path, Class<A> type, LinkOption... options) throws IOException {
+                        return realProvider.readAttributes(unwrap(path), type, options);
+                    }
+
+                    @Override
+                    public Map<String, Object> readAttributes(
+                            Path path, String attributes, LinkOption... options)
+                            throws IOException {
+                        return realProvider.readAttributes(unwrap(path), attributes, options);
+                    }
+
+                    @Override
+                    public void setAttribute(
+                            Path path, String attribute, Object value, LinkOption... options)
+                            throws IOException {
+                        realProvider.setAttribute(unwrap(path), attribute, value, options);
+                    }
+                };
+        holder[0] =
+                new FileSystem() {
+                    @Override
+                    public FileSystemProvider provider() {
+                        return provider;
+                    }
+
+                    @Override
+                    public void close() {}
+
+                    @Override
+                    public boolean isOpen() {
+                        return realFs.isOpen();
+                    }
+
+                    @Override
+                    public boolean isReadOnly() {
+                        return realFs.isReadOnly();
+                    }
+
+                    @Override
+                    public String getSeparator() {
+                        return realFs.getSeparator();
+                    }
+
+                    @Override
+                    public Iterable<Path> getRootDirectories() {
+                        return realFs.getRootDirectories();
+                    }
+
+                    @Override
+                    public Iterable<FileStore> getFileStores() {
+                        return realFs.getFileStores();
+                    }
+
+                    @Override
+                    public Set<String> supportedFileAttributeViews() {
+                        return realFs.supportedFileAttributeViews();
+                    }
+
+                    @Override
+                    public Path getPath(String first, String... more) {
+                        return wrapPath(realFs.getPath(first, more), this);
+                    }
+
+                    @Override
+                    public PathMatcher getPathMatcher(String syntaxAndPattern) {
+                        return realFs.getPathMatcher(syntaxAndPattern);
+                    }
+
+                    @Override
+                    public UserPrincipalLookupService getUserPrincipalLookupService() {
+                        return realFs.getUserPrincipalLookupService();
+                    }
+
+                    @Override
+                    public WatchService newWatchService() throws IOException {
+                        return realFs.newWatchService();
+                    }
+                };
+        return wrapPath(realTarget, holder[0]);
     }
 }

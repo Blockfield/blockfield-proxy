@@ -12,7 +12,6 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
@@ -326,15 +325,11 @@ final class CredentialRenewer {
             Files.writeString(temp, json.toString());
             // Confirm revokes the predecessor: the successor must survive a power loss first.
             force(temp, false);
-            try {
-                Files.move(
-                        temp,
-                        state,
-                        StandardCopyOption.ATOMIC_MOVE,
-                        StandardCopyOption.REPLACE_EXISTING);
-            } catch (AtomicMoveNotSupportedException e) {
-                Files.move(temp, state, StandardCopyOption.REPLACE_EXISTING);
-            }
+            Files.move(
+                    temp,
+                    state,
+                    StandardCopyOption.ATOMIC_MOVE,
+                    StandardCopyOption.REPLACE_EXISTING);
         } finally {
             Files.deleteIfExists(temp);
         }
