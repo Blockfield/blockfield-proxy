@@ -50,7 +50,7 @@ jobs:
     # a verdict on an older SHA) skips `check`, so the gate fails closed.
     # Always exits 0: denial is expressed through the outputs, and the bot's
     # own `bot-review` commit status blocks merge.
-    runs-on: ubuntu-24.04
+    runs-on: tenki-standard-autoscale
     timeout-minutes: 5
     if: github.event_name == 'pull_request_review' && github.event.review.user.login == 'blockfield-review-bot[bot]' && github.event.review.state == 'approved'
     outputs:
@@ -107,7 +107,7 @@ jobs:
     # Same gate as bot-gate: a non-approving or non-bot review must not start
     # a runner here either. Push and manual-dispatch runs always run.
     if: github.event_name != 'pull_request_review' || (github.event.review.user.login == 'blockfield-review-bot[bot]' && github.event.review.state == 'approved')
-    runs-on: ubuntu-24.04
+    runs-on: tenki-standard-autoscale
     timeout-minutes: 10
     outputs:
       tested: ${{ steps.same.outputs.tested }}
@@ -154,7 +154,7 @@ jobs:
     # inputs are unchanged (the release merge next->main is the common case).
     needs: [bot-gate, decide]
     if: always() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || (needs.bot-gate.outputs.verdict == 'permit' && needs.bot-gate.outputs.sha_match == 'true')) && (needs.decide.outputs.tested != 'true' || needs.decide.outputs.image == 'true')
-    runs-on: ubuntu-24.04
+    runs-on: tenki-standard-autoscale
     timeout-minutes: 45
     permissions:
       contents: read
@@ -292,7 +292,7 @@ jobs:
     # "publish only what build validated" guarantee.
     if: always() && github.ref_type == 'tag' && needs.build.result == 'success'
     needs: build
-    runs-on: ubuntu-24.04
+    runs-on: tenki-standard-autoscale
     timeout-minutes: 15
     permissions:
       contents: write
