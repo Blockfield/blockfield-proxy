@@ -316,19 +316,19 @@ class CredentialRenewerTest {
                         "/v2/credentials/renew env",
                         "force temp",
                         "force dir",
+                        "force s.json",
+                        "force dir",
                         "/v2/credentials/renew/confirm next-env"),
-                cp.calls.subList(0, 5));
+                cp.calls.subList(0, 7));
     }
 
     @Test
-    void nonWindowsDirectoryForceFailureThrowsAndDoesNotConfirm() throws Exception {
+    void directoryForceFailureThrowsAndDoesNotConfirm() throws Exception {
         Path sub = dir.resolve("write-only");
         Files.createDirectory(sub);
         Path state = sub.resolve("s.json");
         FakeCp cp = dueCp();
         CredentialRenewer r = renewer(cp, state, "env");
-        String prevOs = System.getProperty("os.name");
-        System.setProperty("os.name", "Linux");
         Files.setPosixFilePermissions(sub, PosixFilePermissions.fromString("-wx------"));
         try {
             assertThrows(
@@ -346,13 +346,43 @@ class CredentialRenewerTest {
                     cp.calls.stream().noneMatch(c -> c.contains("/confirm")), cp.calls.toString());
         } finally {
             Files.setPosixFilePermissions(sub, PosixFilePermissions.fromString("rwx------"));
-            if (prevOs == null) System.clearProperty("os.name");
-            else System.setProperty("os.name", prevOs);
         }
         assertFalse(saved(state).get("confirmed").getAsBoolean());
         assertEquals(0, r.tick());
         assertFalse(saved(state).get("confirmed").getAsBoolean());
         assertTrue(cp.calls.stream().noneMatch(c -> c.contains("/confirm")), cp.calls.toString());
+    }
+
+    @Test
+    void unconfirmedStateLoadedAtStartWaitsForDirectorySyncBeforeConfirming() throws Exception {
+        Path sub = dir.resolve("unconfirmed-sync");
+        Files.createDirectory(sub);
+        Path state = sub.resolve("s.json");
+        CredentialRenewer.persist(state, "next-env", "env", "env", false);
+        FakeCp cp = new FakeCp();
+        cp.issued = Instant.ofEpochMilli(now);
+        cp.expires = cp.issued.plus(Duration.ofDays(30));
+        cp.state = state;
+        List<String> warns = new ArrayList<>();
+        Logger log = captureLogs("warn", warns);
+        Files.setPosixFilePermissions(sub, PosixFilePermissions.fromString("-wx------"));
+        CredentialRenewer r = new CredentialRenewer(cp, state, "env", log, () -> now);
+        try {
+            assertEquals(CredentialRenewer.RETRY_MS, r.tick());
+            assertTrue(
+                    cp.calls.stream().noneMatch(c -> c.contains("/confirm")), cp.calls.toString());
+            assertEquals(1, warns.size(), warns.toString());
+            assertFalse(
+                    warns.get(0).contains("next-env") || warns.get(0).contains("env"),
+                    warns.get(0));
+        } finally {
+            Files.setPosixFilePermissions(sub, PosixFilePermissions.fromString("rwx------"));
+        }
+        assertFalse(saved(state).get("confirmed").getAsBoolean());
+        r.tick();
+        assertTrue(
+                cp.calls.contains("/v2/credentials/renew/confirm next-env"), cp.calls.toString());
+        assertTrue(saved(state).get("confirmed").getAsBoolean());
     }
 
     @Test
@@ -377,16 +407,7 @@ class CredentialRenewerTest {
         Path state = missing.resolve("s.json");
         FakeCp cp = dueCp();
         List<String> errors = new ArrayList<>();
-        Logger log =
-                (Logger)
-                        java.lang.reflect.Proxy.newProxyInstance(
-                                Logger.class.getClassLoader(),
-                                new Class<?>[] {Logger.class},
-                                (proxy, method, args) -> {
-                                    if (method.getName().equals("error") && args != null)
-                                        errors.add(Arrays.toString(args));
-                                    return null;
-                                });
+        Logger log = captureLogs("error", errors);
         CredentialRenewer r = new CredentialRenewer(cp, state, "secret-env-token", log, () -> now);
         r.start();
         try {
@@ -404,68 +425,47 @@ class CredentialRenewerTest {
     }
 
     @Test
-    void nonPosixBranchRenewsAndWritesStateFile() throws Exception {
+    void startOnNonPosixStoreLogsErrorAndDoesNotRenew() {
         Path state = dir.resolve("s.json");
         FakeCp cp = dueCp();
-        CredentialRenewer r = renewer(cp, state, "env");
-        List<Path> checked = new ArrayList<>();
+        List<String> errors = new ArrayList<>();
+        Logger log = captureLogs("error", errors);
+        CredentialRenewer r = new CredentialRenewer(cp, state, "secret-env-token", log, () -> now);
         Predicate<Path> prev = CredentialRenewer.posix;
-        CredentialRenewer.posix =
-                d -> {
-                    checked.add(d);
-                    return false;
-                };
+        CredentialRenewer.posix = d -> false;
         try {
-            assertEquals(0, r.tick());
-            cp.issued = Instant.ofEpochMilli(now);
-            cp.expires = cp.issued.plus(Duration.ofDays(30));
-            assertTrue(r.tick() > 0);
+            r.start();
+            assertEquals(1, errors.size(), errors.toString());
+            assertTrue(
+                    errors.get(0)
+                            .contains(
+                                    "credential renewal needs a POSIX filesystem for {}, "
+                                            + dir.toAbsolutePath().normalize()),
+                    errors.get(0));
+            assertFalse(errors.get(0).contains("secret-env-token"), errors.get(0));
+            assertEquals("secret-env-token", r.token());
+            assertTrue(cp.calls.isEmpty(), cp.calls.toString());
+            assertFalse(Files.exists(state));
+            assertThrows(
+                    IOException.class,
+                    () -> CredentialRenewer.persist(state, "next-env", "env", "env", false));
+            assertFalse(Files.exists(state));
         } finally {
             CredentialRenewer.posix = prev;
+            r.stop();
         }
-        assertFalse(checked.isEmpty(), "expected posix predicate to be consulted");
-        assertEquals("next-env", r.token());
-        assertEquals("next-env", saved(state).get("token").getAsString());
-        assertTrue(saved(state).get("confirmed").getAsBoolean());
     }
 
-    @Test
-    void windowsSkipsDirectoryFlushAndStillPersistsAndConfirms() throws Exception {
-        Path state = dir.resolve("s.json");
-        Path winWriteOnly = dir.resolve("win-write-only");
-        Files.createDirectory(winWriteOnly);
-        FakeCp cp = dueCp();
-        CredentialRenewer r = renewer(cp, state, "env");
-        String prevOs = System.getProperty("os.name");
-        System.setProperty("os.name", "Windows 11");
-        Files.setPosixFilePermissions(winWriteOnly, PosixFilePermissions.fromString("-wx------"));
-        CredentialRenewer.forced =
-                path -> cp.calls.add(Files.isDirectory(path) ? "force dir" : "force temp");
-        try {
-            assertEquals(0, r.tick());
-            cp.issued = Instant.ofEpochMilli(now);
-            cp.expires = cp.issued.plus(Duration.ofDays(30));
-            r.tick();
-            CredentialRenewer.persist(
-                    winWriteOnly.resolve("s.json"), "next-env", "env", "env", false);
-        } finally {
-            CredentialRenewer.forced = path -> {};
-            Files.setPosixFilePermissions(
-                    winWriteOnly, PosixFilePermissions.fromString("rwx------"));
-            if (prevOs == null) System.clearProperty("os.name");
-            else System.setProperty("os.name", prevOs);
-        }
-        assertEquals(
-                List.of(
-                        "/v2/me env",
-                        "/v2/credentials/renew env",
-                        "force temp",
-                        "/v2/credentials/renew/confirm next-env",
-                        "force temp",
-                        "/v2/me next-env",
-                        "force temp"),
-                cp.calls);
-        assertTrue(saved(state).get("confirmed").getAsBoolean());
+    private static Logger captureLogs(String level, List<String> out) {
+        return (Logger)
+                java.lang.reflect.Proxy.newProxyInstance(
+                        Logger.class.getClassLoader(),
+                        new Class<?>[] {Logger.class},
+                        (proxy, method, args) -> {
+                            if (method.getName().equals(level) && args != null)
+                                out.add(Arrays.toString(args));
+                            return null;
+                        });
     }
 
     @Test

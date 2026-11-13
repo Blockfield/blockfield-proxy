@@ -271,7 +271,7 @@ final class ControlSubscriber {
 
     /**
      * Default sits on a mount prod already has; override with BLOCKFIELD_CP_STATE_FILE (its
-     * directory must exist and be on persistent storage).
+     * directory must exist on a persistent POSIX filesystem).
      */
     static java.nio.file.Path statePath() {
         String raw = System.getenv("BLOCKFIELD_CP_STATE_FILE");

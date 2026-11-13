@@ -24,7 +24,6 @@ import java.time.Duration;
 import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.util.HexFormat;
-import java.util.Locale;
 import java.util.function.Consumer;
 import java.util.function.LongSupplier;
 import java.util.function.Predicate;
@@ -115,12 +114,16 @@ final class CredentialRenewer {
     }
 
     void start() {
-        Path dir = state == null ? null : state.toAbsolutePath().normalize().getParent();
+        Path dir = stateDir(state);
         if (dir == null || !Files.isDirectory(dir)) {
             log.error(
                     "CP credential state directory {} does not exist; renewal disabled, keeping"
                             + " current token",
                     dir != null ? dir : state);
+            return;
+        }
+        if (!posix.test(dir)) {
+            log.error("credential renewal needs a POSIX filesystem for {}", dir);
             return;
         }
         Thread t =
@@ -160,6 +163,9 @@ final class CredentialRenewer {
     long tick() throws IOException, InterruptedException {
         if (token.isEmpty()) return MAX_SLEEP_MS;
         if (!confirmed) {
+            // Confirm revokes the predecessor: sync state file and directory right before every
+            // attempt.
+            if (!ensureDurable()) return RETRY_MS;
             int status = cp.call("POST", "/v2/credentials/renew/confirm", token).status();
             // CP answers a replayed confirm with 200 too; a 404 may be a missing route.
             if (status == 200) markConfirmed();
@@ -232,6 +238,26 @@ final class CredentialRenewer {
         return RETRY_MS;
     }
 
+    private boolean ensureDurable() {
+        try {
+            Path dir = stateDir(state);
+            if (dir == null || !Files.isDirectory(dir)) {
+                log.warn("CP credential state directory missing, skipping confirm");
+                return false;
+            }
+            force(state, false);
+            force(dir, true);
+            return true;
+        } catch (IOException e) {
+            log.warn("CP credential state sync failed, skipping confirm: {}", e.toString());
+            return false;
+        }
+    }
+
+    private static Path stateDir(Path state) {
+        return state == null ? null : state.toAbsolutePath().normalize().getParent();
+    }
+
     private void adopt(String next) {
         token = next;
         onToken.accept(next);
@@ -287,19 +313,20 @@ final class CredentialRenewer {
         if (predecessor != null) json.addProperty("predecessor", predecessor);
         json.addProperty("base", sha256(envToken));
         json.addProperty("confirmed", confirmed);
-        Path dir = state == null ? null : state.toAbsolutePath().normalize().getParent();
+        Path dir = stateDir(state);
         if (dir == null || !Files.isDirectory(dir)) {
             throw new IOException("CP credential state directory does not exist: " + dir);
         }
+        if (!posix.test(dir)) {
+            throw new IOException("credential renewal needs a POSIX filesystem for " + dir);
+        }
         Path temp =
-                posix.test(dir)
-                        ? Files.createTempFile(
-                                dir,
-                                ".cp-credential",
-                                ".tmp",
-                                PosixFilePermissions.asFileAttribute(
-                                        PosixFilePermissions.fromString("rw-------")))
-                        : Files.createTempFile(dir, ".cp-credential", ".tmp");
+                Files.createTempFile(
+                        dir,
+                        ".cp-credential",
+                        ".tmp",
+                        PosixFilePermissions.asFileAttribute(
+                                PosixFilePermissions.fromString("rw-------")));
         try {
             Files.writeString(temp, json.toString());
             // Confirm revokes the predecessor: the successor must survive a power loss first.
@@ -328,10 +355,6 @@ final class CredentialRenewer {
     }
 
     private static void force(Path path, boolean directory) throws IOException {
-        // Windows flushes only writable files and cannot open a directory at all.
-        if (directory
-                && System.getProperty("os.name", "").toLowerCase(Locale.ROOT).startsWith("windows"))
-            return;
         try (FileChannel channel =
                 FileChannel.open(
                         path, directory ? StandardOpenOption.READ : StandardOpenOption.WRITE)) {
