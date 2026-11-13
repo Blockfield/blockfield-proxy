@@ -1,0 +1,899 @@
+package io.blockfield.proxy;
+
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+import com.google.gson.JsonObject;
+
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+import org.slf4j.Logger;
+import org.slf4j.helpers.NOPLogger;
+
+import java.io.IOException;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Proxy;
+import java.net.URI;
+import java.nio.channels.FileChannel;
+import java.nio.channels.SeekableByteChannel;
+import java.nio.file.AccessMode;
+import java.nio.file.AtomicMoveNotSupportedException;
+import java.nio.file.CopyOption;
+import java.nio.file.DirectoryStream;
+import java.nio.file.FileStore;
+import java.nio.file.FileSystem;
+import java.nio.file.Files;
+import java.nio.file.LinkOption;
+import java.nio.file.OpenOption;
+import java.nio.file.Path;
+import java.nio.file.PathMatcher;
+import java.nio.file.StandardCopyOption;
+import java.nio.file.WatchService;
+import java.nio.file.attribute.BasicFileAttributes;
+import java.nio.file.attribute.FileAttribute;
+import java.nio.file.attribute.FileAttributeView;
+import java.nio.file.attribute.PosixFilePermissions;
+import java.nio.file.attribute.UserPrincipalLookupService;
+import java.nio.file.spi.FileSystemProvider;
+import java.time.Duration;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Predicate;
+
+class CredentialRenewerTest {
+    @TempDir Path dir;
+
+    /** Fake CP: one credential per token, renew mints "next-<token>", confirm revokes the old. */
+    final class FakeCp implements CredentialRenewer.Transport {
+        final List<String> calls = new ArrayList<>();
+        final Set<String> rejected = new HashSet<>();
+        Instant issued;
+        Instant expires;
+        int confirmFailures;
+        Path state;
+        String stateAtConfirm;
+
+        @Override
+        public CredentialRenewer.Reply call(String method, String path, String token)
+                throws java.io.IOException {
+            calls.add(path + " " + token);
+            if (rejected.contains(token)) return new CredentialRenewer.Reply(401, "{}");
+            return switch (path) {
+                case "/v2/me" ->
+                        new CredentialRenewer.Reply(
+                                200,
+                                "{\"issuedAt\":\""
+                                        + issued
+                                        + "\",\"expiresAt\":\""
+                                        + expires.toString().replace("Z", "+00:00")
+                                        + "\"}");
+                case "/v2/credentials/renew" ->
+                        new CredentialRenewer.Reply(
+                                201,
+                                "{\"token\":\"next-"
+                                        + token
+                                        + "\",\"expiresAt\":\""
+                                        + expires
+                                        + "\"}");
+                default -> {
+                    stateAtConfirm =
+                            state != null && Files.exists(state) ? Files.readString(state) : null;
+                    if (confirmFailures > 0) {
+                        confirmFailures--;
+                        yield new CredentialRenewer.Reply(401, "{}");
+                    }
+                    rejected.add(token.substring("next-".length()));
+                    yield new CredentialRenewer.Reply(200, "{}");
+                }
+            };
+        }
+    }
+
+    long now = Instant.parse("2026-11-12T00:00:00Z").toEpochMilli();
+
+    CredentialRenewer renewer(FakeCp cp, Path state, String env) {
+        cp.state = state;
+        return new CredentialRenewer(cp, state, env, NOPLogger.NOP_LOGGER, () -> now);
+    }
+
+    /** A CP whose credentials are always inside the renewal window. */
+    FakeCp dueCp() {
+        FakeCp cp = new FakeCp();
+        cp.issued = Instant.ofEpochMilli(now).minus(Duration.ofDays(29));
+        cp.expires = cp.issued.plus(Duration.ofDays(30));
+        return cp;
+    }
+
+    /** Renews env, confirms the successor (revoking env) and renews again, unconfirmed. */
+    CredentialRenewer secondRenewal(FakeCp cp, Path state) throws Exception {
+        CredentialRenewer r = renewer(cp, state, "env");
+        assertEquals(0, r.tick());
+        assertEquals(0, r.tick());
+        assertEquals("next-next-env", r.token());
+        assertTrue(cp.rejected.contains("env"));
+        return r;
+    }
+
+    static JsonObject saved(Path state) {
+        return CredentialRenewer.load(state, "env", NOPLogger.NOP_LOGGER);
+    }
+
+    @Test
+    void renewsSevenDaysBeforeExpiryOrAQuarterOfAShortLifetime() throws Exception {
+        Instant issued = Instant.ofEpochMilli(now).minus(Duration.ofDays(22));
+        Instant expires = issued.plus(Duration.ofDays(30));
+        assertEquals(expires.minus(Duration.ofDays(7)), CredentialRenewer.renewAt(issued, expires));
+        Instant shortIssued = Instant.ofEpochMilli(now);
+        assertEquals(
+                shortIssued.plus(Duration.ofMinutes(6)),
+                CredentialRenewer.renewAt(shortIssued, shortIssued.plus(Duration.ofMinutes(8))));
+        assertEquals(issued, CredentialRenewer.renewAt(issued.plus(Duration.ofDays(31)), issued));
+
+        FakeCp cp = new FakeCp();
+        cp.issued = issued;
+        cp.expires = expires;
+        CredentialRenewer r = renewer(cp, dir.resolve("s.json"), "env");
+        // 8 days left: outside the window, sleeps at most an hour and does not renew.
+        assertEquals(Duration.ofHours(1).toMillis(), r.tick());
+        assertEquals(List.of("/v2/me env"), cp.calls);
+        now += Duration.ofDays(1).toMillis();
+        assertEquals(0, r.tick());
+        assertEquals("next-env", r.token());
+    }
+
+    @Test
+    void persistsTheSuccessorBeforeConfirmingIt() throws Exception {
+        FakeCp cp = new FakeCp();
+        cp.issued = Instant.ofEpochMilli(now).minus(Duration.ofDays(29));
+        cp.expires = cp.issued.plus(Duration.ofDays(30));
+        Path state = Files.createDirectory(dir.resolve("nested")).resolve("s.json");
+        CredentialRenewer r = renewer(cp, state, "env");
+        List<String> swapped = new ArrayList<>();
+        r.onToken(swapped::add);
+        r.tick();
+        cp.issued = Instant.ofEpochMilli(now);
+        cp.expires = cp.issued.plus(Duration.ofDays(30));
+        r.tick();
+        assertEquals(
+                List.of(
+                        "/v2/me env",
+                        "/v2/credentials/renew env",
+                        "/v2/credentials/renew/confirm next-env",
+                        "/v2/me next-env"),
+                cp.calls.subList(0, 4));
+        assertTrue(cp.stateAtConfirm.contains("\"token\":\"next-env\""), cp.stateAtConfirm);
+        assertTrue(cp.stateAtConfirm.contains("\"confirmed\":false"), cp.stateAtConfirm);
+        assertTrue(cp.stateAtConfirm.contains("\"predecessor\":\"env\""), cp.stateAtConfirm);
+        assertEquals(List.of("next-env"), swapped);
+        assertEquals(
+                "rw-------", PosixFilePermissions.toString(Files.getPosixFilePermissions(state)));
+        assertTrue(Files.readString(state).contains("\"confirmed\":true"), Files.readString(state));
+        assertFalse(saved(state).has("predecessor"));
+    }
+
+    @Test
+    void restartReadsTheStateFileAndConfirmsIt() throws Exception {
+        Path state = dir.resolve("s.json");
+        CredentialRenewer.persist(state, "next-env", "env", "env", false);
+        FakeCp cp = new FakeCp();
+        cp.issued = Instant.ofEpochMilli(now);
+        cp.expires = cp.issued.plus(Duration.ofDays(30));
+        CredentialRenewer r = renewer(cp, state, "env");
+        assertEquals("next-env", r.token());
+        r.tick();
+        assertEquals(
+                List.of("/v2/credentials/renew/confirm next-env", "/v2/me next-env"), cp.calls);
+        assertTrue(Files.readString(state).contains("\"confirmed\":true"));
+    }
+
+    @Test
+    void aReissuedEnvTokenReplacesTheOldChain() throws Exception {
+        Path state = dir.resolve("s.json");
+        FakeCp cp = dueCp();
+        assertEquals("env", renewer(cp, state, "env").token());
+        Files.writeString(state, "not json");
+        assertEquals("env", renewer(cp, state, "env").token());
+        assertEquals("not json", Files.readString(state));
+        // The owner re-issued the env token: the old chain's state file no longer applies.
+        CredentialRenewer.persist(state, "next-old", "old", "old", false);
+        assertEquals("env", renewer(cp, state, "env").token());
+        assertEquals("env", saved(state).get("token").getAsString());
+        assertTrue(saved(state).get("confirmed").getAsBoolean());
+        assertFalse(Files.readString(state).contains("old"), "old chain tokens left on disk");
+    }
+
+    @Test
+    void aRejectedFirstSuccessorFallsBackToEnvAsItsPredecessor() throws Exception {
+        Path state = dir.resolve("s.json");
+        CredentialRenewer.persist(state, "next-env", "env", "env", false);
+        FakeCp cp = dueCp();
+        cp.rejected.add("next-env");
+        CredentialRenewer r = renewer(cp, state, "env");
+        assertEquals(CredentialRenewer.RETRY_MS, r.tick());
+        assertEquals("env", r.token());
+        // The rejected successor must not come back after a restart.
+        assertEquals("env", renewer(cp, state, "env").token());
+    }
+
+    @Test
+    void aRejectedSecondSuccessorFallsBackToItsPredecessorNotEnv() throws Exception {
+        Path state = dir.resolve("s.json");
+        FakeCp cp = dueCp();
+        CredentialRenewer r = secondRenewal(cp, state);
+        List<String> swapped = new ArrayList<>();
+        r.onToken(swapped::add);
+        cp.rejected.add("next-next-env");
+        assertEquals(CredentialRenewer.RETRY_MS, r.tick());
+        assertEquals("next-env", r.token());
+        assertEquals(List.of("next-env"), swapped);
+        JsonObject saved = saved(state);
+        assertEquals("next-env", saved.get("token").getAsString());
+        assertTrue(saved.get("confirmed").getAsBoolean());
+        assertFalse(saved.has("predecessor"));
+        assertEquals("next-env", renewer(cp, state, "env").token());
+        // env was revoked by the first confirm: only the first renewal ever used it.
+        assertEquals(
+                List.of("/v2/me env", "/v2/credentials/renew env"),
+                cp.calls.stream().filter(c -> c.endsWith(" env")).toList());
+    }
+
+    @Test
+    void aRejectedSuccessorAndPredecessorLeaveTheStateFileAlone() throws Exception {
+        Path state = dir.resolve("s.json");
+        FakeCp cp = dueCp();
+        CredentialRenewer r = secondRenewal(cp, state);
+        String before = Files.readString(state);
+        int seen = cp.calls.size();
+        cp.rejected.add("next-next-env");
+        cp.rejected.add("next-env");
+        for (int i = 0; i < 3; i++) assertEquals(CredentialRenewer.RETRY_MS, r.tick());
+        assertEquals("next-next-env", r.token());
+        assertEquals(before, Files.readString(state));
+        assertFalse(
+                cp.calls.subList(seen, cp.calls.size()).contains("/v2/me env"),
+                "fell back to the revoked env token");
+    }
+
+    @Test
+    void aConfirm401KeepsConfirmingUntilItSucceeds() throws Exception {
+        Path state = dir.resolve("s.json");
+        CredentialRenewer.persist(state, "next-env", "env", "env", false);
+        FakeCp cp = new FakeCp();
+        cp.issued = Instant.ofEpochMilli(now);
+        cp.expires = cp.issued.plus(Duration.ofDays(30));
+        cp.confirmFailures = 1;
+        CredentialRenewer r = renewer(cp, state, "env");
+        assertEquals(CredentialRenewer.RETRY_MS, r.tick());
+        assertFalse(saved(state).get("confirmed").getAsBoolean());
+        r.tick();
+        assertEquals(
+                List.of(
+                        "/v2/credentials/renew/confirm next-env",
+                        "/v2/me next-env",
+                        "/v2/me env",
+                        "/v2/credentials/renew/confirm next-env",
+                        "/v2/me next-env"),
+                cp.calls);
+        assertTrue(saved(state).get("confirmed").getAsBoolean());
+        assertEquals("next-env", r.token());
+    }
+
+    @Test
+    void aConfirm404ProvesNothingUntilThePredecessorIsRejected() throws Exception {
+        Path state = dir.resolve("s.json");
+        CredentialRenewer.persist(state, "next-env", "env", "env", false);
+        Set<String> rejected = new HashSet<>();
+        CredentialRenewer r =
+                new CredentialRenewer(
+                        (method, path, token) ->
+                                new CredentialRenewer.Reply(
+                                        path.endsWith("/confirm")
+                                                ? 404
+                                                : rejected.contains(token) ? 401 : 200,
+                                        "{}"),
+                        state,
+                        "env",
+                        NOPLogger.NOP_LOGGER,
+                        () -> now);
+        // A route-level 404 while the predecessor still works: stay pending, keep confirming.
+        assertEquals(CredentialRenewer.RETRY_MS, r.tick());
+        assertFalse(saved(state).get("confirmed").getAsBoolean());
+        assertEquals("env", saved(state).get("predecessor").getAsString());
+        rejected.add("env");
+        r.tick();
+        assertTrue(saved(state).get("confirmed").getAsBoolean());
+        assertFalse(saved(state).has("predecessor"));
+        assertEquals("next-env", r.token());
+    }
+
+    @Test
+    void forcesTheSuccessorFileAndItsDirectoryBeforeConfirming() throws Exception {
+        FakeCp cp = dueCp();
+        Path state = dir.resolve("s.json");
+        CredentialRenewer r = renewer(cp, state, "env");
+        CredentialRenewer.forced =
+                path ->
+                        cp.calls.add(
+                                Files.isDirectory(path)
+                                        ? "force dir"
+                                        : path.getFileName().toString().endsWith(".tmp")
+                                                ? "force temp"
+                                                : "force " + path.getFileName());
+        try {
+            assertEquals(0, r.tick());
+            r.tick();
+        } finally {
+            CredentialRenewer.forced = path -> {};
+        }
+        assertEquals(
+                List.of(
+                        "/v2/me env",
+                        "/v2/credentials/renew env",
+                        "force temp",
+                        "force dir",
+                        "force temp",
+                        "force dir",
+                        "/v2/credentials/renew/confirm next-env"),
+                cp.calls.subList(0, 7));
+    }
+
+    @Test
+    void directoryForceFailureThrowsAndDoesNotConfirm() throws Exception {
+        Path sub = dir.resolve("write-only");
+        Files.createDirectory(sub);
+        Path state = sub.resolve("s.json");
+        FakeCp cp = dueCp();
+        CredentialRenewer r = renewer(cp, state, "env");
+        Files.setPosixFilePermissions(sub, PosixFilePermissions.fromString("-wx------"));
+        try {
+            assertThrows(
+                    IOException.class,
+                    () ->
+                            CredentialRenewer.persist(
+                                    sub.resolve("direct.json"), "x", null, "env", true));
+            assertThrows(IOException.class, r::tick);
+            assertEquals("env", r.token());
+            assertTrue(
+                    cp.calls.stream().noneMatch(c -> c.contains("/confirm")), cp.calls.toString());
+            // Next tick while the directory still cannot be synced must not confirm either.
+            assertThrows(IOException.class, r::tick);
+            assertTrue(
+                    cp.calls.stream().noneMatch(c -> c.contains("/confirm")), cp.calls.toString());
+        } finally {
+            Files.setPosixFilePermissions(sub, PosixFilePermissions.fromString("rwx------"));
+        }
+        assertFalse(saved(state).get("confirmed").getAsBoolean());
+        assertEquals(0, r.tick());
+        assertFalse(saved(state).get("confirmed").getAsBoolean());
+        assertTrue(cp.calls.stream().noneMatch(c -> c.contains("/confirm")), cp.calls.toString());
+    }
+
+    @Test
+    void unconfirmedStateLoadedAtStartWaitsForDirectorySyncBeforeConfirming() throws Exception {
+        Path sub = dir.resolve("unconfirmed-sync");
+        Files.createDirectory(sub);
+        Path state = sub.resolve("s.json");
+        CredentialRenewer.persist(state, "next-env", "env", "env", false);
+        FakeCp cp = new FakeCp();
+        cp.issued = Instant.ofEpochMilli(now);
+        cp.expires = cp.issued.plus(Duration.ofDays(30));
+        cp.state = state;
+        List<String> warns = new ArrayList<>();
+        Logger log = captureLogs("warn", warns);
+        Files.setPosixFilePermissions(sub, PosixFilePermissions.fromString("-wx------"));
+        CredentialRenewer r = new CredentialRenewer(cp, state, "env", log, () -> now);
+        try {
+            assertEquals(CredentialRenewer.RETRY_MS, r.tick());
+            assertTrue(
+                    cp.calls.stream().noneMatch(c -> c.contains("/confirm")), cp.calls.toString());
+            assertEquals(1, warns.size(), warns.toString());
+            assertFalse(
+                    warns.get(0).contains("next-env") || warns.get(0).contains("env"),
+                    warns.get(0));
+        } finally {
+            Files.setPosixFilePermissions(sub, PosixFilePermissions.fromString("rwx------"));
+        }
+        assertFalse(saved(state).get("confirmed").getAsBoolean());
+        r.tick();
+        assertTrue(
+                cp.calls.contains("/v2/credentials/renew/confirm next-env"), cp.calls.toString());
+        assertTrue(saved(state).get("confirmed").getAsBoolean());
+    }
+
+    @Test
+    void failedFallbackDirectorySyncRewritesSuccessorBeforeConfirm() throws Exception {
+        Path sub = dir.resolve("fallback-sync");
+        Files.createDirectory(sub);
+        Path state = sub.resolve("s.json");
+        CredentialRenewer.persist(state, "next-env", "env", "env", false);
+        FakeCp cp = new FakeCp();
+        cp.issued = Instant.ofEpochMilli(now);
+        cp.expires = cp.issued.plus(Duration.ofDays(30));
+        cp.state = state;
+        cp.rejected.add("next-env");
+        // When rejected() probes the predecessor before fallback persist, block directory read so
+        // the atomic rename replaces s.json with env while force(dir) throws IOException.
+        CredentialRenewer.Transport transport =
+                (method, path, token) -> {
+                    if (path.equals("/v2/me") && token.equals("env")) {
+                        Files.setPosixFilePermissions(
+                                sub, PosixFilePermissions.fromString("-wx------"));
+                    }
+                    return cp.call(method, path, token);
+                };
+        CredentialRenewer r =
+                new CredentialRenewer(transport, state, "env", NOPLogger.NOP_LOGGER, () -> now);
+        try {
+            assertThrows(IOException.class, r::tick);
+        } finally {
+            Files.setPosixFilePermissions(sub, PosixFilePermissions.fromString("rwx------"));
+        }
+        assertEquals("env", saved(state).get("token").getAsString());
+        assertTrue(saved(state).get("confirmed").getAsBoolean());
+        assertEquals("next-env", r.token());
+
+        cp.rejected.remove("next-env");
+        r.tick();
+        assertTrue(cp.stateAtConfirm.contains("\"token\":\"next-env\""), cp.stateAtConfirm);
+        assertTrue(cp.stateAtConfirm.contains("\"predecessor\":\"env\""), cp.stateAtConfirm);
+        assertTrue(cp.stateAtConfirm.contains("\"confirmed\":false"), cp.stateAtConfirm);
+        assertEquals("next-env", saved(state).get("token").getAsString());
+        assertTrue(saved(state).get("confirmed").getAsBoolean());
+        assertFalse(saved(state).has("predecessor"));
+        assertEquals("next-env", r.token());
+    }
+
+    @Test
+    void missingStateDirectoryThrowsWithoutCreatingOrConfirming() throws Exception {
+        Path missing = dir.resolve("missing");
+        Path state = missing.resolve("nested/s.json");
+        assertThrows(
+                IOException.class,
+                () -> CredentialRenewer.persist(state, "next-env", "env", "env", false));
+        assertFalse(Files.exists(missing));
+        FakeCp cp = dueCp();
+        CredentialRenewer r = renewer(cp, state, "env");
+        assertThrows(IOException.class, r::tick);
+        assertFalse(Files.exists(missing));
+        assertEquals("env", r.token());
+        assertTrue(cp.calls.stream().noneMatch(c -> c.contains("/confirm")), cp.calls.toString());
+    }
+
+    @Test
+    void startWithMissingStateDirectoryLogsErrorAndDoesNotRenew() {
+        Path missing = dir.resolve("missing");
+        Path state = missing.resolve("s.json");
+        FakeCp cp = dueCp();
+        List<String> errors = new ArrayList<>();
+        Logger log = captureLogs("error", errors);
+        CredentialRenewer r = new CredentialRenewer(cp, state, "secret-env-token", log, () -> now);
+        r.start();
+        try {
+            assertEquals(1, errors.size(), errors.toString());
+            assertTrue(
+                    errors.get(0).contains(missing.toAbsolutePath().normalize().toString()),
+                    errors.get(0));
+            assertFalse(errors.get(0).contains("secret-env-token"), errors.get(0));
+            assertEquals("secret-env-token", r.token());
+            assertTrue(cp.calls.isEmpty(), cp.calls.toString());
+            assertFalse(Files.exists(missing));
+        } finally {
+            r.stop();
+        }
+    }
+
+    @Test
+    void startOnNonPosixStoreLogsErrorAndDoesNotRenew() {
+        Path state = dir.resolve("s.json");
+        FakeCp cp = dueCp();
+        List<String> errors = new ArrayList<>();
+        Logger log = captureLogs("error", errors);
+        CredentialRenewer r = new CredentialRenewer(cp, state, "secret-env-token", log, () -> now);
+        Predicate<Path> prev = CredentialRenewer.posix;
+        CredentialRenewer.posix = d -> false;
+        try {
+            r.start();
+            assertEquals(1, errors.size(), errors.toString());
+            assertTrue(
+                    errors.get(0)
+                            .contains(
+                                    "credential renewal needs a POSIX filesystem for {}, "
+                                            + dir.toAbsolutePath().normalize()),
+                    errors.get(0));
+            assertFalse(errors.get(0).contains("secret-env-token"), errors.get(0));
+            assertEquals("secret-env-token", r.token());
+            assertTrue(cp.calls.isEmpty(), cp.calls.toString());
+            assertFalse(Files.exists(state));
+            assertThrows(
+                    IOException.class,
+                    () -> CredentialRenewer.persist(state, "next-env", "env", "env", false));
+            assertFalse(Files.exists(state));
+        } finally {
+            CredentialRenewer.posix = prev;
+            r.stop();
+        }
+    }
+
+    private static Logger captureLogs(String level, List<String> out) {
+        return (Logger)
+                java.lang.reflect.Proxy.newProxyInstance(
+                        Logger.class.getClassLoader(),
+                        new Class<?>[] {Logger.class},
+                        (proxy, method, args) -> {
+                            if (method.getName().equals(level) && args != null)
+                                out.add(Arrays.toString(args));
+                            return null;
+                        });
+    }
+
+    @Test
+    void a401RightAfterAConfirmedRenewalKeepsTheSuccessor() throws Exception {
+        Path state = dir.resolve("s.json");
+        CredentialRenewer.persist(state, "next-env", null, "env", true);
+        CredentialRenewer r =
+                new CredentialRenewer(
+                        (method, path, token) ->
+                                new CredentialRenewer.Reply(
+                                        path.endsWith("/confirm") ? 200 : 401, "{}"),
+                        state,
+                        "env",
+                        NOPLogger.NOP_LOGGER,
+                        () -> now);
+        assertEquals(CredentialRenewer.RETRY_MS, r.tick());
+        assertEquals("next-env", r.token());
+    }
+
+    @Test
+    void confirmed401sAcrossTicksAndARestartKeepTheSuccessor() throws Exception {
+        Path state = dir.resolve("s.json");
+        FakeCp cp = new FakeCp();
+        cp.issued = Instant.ofEpochMilli(now).minus(Duration.ofDays(29));
+        cp.expires = cp.issued.plus(Duration.ofDays(30));
+        CredentialRenewer r = renewer(cp, state, "env");
+        assertEquals(0, r.tick());
+        // The CP revoked env on confirm, but /v2/me still lags behind for the successor.
+        CredentialRenewer.Transport lagging =
+                (method, path, token) ->
+                        new CredentialRenewer.Reply(path.endsWith("/confirm") ? 200 : 401, "{}");
+        r = new CredentialRenewer(lagging, state, "env", NOPLogger.NOP_LOGGER, () -> now);
+        assertEquals(CredentialRenewer.RETRY_MS, r.tick());
+        assertEquals("next-env", r.token());
+        assertTrue(Files.readString(state).contains("\"confirmed\":true"));
+        // Past the old 10-minute grace a confirmed successor is still kept, never env.
+        for (int i = 0; i < 30; i++) {
+            assertEquals(CredentialRenewer.RETRY_MS, r.tick());
+            now += CredentialRenewer.RETRY_MS;
+        }
+        assertEquals("next-env", r.token());
+        assertTrue(Files.exists(state));
+        // A restart with confirmed state keeps the successor without falling back.
+        r =
+                new CredentialRenewer(
+                        (method, path, token) ->
+                                new CredentialRenewer.Reply(
+                                        path.endsWith("/confirm") ? 404 : 401, "{}"),
+                        state,
+                        "env",
+                        NOPLogger.NOP_LOGGER,
+                        () -> now);
+        assertEquals(CredentialRenewer.RETRY_MS, r.tick());
+        assertEquals("next-env", r.token());
+        assertTrue(Files.exists(state));
+    }
+
+    @Test
+    void aCpWithoutRenewalSupportIsCheckedHourly() throws Exception {
+        List<String> calls = new ArrayList<>();
+        CredentialRenewer r =
+                new CredentialRenewer(
+                        (method, path, token) -> {
+                            calls.add(path);
+                            return new CredentialRenewer.Reply(200, "{\"client\":\"proxy\"}");
+                        },
+                        dir.resolve("s.json"),
+                        "env",
+                        NOPLogger.NOP_LOGGER,
+                        () -> now);
+        assertEquals(Duration.ofHours(1).toMillis(), r.tick());
+        assertEquals(List.of("/v2/me"), calls);
+    }
+
+    @Test
+    void atomicMoveRefusedLeavesOldStateAndSkipsConfirmUntilMoveWorks() throws Exception {
+        Path sub = Files.createDirectory(dir.resolve("atomic-refused"));
+        Path realState = sub.resolve("s.json");
+        CredentialRenewer.persist(realState, "next-env", "env", "env", false);
+        byte[] before = Files.readAllBytes(realState);
+
+        AtomicBoolean refuseAtomicMove = new AtomicBoolean(true);
+        Path state = wrapWithAtomicMoveGate(realState, refuseAtomicMove);
+        FakeCp cp = new FakeCp();
+        cp.issued = Instant.ofEpochMilli(now);
+        cp.expires = cp.issued.plus(Duration.ofDays(30));
+        cp.state = realState;
+        List<String> warns = new ArrayList<>();
+        CredentialRenewer r =
+                new CredentialRenewer(cp, state, "env", captureLogs("warn", warns), () -> now);
+
+        assertThrows(
+                AtomicMoveNotSupportedException.class,
+                () -> CredentialRenewer.persist(state, "other", null, "env", true));
+        assertArrayEquals(before, Files.readAllBytes(realState));
+        try (var entries = Files.list(sub)) {
+            assertEquals(List.of(realState), entries.toList());
+        }
+
+        assertEquals(CredentialRenewer.RETRY_MS, r.tick());
+        assertTrue(cp.calls.stream().noneMatch(c -> c.contains("/confirm")), cp.calls.toString());
+        assertArrayEquals(before, Files.readAllBytes(realState));
+        try (var entries = Files.list(sub)) {
+            assertEquals(List.of(realState), entries.toList());
+        }
+        assertEquals(1, warns.size(), warns.toString());
+        assertFalse(
+                warns.get(0).contains("next-env") || warns.get(0).contains("env"), warns.get(0));
+
+        refuseAtomicMove.set(false);
+        r.tick();
+        assertTrue(
+                cp.calls.contains("/v2/credentials/renew/confirm next-env"), cp.calls.toString());
+        assertTrue(saved(realState).get("confirmed").getAsBoolean());
+        assertFalse(saved(realState).has("predecessor"));
+        assertEquals("next-env", r.token());
+    }
+
+    private interface WrappedPath extends Path {
+        Path unwrap();
+    }
+
+    private static Path unwrap(Path path) {
+        return path instanceof WrappedPath w ? w.unwrap() : path;
+    }
+
+    private static Path wrapPath(Path real, FileSystem fs) {
+        if (real == null) return null;
+        return (Path)
+                Proxy.newProxyInstance(
+                        WrappedPath.class.getClassLoader(),
+                        new Class<?>[] {WrappedPath.class},
+                        (proxy, method, args) -> {
+                            String name = method.getName();
+                            if (name.equals("unwrap")) return real;
+                            if (name.equals("getFileSystem")) return fs;
+                            if (name.equals("equals")) {
+                                return args[0] instanceof Path other && real.equals(unwrap(other));
+                            }
+                            if (name.equals("hashCode")) return real.hashCode();
+                            if (name.equals("toString")) return real.toString();
+                            Object[] unwrapped = null;
+                            if (args != null) {
+                                unwrapped = args.clone();
+                                for (int i = 0; i < unwrapped.length; i++) {
+                                    if (unwrapped[i] instanceof Path p) unwrapped[i] = unwrap(p);
+                                }
+                            }
+                            try {
+                                Object res = method.invoke(real, unwrapped);
+                                if (res instanceof Path p) return wrapPath(p, fs);
+                                if (name.equals("iterator")) {
+                                    @SuppressWarnings("unchecked")
+                                    Iterator<Path> it = (Iterator<Path>) res;
+                                    return new Iterator<Path>() {
+                                        @Override
+                                        public boolean hasNext() {
+                                            return it.hasNext();
+                                        }
+
+                                        @Override
+                                        public Path next() {
+                                            return wrapPath(it.next(), fs);
+                                        }
+                                    };
+                                }
+                                return res;
+                            } catch (InvocationTargetException e) {
+                                throw e.getCause();
+                            }
+                        });
+    }
+
+    private static Path wrapWithAtomicMoveGate(Path realTarget, AtomicBoolean refuseAtomicMove) {
+        FileSystem realFs = realTarget.getFileSystem();
+        FileSystemProvider realProvider = realFs.provider();
+        FileSystem[] holder = new FileSystem[1];
+        FileSystemProvider provider =
+                new FileSystemProvider() {
+                    @Override
+                    public String getScheme() {
+                        return realProvider.getScheme();
+                    }
+
+                    @Override
+                    public FileSystem newFileSystem(URI uri, Map<String, ?> env) {
+                        throw new UnsupportedOperationException();
+                    }
+
+                    @Override
+                    public FileSystem getFileSystem(URI uri) {
+                        return holder[0];
+                    }
+
+                    @Override
+                    public Path getPath(URI uri) {
+                        return wrapPath(realProvider.getPath(uri), holder[0]);
+                    }
+
+                    @Override
+                    public FileChannel newFileChannel(
+                            Path path, Set<? extends OpenOption> options, FileAttribute<?>... attrs)
+                            throws IOException {
+                        return realProvider.newFileChannel(unwrap(path), options, attrs);
+                    }
+
+                    @Override
+                    public SeekableByteChannel newByteChannel(
+                            Path path, Set<? extends OpenOption> options, FileAttribute<?>... attrs)
+                            throws IOException {
+                        return realProvider.newByteChannel(unwrap(path), options, attrs);
+                    }
+
+                    @Override
+                    public DirectoryStream<Path> newDirectoryStream(
+                            Path dir, DirectoryStream.Filter<? super Path> filter)
+                            throws IOException {
+                        return realProvider.newDirectoryStream(unwrap(dir), filter);
+                    }
+
+                    @Override
+                    public void createDirectory(Path dir, FileAttribute<?>... attrs)
+                            throws IOException {
+                        realProvider.createDirectory(unwrap(dir), attrs);
+                    }
+
+                    @Override
+                    public void delete(Path path) throws IOException {
+                        realProvider.delete(unwrap(path));
+                    }
+
+                    @Override
+                    public boolean deleteIfExists(Path path) throws IOException {
+                        return realProvider.deleteIfExists(unwrap(path));
+                    }
+
+                    @Override
+                    public void copy(Path source, Path target, CopyOption... options)
+                            throws IOException {
+                        realProvider.copy(unwrap(source), unwrap(target), options);
+                    }
+
+                    @Override
+                    public void move(Path source, Path target, CopyOption... options)
+                            throws IOException {
+                        if (refuseAtomicMove.get()
+                                && Arrays.asList(options)
+                                        .contains(StandardCopyOption.ATOMIC_MOVE)) {
+                            throw new AtomicMoveNotSupportedException(
+                                    source.toString(), target.toString(), "simulated");
+                        }
+                        realProvider.move(unwrap(source), unwrap(target), options);
+                    }
+
+                    @Override
+                    public boolean isSameFile(Path path, Path path2) throws IOException {
+                        return realProvider.isSameFile(unwrap(path), unwrap(path2));
+                    }
+
+                    @Override
+                    public boolean isHidden(Path path) throws IOException {
+                        return realProvider.isHidden(unwrap(path));
+                    }
+
+                    @Override
+                    public FileStore getFileStore(Path path) throws IOException {
+                        return realProvider.getFileStore(unwrap(path));
+                    }
+
+                    @Override
+                    public void checkAccess(Path path, AccessMode... modes) throws IOException {
+                        realProvider.checkAccess(unwrap(path), modes);
+                    }
+
+                    @Override
+                    public <V extends FileAttributeView> V getFileAttributeView(
+                            Path path, Class<V> type, LinkOption... options) {
+                        return realProvider.getFileAttributeView(unwrap(path), type, options);
+                    }
+
+                    @Override
+                    public <A extends BasicFileAttributes> A readAttributes(
+                            Path path, Class<A> type, LinkOption... options) throws IOException {
+                        return realProvider.readAttributes(unwrap(path), type, options);
+                    }
+
+                    @Override
+                    public Map<String, Object> readAttributes(
+                            Path path, String attributes, LinkOption... options)
+                            throws IOException {
+                        return realProvider.readAttributes(unwrap(path), attributes, options);
+                    }
+
+                    @Override
+                    public void setAttribute(
+                            Path path, String attribute, Object value, LinkOption... options)
+                            throws IOException {
+                        realProvider.setAttribute(unwrap(path), attribute, value, options);
+                    }
+                };
+        holder[0] =
+                new FileSystem() {
+                    @Override
+                    public FileSystemProvider provider() {
+                        return provider;
+                    }
+
+                    @Override
+                    public void close() {}
+
+                    @Override
+                    public boolean isOpen() {
+                        return realFs.isOpen();
+                    }
+
+                    @Override
+                    public boolean isReadOnly() {
+                        return realFs.isReadOnly();
+                    }
+
+                    @Override
+                    public String getSeparator() {
+                        return realFs.getSeparator();
+                    }
+
+                    @Override
+                    public Iterable<Path> getRootDirectories() {
+                        return realFs.getRootDirectories();
+                    }
+
+                    @Override
+                    public Iterable<FileStore> getFileStores() {
+                        return realFs.getFileStores();
+                    }
+
+                    @Override
+                    public Set<String> supportedFileAttributeViews() {
+                        return realFs.supportedFileAttributeViews();
+                    }
+
+                    @Override
+                    public Path getPath(String first, String... more) {
+                        return wrapPath(realFs.getPath(first, more), this);
+                    }
+
+                    @Override
+                    public PathMatcher getPathMatcher(String syntaxAndPattern) {
+                        return realFs.getPathMatcher(syntaxAndPattern);
+                    }
+
+                    @Override
+                    public UserPrincipalLookupService getUserPrincipalLookupService() {
+                        return realFs.getUserPrincipalLookupService();
+                    }
+
+                    @Override
+                    public WatchService newWatchService() throws IOException {
+                        return realFs.newWatchService();
+                    }
+                };
+        return wrapPath(realTarget, holder[0]);
+    }
+}
