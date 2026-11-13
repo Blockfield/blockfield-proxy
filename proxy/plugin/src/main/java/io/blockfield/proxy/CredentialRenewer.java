@@ -10,11 +10,13 @@ import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.nio.file.StandardOpenOption;
 import java.nio.file.attribute.PosixFilePermissions;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
@@ -38,6 +40,9 @@ final class CredentialRenewer {
 
     private static final long MAX_SLEEP_MS = Duration.ofHours(1).toMillis();
     private static final Duration RPC_TIMEOUT = Duration.ofSeconds(10);
+
+    /** Called after each fsync of the state file or its directory; tests observe the order. */
+    static Consumer<Path> forced = path -> {};
 
     record Reply(int status, String body) {}
 
@@ -143,17 +148,20 @@ final class CredentialRenewer {
         if (token.isEmpty()) return MAX_SLEEP_MS;
         if (!confirmed) {
             int status = cp.call("POST", "/v2/credentials/renew/confirm", token).status();
-            if (status == 200 || status == 404) {
-                // Confirm revoked the predecessor: drop it so a later 401 never falls back.
-                persist(state, token, null, envToken, true);
-                confirmed = true;
-                predecessor = null;
-            } else if (status != 401) return RETRY_MS;
+            // CP answers a replayed confirm with 200 too; a 404 may be a missing route.
+            if (status == 200) markConfirmed();
+            else if (status != 401 && status != 404) return RETRY_MS;
         }
         Reply me = cp.call("GET", "/v2/me", token);
         if (me.status() == 401) return rejected();
-        // A 401 from confirm alone does not prove the successor rejected: keep confirming.
-        if (!confirmed) return RETRY_MS;
+        if (!confirmed) {
+            // A confirm 401 or 404 alone proves nothing: keep confirming until the successor
+            // works and its predecessor is rejected (revoked, or expired after CP's grace).
+            if (me.status() != 200
+                    || predecessor == null
+                    || cp.call("GET", "/v2/me", predecessor).status() != 401) return RETRY_MS;
+            markConfirmed();
+        }
         if (me.status() != 200) {
             log.warn("CP credential check status {}", me.status());
             return RETRY_MS;
@@ -183,6 +191,13 @@ final class CredentialRenewer {
                 "CP credential renewed, valid until {}",
                 instant(JsonParser.parseString(renewed.body()).getAsJsonObject(), "expiresAt"));
         return 0;
+    }
+
+    /** The predecessor is revoked: drop it so a later 401 never falls back. */
+    private void markConfirmed() throws IOException {
+        persist(state, token, null, envToken, true);
+        confirmed = true;
+        predecessor = null;
     }
 
     /** /v2/me answered 401 for the token in use. */
@@ -270,6 +285,8 @@ final class CredentialRenewer {
                                 PosixFilePermissions.fromString("rw-------")));
         try {
             Files.writeString(temp, json.toString());
+            // Confirm revokes the predecessor: the successor must survive a power loss first.
+            force(temp, false);
             try {
                 Files.move(
                         temp,
@@ -282,5 +299,23 @@ final class CredentialRenewer {
         } finally {
             Files.deleteIfExists(temp);
         }
+        force(dir, true);
+    }
+
+    private static void force(Path path, boolean directory) throws IOException {
+        FileChannel channel;
+        try {
+            // Windows flushes only writable files and cannot open a directory at all.
+            channel =
+                    FileChannel.open(
+                            path, directory ? StandardOpenOption.READ : StandardOpenOption.WRITE);
+        } catch (IOException e) {
+            if (directory) return;
+            throw e;
+        }
+        try (channel) {
+            channel.force(true);
+        }
+        forced.accept(path);
     }
 }

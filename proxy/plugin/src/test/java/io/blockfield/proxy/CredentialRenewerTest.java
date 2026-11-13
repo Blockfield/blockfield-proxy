@@ -250,11 +250,69 @@ class CredentialRenewerTest {
                 List.of(
                         "/v2/credentials/renew/confirm next-env",
                         "/v2/me next-env",
+                        "/v2/me env",
                         "/v2/credentials/renew/confirm next-env",
                         "/v2/me next-env"),
                 cp.calls);
         assertTrue(saved(state).get("confirmed").getAsBoolean());
         assertEquals("next-env", r.token());
+    }
+
+    @Test
+    void aConfirm404ProvesNothingUntilThePredecessorIsRejected() throws Exception {
+        Path state = dir.resolve("s.json");
+        CredentialRenewer.persist(state, "next-env", "env", "env", false);
+        Set<String> rejected = new HashSet<>();
+        CredentialRenewer r =
+                new CredentialRenewer(
+                        (method, path, token) ->
+                                new CredentialRenewer.Reply(
+                                        path.endsWith("/confirm")
+                                                ? 404
+                                                : rejected.contains(token) ? 401 : 200,
+                                        "{}"),
+                        state,
+                        "env",
+                        NOPLogger.NOP_LOGGER,
+                        () -> now);
+        // A route-level 404 while the predecessor still works: stay pending, keep confirming.
+        assertEquals(CredentialRenewer.RETRY_MS, r.tick());
+        assertFalse(saved(state).get("confirmed").getAsBoolean());
+        assertEquals("env", saved(state).get("predecessor").getAsString());
+        rejected.add("env");
+        r.tick();
+        assertTrue(saved(state).get("confirmed").getAsBoolean());
+        assertFalse(saved(state).has("predecessor"));
+        assertEquals("next-env", r.token());
+    }
+
+    @Test
+    void forcesTheSuccessorFileAndItsDirectoryBeforeConfirming() throws Exception {
+        FakeCp cp = dueCp();
+        Path state = dir.resolve("s.json");
+        CredentialRenewer r = renewer(cp, state, "env");
+        CredentialRenewer.forced =
+                path ->
+                        cp.calls.add(
+                                Files.isDirectory(path)
+                                        ? "force dir"
+                                        : path.getFileName().toString().endsWith(".tmp")
+                                                ? "force temp"
+                                                : "force " + path.getFileName());
+        try {
+            assertEquals(0, r.tick());
+            r.tick();
+        } finally {
+            CredentialRenewer.forced = path -> {};
+        }
+        assertEquals(
+                List.of(
+                        "/v2/me env",
+                        "/v2/credentials/renew env",
+                        "force temp",
+                        "force dir",
+                        "/v2/credentials/renew/confirm next-env"),
+                cp.calls.subList(0, 5));
     }
 
     @Test
