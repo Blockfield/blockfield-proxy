@@ -34,12 +34,12 @@ permissions:
   actions: read # decide looks up the green build run for this tree
   pull-requests: read # bot-gate reads blockfield-review-bot verdicts on the head SHA
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}-${{ (github.event_name == 'pull_request_review' && (github.event.review.user.login != 'blockfield-review-bot[bot]' || github.event.review.state != 'approved')) && 'review-noise' || 'gate' }}
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ (github.event_name == 'pull_request_review' && (github.event.pull_request.head.repo.full_name != github.repository || github.event.review.user.login != 'blockfield-review-bot[bot]' || github.event.review.state != 'approved')) && 'review-noise' || 'gate' }}
   # A review must never cancel the run it gates.
   cancel-in-progress: false
 jobs:
   bot-gate:
-    name: ${{ (github.event_name == 'pull_request_review' && (github.event.review.user.login != 'blockfield-review-bot[bot]' || github.event.review.state != 'approved')) && 'bot-gate (skipped review)' || 'bot-gate' }}
+    name: ${{ (github.event_name == 'pull_request_review' && (github.event.pull_request.head.repo.full_name != github.repository || github.event.review.user.login != 'blockfield-review-bot[bot]' || github.event.review.state != 'approved')) && 'bot-gate (skipped review)' || 'bot-gate' }}
     # Enforcing: `check` runs on a PR head only when this job reports
     # verdict=permit with sha_match=true for the CURRENT head SHA, resolved
     # from the API at gate runtime (a push may have landed after the
@@ -52,7 +52,7 @@ jobs:
     # own `bot-review` commit status blocks merge.
     runs-on: tenki-standard-autoscale
     timeout-minutes: 5
-    if: github.event_name == 'pull_request_review' && github.event.review.user.login == 'blockfield-review-bot[bot]' && github.event.review.state == 'approved'
+    if: github.event_name == 'pull_request_review' && github.event.pull_request.head.repo.full_name == github.repository && github.event.review.user.login == 'blockfield-review-bot[bot]' && github.event.review.state == 'approved'
     outputs:
       verdict: ${{ steps.gate.outputs.verdict }}
       sha_match: ${{ steps.gate.outputs.sha_match }}
@@ -103,10 +103,10 @@ jobs:
             echo "sha=$HEAD_SHA"
           } >> "$GITHUB_OUTPUT"
   decide:
-    name: ${{ (github.event_name == 'pull_request_review' && (github.event.review.user.login != 'blockfield-review-bot[bot]' || github.event.review.state != 'approved')) && 'decide (skipped review)' || 'decide' }}
+    name: ${{ (github.event_name == 'pull_request_review' && (github.event.pull_request.head.repo.full_name != github.repository || github.event.review.user.login != 'blockfield-review-bot[bot]' || github.event.review.state != 'approved')) && 'decide (skipped review)' || 'decide' }}
     # Same gate as bot-gate: a non-approving or non-bot review must not start
     # a runner here either. Push and manual-dispatch runs always run.
-    if: github.event_name != 'pull_request_review' || (github.event.review.user.login == 'blockfield-review-bot[bot]' && github.event.review.state == 'approved')
+    if: github.event_name != 'pull_request_review' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.review.user.login == 'blockfield-review-bot[bot]' && github.event.review.state == 'approved')
     runs-on: tenki-standard-autoscale
     timeout-minutes: 10
     outputs:
@@ -147,7 +147,7 @@ jobs:
           fi
           echo "image=$image" >> "$GITHUB_OUTPUT"
   build:
-    name: ${{ (github.event_name == 'pull_request_review' && (github.event.review.user.login != 'blockfield-review-bot[bot]' || github.event.review.state != 'approved')) && 'build (skipped review)' || 'build' }}
+    name: ${{ (github.event_name == 'pull_request_review' && (github.event.pull_request.head.repo.full_name != github.repository || github.event.review.user.login != 'blockfield-review-bot[bot]' || github.event.review.state != 'approved')) && 'build (skipped review)' || 'build' }}
     # Main/tag pushes and maintainer dispatches always run; PR heads run only
     # on a gate permit for the exact head SHA. Main pushes additionally skip
     # re-verification when a green run already tested this tree and image
@@ -286,7 +286,7 @@ jobs:
           if-no-files-found: error
   # Описание версии: только GitHub Release с release-notes.md и announcement.json; деплой — отдельный ручной workflow.
   release:
-    name: ${{ (github.event_name == 'pull_request_review' && (github.event.review.user.login != 'blockfield-review-bot[bot]' || github.event.review.state != 'approved')) && 'release (skipped review)' || 'release' }}
+    name: ${{ (github.event_name == 'pull_request_review' && (github.event.pull_request.head.repo.full_name != github.repository || github.event.review.user.login != 'blockfield-review-bot[bot]' || github.event.review.state != 'approved')) && 'release (skipped review)' || 'release' }}
     # always(): bot-gate skips on pushes and GitHub extends that skip down the
     # whole chain unless this job opts out; the result check keeps the old
     # "publish only what build validated" guarantee.
