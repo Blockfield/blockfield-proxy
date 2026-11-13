@@ -2,6 +2,7 @@ package io.blockfield.proxy;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.google.gson.JsonObject;
@@ -10,6 +11,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.slf4j.helpers.NOPLogger;
 
+import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.attribute.PosixFilePermissions;
@@ -313,6 +315,119 @@ class CredentialRenewerTest {
                         "force dir",
                         "/v2/credentials/renew/confirm next-env"),
                 cp.calls.subList(0, 5));
+    }
+
+    @Test
+    void nonWindowsDirectoryForceFailureThrowsAndDoesNotConfirm() throws Exception {
+        Path sub = dir.resolve("write-only");
+        Files.createDirectory(sub);
+        Path state = sub.resolve("s.json");
+        FakeCp cp = dueCp();
+        CredentialRenewer r = renewer(cp, state, "env");
+        String prevOs = System.getProperty("os.name");
+        System.setProperty("os.name", "Linux");
+        Files.setPosixFilePermissions(sub, PosixFilePermissions.fromString("-wx------"));
+        try {
+            assertThrows(
+                    IOException.class,
+                    () ->
+                            CredentialRenewer.persist(
+                                    sub.resolve("direct.json"), "x", null, "env", true));
+            assertThrows(IOException.class, r::tick);
+            assertEquals("env", r.token());
+            assertTrue(
+                    cp.calls.stream().noneMatch(c -> c.contains("/confirm")), cp.calls.toString());
+            // Next tick while the directory still cannot be synced must not confirm either.
+            assertThrows(IOException.class, r::tick);
+            assertTrue(
+                    cp.calls.stream().noneMatch(c -> c.contains("/confirm")), cp.calls.toString());
+        } finally {
+            Files.setPosixFilePermissions(sub, PosixFilePermissions.fromString("rwx------"));
+            if (prevOs == null) System.clearProperty("os.name");
+            else System.setProperty("os.name", prevOs);
+        }
+        assertFalse(saved(state).get("confirmed").getAsBoolean());
+        assertEquals(0, r.tick());
+        assertFalse(saved(state).get("confirmed").getAsBoolean());
+        assertTrue(cp.calls.stream().noneMatch(c -> c.contains("/confirm")), cp.calls.toString());
+    }
+
+    @Test
+    void forcesNewlyCreatedParentDirectoriesAndExistingAncestorBeforeConfirming() throws Exception {
+        FakeCp cp = dueCp();
+        Path parent = dir.resolve("a");
+        Path leaf = parent.resolve("b");
+        Path state = leaf.resolve("s.json");
+        CredentialRenewer r = renewer(cp, state, "env");
+        CredentialRenewer.forced =
+                path ->
+                        cp.calls.add(
+                                path.equals(dir)
+                                        ? "force ancestor"
+                                        : path.equals(parent)
+                                                ? "force parent"
+                                                : path.equals(leaf)
+                                                        ? "force leaf"
+                                                        : path.getFileName()
+                                                                        .toString()
+                                                                        .endsWith(".tmp")
+                                                                ? "force temp"
+                                                                : "force " + path);
+        try {
+            assertEquals(0, r.tick());
+            r.tick();
+        } finally {
+            CredentialRenewer.forced = path -> {};
+        }
+        assertEquals(
+                List.of(
+                        "/v2/me env",
+                        "/v2/credentials/renew env",
+                        "force temp",
+                        "force leaf",
+                        "force parent",
+                        "force ancestor",
+                        "/v2/credentials/renew/confirm next-env"),
+                cp.calls.subList(0, 7));
+    }
+
+    @Test
+    void windowsSkipsDirectoryFlushAndStillPersistsAndConfirms() throws Exception {
+        Path state = dir.resolve("s.json");
+        Path winWriteOnly = dir.resolve("win-write-only");
+        Files.createDirectory(winWriteOnly);
+        FakeCp cp = dueCp();
+        CredentialRenewer r = renewer(cp, state, "env");
+        String prevOs = System.getProperty("os.name");
+        System.setProperty("os.name", "Windows 11");
+        Files.setPosixFilePermissions(winWriteOnly, PosixFilePermissions.fromString("-wx------"));
+        CredentialRenewer.forced =
+                path -> cp.calls.add(Files.isDirectory(path) ? "force dir" : "force temp");
+        try {
+            assertEquals(0, r.tick());
+            cp.issued = Instant.ofEpochMilli(now);
+            cp.expires = cp.issued.plus(Duration.ofDays(30));
+            r.tick();
+            CredentialRenewer.persist(
+                    winWriteOnly.resolve("s.json"), "next-env", "env", "env", false);
+        } finally {
+            CredentialRenewer.forced = path -> {};
+            Files.setPosixFilePermissions(
+                    winWriteOnly, PosixFilePermissions.fromString("rwx------"));
+            if (prevOs == null) System.clearProperty("os.name");
+            else System.setProperty("os.name", prevOs);
+        }
+        assertEquals(
+                List.of(
+                        "/v2/me env",
+                        "/v2/credentials/renew env",
+                        "force temp",
+                        "/v2/credentials/renew/confirm next-env",
+                        "force temp",
+                        "/v2/me next-env",
+                        "force temp"),
+                cp.calls);
+        assertTrue(saved(state).get("confirmed").getAsBoolean());
     }
 
     @Test

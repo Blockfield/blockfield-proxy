@@ -23,7 +23,10 @@ import java.security.NoSuchAlgorithmException;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.OffsetDateTime;
+import java.util.ArrayList;
 import java.util.HexFormat;
+import java.util.List;
+import java.util.Locale;
 import java.util.function.Consumer;
 import java.util.function.LongSupplier;
 
@@ -274,7 +277,14 @@ final class CredentialRenewer {
         if (predecessor != null) json.addProperty("predecessor", predecessor);
         json.addProperty("base", sha256(envToken));
         json.addProperty("confirmed", confirmed);
-        Path dir = state.toAbsolutePath().getParent();
+        Path dir = state.toAbsolutePath().normalize().getParent();
+        List<Path> dirsToForce = new ArrayList<>();
+        Path cur = dir;
+        while (cur != null && !Files.exists(cur)) {
+            dirsToForce.add(cur);
+            cur = cur.getParent();
+        }
+        if (cur != null) dirsToForce.add(cur);
         Files.createDirectories(dir);
         Path temp =
                 Files.createTempFile(
@@ -299,21 +309,17 @@ final class CredentialRenewer {
         } finally {
             Files.deleteIfExists(temp);
         }
-        force(dir, true);
+        for (Path d : dirsToForce) force(d, true);
     }
 
     private static void force(Path path, boolean directory) throws IOException {
-        FileChannel channel;
-        try {
-            // Windows flushes only writable files and cannot open a directory at all.
-            channel =
-                    FileChannel.open(
-                            path, directory ? StandardOpenOption.READ : StandardOpenOption.WRITE);
-        } catch (IOException e) {
-            if (directory) return;
-            throw e;
-        }
-        try (channel) {
+        // Windows flushes only writable files and cannot open a directory at all.
+        if (directory
+                && System.getProperty("os.name", "").toLowerCase(Locale.ROOT).startsWith("windows"))
+            return;
+        try (FileChannel channel =
+                FileChannel.open(
+                        path, directory ? StandardOpenOption.READ : StandardOpenOption.WRITE)) {
             channel.force(true);
         }
         forced.accept(path);
