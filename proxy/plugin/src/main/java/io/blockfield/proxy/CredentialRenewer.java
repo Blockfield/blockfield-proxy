@@ -23,12 +23,11 @@ import java.security.NoSuchAlgorithmException;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.OffsetDateTime;
-import java.util.ArrayList;
 import java.util.HexFormat;
-import java.util.List;
 import java.util.Locale;
 import java.util.function.Consumer;
 import java.util.function.LongSupplier;
+import java.util.function.Predicate;
 
 /**
  * Renews this service's control-plane credential before it expires (coordination#33): ~7 days ahead
@@ -46,6 +45,9 @@ final class CredentialRenewer {
 
     /** Called after each fsync of the state file or its directory; tests observe the order. */
     static Consumer<Path> forced = path -> {};
+
+    /** Whether the directory's store supports POSIX attributes; tests override for non-POSIX. */
+    static Predicate<Path> posix = CredentialRenewer::supportsPosix;
 
     record Reply(int status, String body) {}
 
@@ -113,6 +115,14 @@ final class CredentialRenewer {
     }
 
     void start() {
+        Path dir = state == null ? null : state.toAbsolutePath().normalize().getParent();
+        if (dir == null || !Files.isDirectory(dir)) {
+            log.error(
+                    "CP credential state directory {} does not exist; renewal disabled, keeping"
+                            + " current token",
+                    dir != null ? dir : state);
+            return;
+        }
         Thread t =
                 new Thread(
                         () -> {
@@ -277,22 +287,19 @@ final class CredentialRenewer {
         if (predecessor != null) json.addProperty("predecessor", predecessor);
         json.addProperty("base", sha256(envToken));
         json.addProperty("confirmed", confirmed);
-        Path dir = state.toAbsolutePath().normalize().getParent();
-        List<Path> dirsToForce = new ArrayList<>();
-        Path cur = dir;
-        while (cur != null && !Files.exists(cur)) {
-            dirsToForce.add(cur);
-            cur = cur.getParent();
+        Path dir = state == null ? null : state.toAbsolutePath().normalize().getParent();
+        if (dir == null || !Files.isDirectory(dir)) {
+            throw new IOException("CP credential state directory does not exist: " + dir);
         }
-        if (cur != null) dirsToForce.add(cur);
-        Files.createDirectories(dir);
         Path temp =
-                Files.createTempFile(
-                        dir,
-                        ".cp-credential",
-                        ".tmp",
-                        PosixFilePermissions.asFileAttribute(
-                                PosixFilePermissions.fromString("rw-------")));
+                posix.test(dir)
+                        ? Files.createTempFile(
+                                dir,
+                                ".cp-credential",
+                                ".tmp",
+                                PosixFilePermissions.asFileAttribute(
+                                        PosixFilePermissions.fromString("rw-------")))
+                        : Files.createTempFile(dir, ".cp-credential", ".tmp");
         try {
             Files.writeString(temp, json.toString());
             // Confirm revokes the predecessor: the successor must survive a power loss first.
@@ -309,7 +316,15 @@ final class CredentialRenewer {
         } finally {
             Files.deleteIfExists(temp);
         }
-        for (Path d : dirsToForce) force(d, true);
+        force(dir, true);
+    }
+
+    private static boolean supportsPosix(Path dir) {
+        try {
+            return Files.getFileStore(dir).supportsFileAttributeView("posix");
+        } catch (IOException e) {
+            return false;
+        }
     }
 
     private static void force(Path path, boolean directory) throws IOException {

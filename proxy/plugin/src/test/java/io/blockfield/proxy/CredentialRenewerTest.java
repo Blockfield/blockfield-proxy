@@ -9,6 +9,7 @@ import com.google.gson.JsonObject;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.slf4j.Logger;
 import org.slf4j.helpers.NOPLogger;
 
 import java.io.IOException;
@@ -18,9 +19,11 @@ import java.nio.file.attribute.PosixFilePermissions;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.function.Predicate;
 
 class CredentialRenewerTest {
     @TempDir Path dir;
@@ -128,7 +131,7 @@ class CredentialRenewerTest {
         FakeCp cp = new FakeCp();
         cp.issued = Instant.ofEpochMilli(now).minus(Duration.ofDays(29));
         cp.expires = cp.issued.plus(Duration.ofDays(30));
-        Path state = dir.resolve("nested/s.json");
+        Path state = Files.createDirectory(dir.resolve("nested")).resolve("s.json");
         CredentialRenewer r = renewer(cp, state, "env");
         List<String> swapped = new ArrayList<>();
         r.onToken(swapped::add);
@@ -353,42 +356,77 @@ class CredentialRenewerTest {
     }
 
     @Test
-    void forcesNewlyCreatedParentDirectoriesAndExistingAncestorBeforeConfirming() throws Exception {
+    void missingStateDirectoryThrowsWithoutCreatingOrConfirming() throws Exception {
+        Path missing = dir.resolve("missing");
+        Path state = missing.resolve("nested/s.json");
+        assertThrows(
+                IOException.class,
+                () -> CredentialRenewer.persist(state, "next-env", "env", "env", false));
+        assertFalse(Files.exists(missing));
         FakeCp cp = dueCp();
-        Path parent = dir.resolve("a");
-        Path leaf = parent.resolve("b");
-        Path state = leaf.resolve("s.json");
         CredentialRenewer r = renewer(cp, state, "env");
-        CredentialRenewer.forced =
-                path ->
-                        cp.calls.add(
-                                path.equals(dir)
-                                        ? "force ancestor"
-                                        : path.equals(parent)
-                                                ? "force parent"
-                                                : path.equals(leaf)
-                                                        ? "force leaf"
-                                                        : path.getFileName()
-                                                                        .toString()
-                                                                        .endsWith(".tmp")
-                                                                ? "force temp"
-                                                                : "force " + path);
+        assertThrows(IOException.class, r::tick);
+        assertFalse(Files.exists(missing));
+        assertEquals("env", r.token());
+        assertTrue(cp.calls.stream().noneMatch(c -> c.contains("/confirm")), cp.calls.toString());
+    }
+
+    @Test
+    void startWithMissingStateDirectoryLogsErrorAndDoesNotRenew() {
+        Path missing = dir.resolve("missing");
+        Path state = missing.resolve("s.json");
+        FakeCp cp = dueCp();
+        List<String> errors = new ArrayList<>();
+        Logger log =
+                (Logger)
+                        java.lang.reflect.Proxy.newProxyInstance(
+                                Logger.class.getClassLoader(),
+                                new Class<?>[] {Logger.class},
+                                (proxy, method, args) -> {
+                                    if (method.getName().equals("error") && args != null)
+                                        errors.add(Arrays.toString(args));
+                                    return null;
+                                });
+        CredentialRenewer r = new CredentialRenewer(cp, state, "secret-env-token", log, () -> now);
+        r.start();
+        try {
+            assertEquals(1, errors.size(), errors.toString());
+            assertTrue(
+                    errors.get(0).contains(missing.toAbsolutePath().normalize().toString()),
+                    errors.get(0));
+            assertFalse(errors.get(0).contains("secret-env-token"), errors.get(0));
+            assertEquals("secret-env-token", r.token());
+            assertTrue(cp.calls.isEmpty(), cp.calls.toString());
+            assertFalse(Files.exists(missing));
+        } finally {
+            r.stop();
+        }
+    }
+
+    @Test
+    void nonPosixBranchRenewsAndWritesStateFile() throws Exception {
+        Path state = dir.resolve("s.json");
+        FakeCp cp = dueCp();
+        CredentialRenewer r = renewer(cp, state, "env");
+        List<Path> checked = new ArrayList<>();
+        Predicate<Path> prev = CredentialRenewer.posix;
+        CredentialRenewer.posix =
+                d -> {
+                    checked.add(d);
+                    return false;
+                };
         try {
             assertEquals(0, r.tick());
-            r.tick();
+            cp.issued = Instant.ofEpochMilli(now);
+            cp.expires = cp.issued.plus(Duration.ofDays(30));
+            assertTrue(r.tick() > 0);
         } finally {
-            CredentialRenewer.forced = path -> {};
+            CredentialRenewer.posix = prev;
         }
-        assertEquals(
-                List.of(
-                        "/v2/me env",
-                        "/v2/credentials/renew env",
-                        "force temp",
-                        "force leaf",
-                        "force parent",
-                        "force ancestor",
-                        "/v2/credentials/renew/confirm next-env"),
-                cp.calls.subList(0, 7));
+        assertFalse(checked.isEmpty(), "expected posix predicate to be consulted");
+        assertEquals("next-env", r.token());
+        assertEquals("next-env", saved(state).get("token").getAsString());
+        assertTrue(saved(state).get("confirmed").getAsBoolean());
     }
 
     @Test
