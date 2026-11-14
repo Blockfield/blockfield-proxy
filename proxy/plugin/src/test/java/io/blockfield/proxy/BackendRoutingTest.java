@@ -527,7 +527,6 @@ class BackendRoutingTest {
                             forwarding,
                             host,
                             port,
-                            null,
                             workshopContract);
         }
 

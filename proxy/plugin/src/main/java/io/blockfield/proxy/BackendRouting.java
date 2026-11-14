@@ -17,17 +17,10 @@ import net.kyori.adventure.text.format.NamedTextColor;
 
 import org.slf4j.Logger;
 
-import java.io.IOException;
 import java.net.InetAddress;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.net.UnknownHostException;
-import java.nio.charset.StandardCharsets;
-import java.nio.file.AtomicMoveNotSupportedException;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.nio.file.StandardCopyOption;
-import java.nio.file.StandardOpenOption;
 import java.time.Duration;
 import java.util.List;
 import java.util.Locale;
@@ -85,9 +78,11 @@ final class BackendRouting {
     private Gate enforced = gate;
 
     private final Map<UUID, Long> lastOnGame = new ConcurrentHashMap<>();
-    private final Path inboxDir;
 
-    /** Last wake request, epoch ms; at most one inbox file per minute per proxy. */
+    /** Cold-Workshop wake over CP; null pins wake off (message only), never a file fallback. */
+    private final WorkshopWake wake;
+
+    /** Last wake request, epoch ms; at most one wake POST per minute per proxy. */
     private long lastWakeMs;
 
     BackendRouting(Object plugin, ProxyServer proxy, Logger logger, Authentication authentication) {
@@ -100,7 +95,7 @@ final class BackendRouting {
             Logger logger,
             Authentication authentication,
             String workshopHost) {
-        this(plugin, proxy, logger, authentication, workshopHost, inboxDirFromEnv());
+        this(plugin, proxy, logger, authentication, workshopHost, workshopPortFromEnv());
     }
 
     BackendRouting(
@@ -109,18 +104,7 @@ final class BackendRouting {
             Logger logger,
             Authentication authentication,
             String workshopHost,
-            Path inboxDir) {
-        this(plugin, proxy, logger, authentication, workshopHost, workshopPortFromEnv(), inboxDir);
-    }
-
-    BackendRouting(
-            Object plugin,
-            ProxyServer proxy,
-            Logger logger,
-            Authentication authentication,
-            String workshopHost,
-            int workshopPort,
-            Path inboxDir) {
+            int workshopPort) {
         this(
                 plugin,
                 proxy,
@@ -129,7 +113,6 @@ final class BackendRouting {
                 null,
                 workshopHost,
                 workshopPort,
-                inboxDir,
                 workshopContractFromEnv());
     }
 
@@ -155,17 +138,6 @@ final class BackendRouting {
             Authentication authentication,
             LoginForwarding forwarding,
             String workshopHost) {
-        this(plugin, proxy, logger, authentication, forwarding, workshopHost, inboxDirFromEnv());
-    }
-
-    BackendRouting(
-            Object plugin,
-            ProxyServer proxy,
-            Logger logger,
-            Authentication authentication,
-            LoginForwarding forwarding,
-            String workshopHost,
-            Path inboxDir) {
         this(
                 plugin,
                 proxy,
@@ -173,9 +145,7 @@ final class BackendRouting {
                 authentication,
                 forwarding,
                 workshopHost,
-                workshopPortFromEnv(),
-                inboxDir,
-                workshopContractFromEnv());
+                workshopPortFromEnv());
     }
 
     BackendRouting(
@@ -185,8 +155,7 @@ final class BackendRouting {
             Authentication authentication,
             LoginForwarding forwarding,
             String workshopHost,
-            int workshopPort,
-            Path inboxDir) {
+            int workshopPort) {
         this(
                 plugin,
                 proxy,
@@ -195,7 +164,6 @@ final class BackendRouting {
                 forwarding,
                 workshopHost,
                 workshopPort,
-                inboxDir,
                 workshopContractFromEnv());
     }
 
@@ -207,7 +175,6 @@ final class BackendRouting {
             LoginForwarding forwarding,
             String workshopHost,
             int workshopPort,
-            Path inboxDir,
             String workshopContract) {
         this.plugin = plugin;
         this.proxy = proxy;
@@ -237,11 +204,13 @@ final class BackendRouting {
             workshopPort = -1;
         }
         this.workshopPort = workshopPort;
-        this.inboxDir = inboxDir;
         // Fail-closed: no consumer (or a half-configured one) pins game entry closed, never open;
         // fromEnv never throws, and a bad workshop host only disables Workshop (as if empty).
         this.controlPlane = ControlSubscriber.fromEnv(logger);
         this.ownerAlert = OwnerAlert.fromEnv(logger);
+        // The wake shares the gate consumer's live service credential (renewal keeps it fresh);
+        // without it there is nothing to authorize the POST with, so wake stays off.
+        this.wake = controlPlane == null ? null : WorkshopWake.fromEnv(logger, controlPlane::token);
         if (controlPlane == null)
             logger.warn(
                     "gate source: control-plane consumer not configured"
@@ -256,11 +225,6 @@ final class BackendRouting {
         } catch (URISyntaxException e) {
             return false;
         }
-    }
-
-    private static Path inboxDirFromEnv() {
-        String dir = System.getenv("BLOCKFIELD_WORKSHOP_INBOX_DIR");
-        return dir == null || dir.isBlank() ? null : Path.of(dir);
     }
 
     private static int workshopPortFromEnv() {
@@ -381,63 +345,30 @@ final class BackendRouting {
 
     /**
      * Cold Workshop wake-on-connect: a sleeping workshop keeps members in the lobby and takes one
-     * inbox wake request per minute per proxy. No inbox mount means message only; STARTING means
-     * the request is already in flight, so only sleeping writes.
+     * CP wake POST per minute per proxy (a fresh idempotency key per connect attempt). Unconfigured
+     * wake means message only; STARTING means the request is already in flight, so only sleeping
+     * posts. The POST goes through the scheduler with a bounded timeout, never on the event thread.
      */
     void maybeRequestWake(Player player) {
-        Path dir = inboxDir;
-        if (dir == null || !authentication.authenticated(player)) return;
+        WorkshopWake sender = wake;
+        if (sender == null || !authentication.authenticated(player)) return;
         if (!requestedBackend(player).equals("workshop")) return;
         Gate workshop = gate.forBackend("workshop");
         if (!workshop.sleeping()) return;
         String draslId = authentication.profileId(player.getUniqueId());
         String name = player.getUsername();
         if (!workshop.member(draslId, name)) return;
+        String idempotencyKey;
         long now = System.currentTimeMillis();
         synchronized (this) {
             if (now - lastWakeMs < WAKE_INTERVAL_MS) return;
             lastWakeMs = now;
+            idempotencyKey = UUID.randomUUID().toString();
         }
-        // Off the event thread: the scheduler runs this async, a tiny write is all it does.
-        proxy.getScheduler().buildTask(plugin, () -> writeWake(dir, draslId, name)).schedule();
-    }
-
-    private void writeWake(Path dir, String draslId, String name) {
-        try {
-            writeWakeRequest(dir, draslId, name, System.currentTimeMillis());
-        } catch (IOException | RuntimeException e) {
-            logger.warn("Workshop wake request failed", e);
-        }
-    }
-
-    /** Controller inbox envelope, exactly as other kinds; file name matches id; no secrets. */
-    static void writeWakeRequest(Path dir, String draslId, String name, long nowMs)
-            throws IOException {
-        String id = UUID.randomUUID().toString();
-        // draslId is hex, name matches Authentication.NAME, id is a UUID: no escaping needed.
-        String json =
-                "{\"schema\":1,\"id\":\""
-                        + id
-                        + "\",\"kind\":\"wake\",\"actor\":{\"draslId\":\""
-                        + draslId
-                        + "\",\"name\":\""
-                        + name
-                        + "\"},\"createdAt\":"
-                        + nowMs
-                        + "}";
-        Path tmp = dir.resolve("." + id + ".tmp");
-        Path dst = dir.resolve(id + ".json");
-        Files.writeString(
-                tmp,
-                json,
-                StandardCharsets.UTF_8,
-                StandardOpenOption.CREATE,
-                StandardOpenOption.TRUNCATE_EXISTING);
-        try {
-            Files.move(tmp, dst, StandardCopyOption.ATOMIC_MOVE);
-        } catch (AtomicMoveNotSupportedException e) {
-            Files.move(tmp, dst);
-        }
+        // Off the event thread: the scheduler runs this async, one bounded POST is all it does.
+        proxy.getScheduler()
+                .buildTask(plugin, () -> sender.send(idempotencyKey, draslId, name))
+                .schedule();
     }
 
     private boolean allowed(Player player, RegisteredServer server) {
@@ -659,7 +590,7 @@ final class BackendRouting {
             }
         }
         if (gate.forBackend("workshop").sleeping()) {
-            // Wake on connect: members parked in the lobby trigger one inbox request.
+            // Wake on connect: members parked in the lobby trigger one wake POST.
             for (Player parked : lobby.get().getPlayersConnected()) maybeRequestWake(parked);
         }
         for (String name : List.of("game", "workshop")) {
