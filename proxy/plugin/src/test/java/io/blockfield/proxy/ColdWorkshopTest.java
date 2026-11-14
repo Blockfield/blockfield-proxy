@@ -14,10 +14,10 @@ import com.velocitypowered.api.event.player.ServerPreConnectEvent;
 import com.velocitypowered.api.proxy.Player;
 import com.velocitypowered.api.proxy.ProxyServer;
 import com.velocitypowered.api.proxy.ServerConnection;
-import com.velocitypowered.api.proxy.scheduler.ScheduledTask;
-import com.velocitypowered.api.proxy.scheduler.Scheduler;
 import com.velocitypowered.api.proxy.server.RegisteredServer;
 import com.velocitypowered.api.proxy.server.ServerInfo;
+import com.velocitypowered.api.scheduler.ScheduledTask;
+import com.velocitypowered.api.scheduler.Scheduler;
 
 import org.junit.jupiter.api.Test;
 import org.slf4j.LoggerFactory;
