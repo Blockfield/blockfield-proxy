@@ -11,6 +11,10 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.time.Duration;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.function.Supplier;
 
 /**
@@ -163,10 +167,19 @@ final class WorkshopWake {
                             .header("Content-Type", "application/json")
                             .POST(HttpRequest.BodyPublishers.ofString(body))
                             .build();
-            HttpResponse<String> response =
+            // The request timeout stops at response headers; bound the whole
+            // exchange, body included, and abort it so no scheduler task stalls.
+            CompletableFuture<HttpResponse<Void>> exchange =
                     ControlSubscriber.newHttpClient()
-                            .send(request, HttpResponse.BodyHandlers.ofString());
-            return response.statusCode();
+                            .sendAsync(request, HttpResponse.BodyHandlers.discarding());
+            try {
+                return exchange.get(RPC_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS).statusCode();
+            } catch (TimeoutException e) {
+                exchange.cancel(true);
+                throw new IOException("control-plane wake timed out", e);
+            } catch (ExecutionException e) {
+                throw new IOException("control-plane wake failed", e.getCause());
+            }
         };
     }
 
