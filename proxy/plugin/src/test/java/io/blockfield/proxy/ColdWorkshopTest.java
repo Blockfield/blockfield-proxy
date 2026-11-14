@@ -4,6 +4,7 @@ import static io.blockfield.proxy.GateEvictionTest.fake;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.google.gson.JsonObject;
@@ -19,13 +20,11 @@ import com.velocitypowered.api.scheduler.ScheduledTask;
 import com.velocitypowered.api.scheduler.Scheduler;
 
 import org.junit.jupiter.api.Test;
-import org.junit.jupiter.api.io.TempDir;
 import org.slf4j.LoggerFactory;
 
 import java.lang.reflect.Field;
 import java.net.InetSocketAddress;
-import java.nio.file.Files;
-import java.nio.file.Path;
+import java.net.URI;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -35,9 +34,10 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 
-/** Cold Workshop (contract section 4): lobby hold, waking message, and the wake inbox. */
+/** Cold Workshop: lobby hold, waking message, and the CP wake POST. */
 class ColdWorkshopTest {
     private static final String DRASL = "6727890496a93613a33463780ae01220";
+    private static final String GENERATION = "123e4567-e89b-12d3-a456-426614174000";
 
     @Test
     void sleepingGateNeverAdmitsButKeepsMembers() {
@@ -51,8 +51,8 @@ class ColdWorkshopTest {
     }
 
     @Test
-    void sleepingMemberGetsMessageAndOneWakeRequest(@TempDir Path inbox) throws Exception {
-        var fixture = new Fixture("workshop.invalid", inbox);
+    void sleepingMemberGetsMessageAndOneWakePost() throws Exception {
+        var fixture = new Fixture("workshop.invalid");
         Player builder = fixture.player(UUID.randomUUID(), "workshop.invalid", "Builder");
         fixture.authenticate(builder);
         fixture.gate(SleepingGate());
@@ -61,28 +61,36 @@ class ColdWorkshopTest {
                 fixture.messages.get(builder.getUniqueId()).stream()
                         .anyMatch(text -> text.contains("просыпается")),
                 "sleeping workshop shows the waking message");
-        List<Path> wakes = fixture.wakes();
-        assertEquals(1, wakes.size(), "one wake request per sleeping member");
-        JsonObject envelope =
-                JsonParser.parseString(Files.readString(wakes.get(0))).getAsJsonObject();
-        assertEquals(Set.of("schema", "id", "kind", "actor", "createdAt"), envelope.keySet());
-        assertEquals(1, envelope.get("schema").getAsInt());
-        assertEquals("wake", envelope.get("kind").getAsString());
+        List<String> wakes = fixture.wakes();
+        assertEquals(1, wakes.size(), "one wake POST per sleeping member");
+        JsonObject request = JsonParser.parseString(wakes.get(0)).getAsJsonObject();
         assertEquals(
-                wakes.get(0).getFileName().toString(),
-                envelope.get("id").getAsString() + ".json",
-                "file name matches id");
-        UUID.fromString(envelope.get("id").getAsString());
-        JsonObject actor = envelope.getAsJsonObject("actor");
+                Set.of(
+                        "idempotencyKey",
+                        "environment",
+                        "backend",
+                        "consumerId",
+                        "generation",
+                        "target",
+                        "actor",
+                        "expiresInSeconds"),
+                request.keySet());
+        assertEquals("prod", request.get("environment").getAsString());
+        assertEquals("game", request.get("backend").getAsString());
+        assertEquals("workshop", request.get("consumerId").getAsString());
+        assertEquals(GENERATION, request.get("generation").getAsString());
+        assertEquals("*", request.get("target").getAsString());
+        assertEquals(30, request.get("expiresInSeconds").getAsInt());
+        UUID.fromString(request.get("idempotencyKey").getAsString());
+        JsonObject actor = request.getAsJsonObject("actor");
         assertEquals(Set.of("draslId", "name"), actor.keySet());
         assertEquals(DRASL, actor.get("draslId").getAsString());
         assertEquals("Builder", actor.get("name").getAsString());
-        assertTrue(envelope.get("createdAt").getAsLong() > 0);
     }
 
     @Test
-    void wakeRateLimitedToOnePerMinutePerProxy(@TempDir Path inbox) throws Exception {
-        var fixture = new Fixture("workshop.invalid", inbox);
+    void wakeRateLimitedToOnePerMinutePerProxy() throws Exception {
+        var fixture = new Fixture("workshop.invalid");
         Player first = fixture.player(UUID.randomUUID(), "workshop.invalid", "Builder");
         Player second = fixture.player(UUID.randomUUID(), "workshop.invalid", "Builder");
         fixture.authenticate(first);
@@ -93,17 +101,25 @@ class ColdWorkshopTest {
         fixture.authenticate(second);
         fixture.routing.admit(second);
         fixture.routing.tick();
-        assertEquals(1, fixture.wakes().size(), "one inbox file per 60 s per proxy");
-        assertEquals(
-                0,
-                Files.list(inbox)
-                        .filter(path -> path.getFileName().toString().startsWith("."))
-                        .count(),
-                "no temp files left behind");
+        assertEquals(1, fixture.wakes().size(), "one wake POST per 60 s per proxy");
+        // A later connect attempt past the limit posts again, with its own key.
+        Field lastWake = BackendRouting.class.getDeclaredField("lastWakeMs");
+        lastWake.setAccessible(true);
+        lastWake.set(fixture.routing, 0L);
+        fixture.routing.admit(second);
+        assertEquals(2, fixture.wakes().size(), "next attempt past the limit posts again");
+        assertNotEquals(
+                idempotencyKey(fixture.wakes().get(0)),
+                idempotencyKey(fixture.wakes().get(1)),
+                "idempotency key is per connect attempt");
+    }
+
+    private static String idempotencyKey(String body) {
+        return JsonParser.parseString(body).getAsJsonObject().get("idempotencyKey").getAsString();
     }
 
     @Test
-    void unsetInboxDirShowsMessageOnly() throws Exception {
+    void unconfiguredWakeShowsMessageOnly() throws Exception {
         var fixture = new Fixture("workshop.invalid", null);
         Player builder = fixture.player(UUID.randomUUID(), "workshop.invalid", "Builder");
         fixture.authenticate(builder);
@@ -114,11 +130,12 @@ class ColdWorkshopTest {
                         .anyMatch(text -> text.contains("просыпается")));
         var event = fixture.connect(builder, "workshop");
         assertFalse(event.getResult().isAllowed(), "sleeping workshop never connects");
+        assertEquals(List.of(), fixture.wakes(), "unconfigured wake never posts");
     }
 
     @Test
-    void malformedGateKeepsExistingBehaviour(@TempDir Path inbox) throws Exception {
-        var fixture = new Fixture("workshop.invalid", inbox);
+    void malformedGateKeepsExistingBehaviour() throws Exception {
+        var fixture = new Fixture("workshop.invalid");
         Player builder = fixture.player(UUID.randomUUID(), "workshop.invalid", "Builder");
         fixture.authenticate(builder);
         fixture.gate(Gate.closed());
@@ -135,8 +152,8 @@ class ColdWorkshopTest {
     }
 
     @Test
-    void startingShowsMessageButSendsNoWake(@TempDir Path inbox) throws Exception {
-        var fixture = new Fixture("workshop.invalid", inbox);
+    void startingShowsMessageButSendsNoWake() throws Exception {
+        var fixture = new Fixture("workshop.invalid");
         Player builder = fixture.player(UUID.randomUUID(), "workshop.invalid", "Builder");
         fixture.authenticate(builder);
         for (String state : List.of("STARTING", "starting")) {
@@ -163,12 +180,12 @@ class ColdWorkshopTest {
                 fixture.messages.get(builder.getUniqueId()).stream()
                         .anyMatch(text -> text.contains("просыпается")),
                 "STARTING shows the waking message");
-        assertEquals(List.of(), fixture.wakes(), "STARTING sends no wake request");
+        assertEquals(List.of(), fixture.wakes(), "STARTING sends no wake POST");
     }
 
     @Test
-    void outsiderGetsNoWake(@TempDir Path inbox) throws Exception {
-        var fixture = new Fixture("workshop.invalid", inbox);
+    void outsiderGetsNoWake() throws Exception {
+        var fixture = new Fixture("workshop.invalid");
         Player outsider = fixture.player(UUID.randomUUID(), "workshop.invalid", "Other");
         fixture.authenticate(outsider);
         fixture.gate(SleepingGate());
@@ -178,8 +195,8 @@ class ColdWorkshopTest {
     }
 
     @Test
-    void gameUnaffectedBySleepingWorkshop(@TempDir Path inbox) throws Exception {
-        var fixture = new Fixture("workshop.invalid", inbox);
+    void gameUnaffectedBySleepingWorkshop() throws Exception {
+        var fixture = new Fixture("workshop.invalid");
         Player gamer = fixture.player(UUID.randomUUID(), "game.invalid", "Player");
         fixture.authenticate(gamer);
         fixture.gate(SleepingGate());
@@ -210,12 +227,27 @@ class ColdWorkshopTest {
         final Map<UUID, RegisteredServer> current = new HashMap<>();
         final Map<UUID, List<String>> requests = new HashMap<>();
         final Map<UUID, List<String>> messages = new HashMap<>();
+        final List<String> posts = new ArrayList<>();
         final Authentication authentication;
         final BackendRouting routing;
-        final Path inbox;
 
-        Fixture(String host, Path inbox) {
-            this.inbox = inbox;
+        Fixture(String host) {
+            this(host, null);
+            setWake(
+                    new WorkshopWake(
+                            URI.create("https://cp.invalid/v2/workshop/wake"),
+                            () -> "token",
+                            "workshop",
+                            GENERATION,
+                            "prod",
+                            body -> {
+                                posts.add(body);
+                                return 202;
+                            },
+                            LoggerFactory.getLogger("test")));
+        }
+
+        Fixture(String host, WorkshopWake wake) {
             for (String name : List.of("lobby", "game", "workshop")) {
                 servers.put(
                         name,
@@ -265,12 +297,18 @@ class ColdWorkshopTest {
                             this, proxy, LoggerFactory.getLogger("test"), new LoginForwarding());
             routing =
                     new BackendRouting(
-                            this,
-                            proxy,
-                            LoggerFactory.getLogger("test"),
-                            authentication,
-                            host,
-                            inbox);
+                            this, proxy, LoggerFactory.getLogger("test"), authentication, host);
+            setWake(wake);
+        }
+
+        private void setWake(WorkshopWake wake) {
+            try {
+                Field field = BackendRouting.class.getDeclaredField("wake");
+                field.setAccessible(true);
+                field.set(routing, wake);
+            } catch (ReflectiveOperationException e) {
+                throw new IllegalStateException(e);
+            }
         }
 
         private List<Player> playersOn(String name) {
@@ -339,12 +377,8 @@ class ColdWorkshopTest {
             field.set(routing, gate);
         }
 
-        List<Path> wakes() throws Exception {
-            if (inbox == null) return List.of();
-            try (var stream = Files.list(inbox)) {
-                return stream.filter(path -> path.getFileName().toString().endsWith(".json"))
-                        .toList();
-            }
+        List<String> wakes() {
+            return List.copyOf(posts);
         }
 
         RegisteredServer choose(Player player) {

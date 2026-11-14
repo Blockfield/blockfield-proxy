@@ -284,6 +284,13 @@ final class ControlSubscriber {
         if (acks instanceof HttpAckSender http) http.token = next;
     }
 
+    /**
+     * Live bearer for CP calls sharing this consumer's service credential (renewal keeps it fresh).
+     */
+    String token() {
+        return token;
+    }
+
     /** Fail-safe bound parse: blank or invalid values fall back to the default, never unbounded. */
     static long failStaticMaxAgeMs(String raw, Logger logger) {
         if (raw == null || raw.isBlank()) return FAIL_STATIC_MAX_AGE_MS;
